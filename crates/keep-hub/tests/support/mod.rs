@@ -8,6 +8,8 @@
 
 #![allow(dead_code)]
 
+pub mod world;
+
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
@@ -611,6 +613,8 @@ pub struct Fixture {
     pub admin_token: String,
     /// The hub's limit for a transfer with no bytes moving.
     pub idle: Duration,
+    /// The internet as the hub sees it: none, unless a test gives a fake world.
+    pub outside: keep_hub::names::Outside,
     hub: Option<Running>,
 }
 
@@ -628,6 +632,15 @@ impl Fixture {
     /// seconds), so a test of the rule doesn't wait minutes.
     pub fn with_idle(idle: Duration) -> Fixture {
         Self::build(|_| {}, idle)
+    }
+
+    /// A hub whose outside world is a fake (`world::World`), sharing the hub's clock.
+    pub fn with_world(settings: impl FnOnce(&mut HubConfig)) -> (Fixture, Arc<world::World>) {
+        let mut f = Self::build(settings, keep_hub::relay::IDLE);
+        let w = world::World::new(f.clock.clone());
+        f.outside = w.outside();
+        f.restart();
+        (f, w)
     }
 
     fn build(settings: impl FnOnce(&mut HubConfig), idle: Duration) -> Fixture {
@@ -654,6 +667,7 @@ impl Fixture {
             log: Arc::new(Mutex::new(Vec::new())),
             admin_token,
             idle,
+            outside: keep_hub::names::Outside::unavailable("the tests have no network"),
             hub: None,
         };
         f.start();
@@ -669,6 +683,7 @@ impl Fixture {
             log: Arc::new(move |l: &str| log.lock().unwrap().push(l.to_string())),
             pin_cost: Cost { m: 64, t: 1, p: 1 },
             idle: self.idle,
+            outside: Some(self.outside.clone()),
         })
         .unwrap();
         self.hub = Some(hub);

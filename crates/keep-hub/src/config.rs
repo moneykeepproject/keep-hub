@@ -23,8 +23,7 @@ pub const INVITE_DAYS: u32 = 7;
 pub const CONFIG_FILE: &str = "hub.json";
 
 /// The hub's settings, with the spec's keys: `ports.helper` is `{"ports": {"helper": …}}`.
-/// A key that is left out has its default. (The `names`, `address` and `cert` settings join
-/// with their stages.)
+/// A key that is left out has its default. (The `address` settings join with stage 5.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubConfig {
     /// The hub computer's address on the home network.
@@ -35,6 +34,50 @@ pub struct HubConfig {
     pub pair: Pair,
     #[serde(default)]
     pub guest: Guest,
+    #[serde(default)]
+    pub names: NamesSettings,
+    #[serde(default)]
+    pub cert: CertSettings,
+}
+
+/// The `names.*` settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamesSettings {
+    /// Use a hub name (off until the person turns it on).
+    pub enabled: bool,
+    /// The name service.
+    pub service: String,
+    /// The certificate authority's ACME directory.
+    pub acme: String,
+    /// Use Let's Encrypt's staging service (and `service` must then be the staging name
+    /// service).
+    pub staging: bool,
+}
+
+impl Default for NamesSettings {
+    fn default() -> Self {
+        NamesSettings {
+            enabled: false,
+            service: crate::nameservice::NAME_SERVICE.to_string(),
+            acme: crate::acme::LETS_ENCRYPT.to_string(),
+            staging: false,
+        }
+    }
+}
+
+/// The `cert.*` settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CertSettings {
+    /// Tell the person renewal is failing when this many days or fewer remain.
+    pub warn_days: u32,
+}
+
+impl Default for CertSettings {
+    fn default() -> Self {
+        CertSettings { warn_days: 14 }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +131,8 @@ impl HubConfig {
             ports: Ports::default(),
             pair: Pair::default(),
             guest: Guest::default(),
+            names: NamesSettings::default(),
+            cert: CertSettings::default(),
         }
     }
 
@@ -114,6 +159,13 @@ mod tests {
         let cfg = HubConfig::new(Ipv4Addr::new(192, 168, 1, 20));
         assert_eq!((cfg.ports.helper, cfg.ports.admin), (16080, 16081));
         assert_eq!((cfg.pair.code_minutes, cfg.guest.invite_days), (10, 7));
+        assert!(!cfg.names.enabled && !cfg.names.staging);
+        assert_eq!(cfg.names.service, "https://names.getmoneykeep.org/v1");
+        assert_eq!(
+            cfg.names.acme,
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
+        assert_eq!(cfg.cert.warn_days, 14);
         cfg.save(dir.path()).unwrap();
         assert_eq!(HubConfig::load(dir.path()).unwrap(), cfg);
     }

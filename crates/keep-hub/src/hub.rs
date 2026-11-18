@@ -26,7 +26,7 @@ use crate::config::HubConfig;
 use crate::keys::KeyStore;
 use crate::registry::{App, Device, Member, Registry, PIN_KEY};
 use crate::util::{self, StoreResult};
-use crate::{admin, ca, pin, relay};
+use crate::{admin, ca, names, pin, relay};
 
 /// The hub protocols this hub accepts from an app. A newer hub keeps every older number.
 pub const PROTOCOLS: &[u32] = &[1];
@@ -64,6 +64,9 @@ pub struct HubOptions {
     /// A transfer with no bytes moving for this long is closed ([`relay::IDLE`]; shorter
     /// in tests).
     pub idle: Duration,
+    /// The internet, for the hub name (`None`: the real one, trusting what this computer
+    /// trusts; tests give fakes).
+    pub outside: Option<names::Outside>,
 }
 
 impl HubOptions {
@@ -76,6 +79,7 @@ impl HubOptions {
             log: Arc::new(|l: &str| eprintln!("{l}")),
             pin_cost: pin::COST,
             idle: relay::IDLE,
+            outside: None,
         }
     }
 }
@@ -215,6 +219,7 @@ pub(crate) struct Hub {
     pub(crate) tls: Arc<rustls::ServerConfig>,
     pub(crate) gate: Arc<relay::Gate>,
     pub(crate) stopping: Arc<AtomicBool>,
+    pub(crate) names: Arc<names::Names>,
 }
 
 fn normalise_code(code: &str) -> String {
@@ -905,6 +910,7 @@ impl Hub {
             "version": VERSION,
             "protocols": PROTOCOLS,
             "address": self.cfg.address,
+            "names": self.names.status()["state"],
             "apps": apps,
         }))
     }
@@ -938,6 +944,7 @@ impl Running {
     /// Stop every listener and wait for them.
     pub fn stop(mut self) {
         self.hub.stopping.store(true, Ordering::SeqCst);
+        self.hub.names.poke();
         let listeners: Vec<Listener> = {
             let mut st = self.hub.lock();
             st.listeners.drain().map(|(_, l)| l).collect()
@@ -989,6 +996,22 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         .ok_or_else(|| "the hub's admin listener has no address".to_string())?;
     let admin_server = Arc::new(admin_server);
 
+    let outside = match opts.outside {
+        Some(o) => o,
+        None => names::Outside::system().unwrap_or_else(|e| {
+            (opts.log)(&format!("names: {e}"));
+            names::Outside::unavailable(&e)
+        }),
+    };
+    let names = Arc::new(names::Names::open(
+        &opts.data,
+        &cfg,
+        opts.keys.clone(),
+        outside,
+        opts.clock.clone(),
+        opts.log.clone(),
+    ));
+
     let mut secrets = HashMap::new();
     for a in &apps {
         match opts.keys.get(&secret_key(&a.id)) {
@@ -1022,6 +1045,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         tls,
         gate: relay::Gate::new(),
         stopping: Arc::new(AtomicBool::new(false)),
+        names,
     });
 
     // Every registered app's port. One that can't be opened is logged and left closed: the
@@ -1048,6 +1072,16 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
                     Ok(None) => {}
                     Err(_) => break,
                 }
+            }
+        })?);
+    }
+    {
+        // The hub name: whatever is due, when the admin address asks and every minute.
+        let hub = hub.clone();
+        threads.push(spawn("hub-names", move || {
+            while !hub.stopping.load(Ordering::SeqCst) {
+                hub.names.run_once();
+                hub.names.wait_for_work(Duration::from_secs(60));
             }
         })?);
     }

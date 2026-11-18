@@ -24,9 +24,13 @@
 //! DELETE /admin/v1/invites/<id>                 cancel
 //! GET    /admin/v1/pin                          whether a household PIN is set
 //! PUT    /admin/v1/pin            {pin, old?}   set, or change with the old one
+//! GET    /admin/v1/names                        the name's state and certificate
+//! POST   /admin/v1/names/on       {registration_code?}  turn on (the code the first time)
+//! POST   /admin/v1/names/off                    turn off (the name and certificate are kept)
+//! POST   /admin/v1/names/renew                  ask for a new certificate now
 //! ```
 //!
-//! Names, certificates and "find the problem" join this list with their stages.
+//! "Find the problem" joins this list with stage 5.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -74,24 +78,47 @@ fn refuse(hub: &Hub, req: Request, r: &Refusal) {
     );
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(req: &mut Request) -> Result<T, Refusal> {
-    let bad = |m: String| Refusal::new(400, "bad_request", m);
+fn read_body(req: &mut Request) -> Result<Vec<u8>, Refusal> {
+    let bad = |m: &str| Refusal::new(400, "bad_request", m);
     let mut buf = Vec::new();
     req.as_reader()
         .take(MAX_BODY + 1)
         .read_to_end(&mut buf)
-        .map_err(|_| bad("The request couldn't be read.".into()))?;
+        .map_err(|_| bad("The request couldn't be read."))?;
     if buf.len() as u64 > MAX_BODY {
-        return Err(bad("The request is too large.".into()));
+        return Err(bad("The request is too large."));
     }
+    Ok(buf)
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(req: &mut Request) -> Result<T, Refusal> {
+    parse_json(&read_body(req)?)
+}
+
+/// Like [`read_json`], with an empty body meaning every field left out.
+fn read_json_or_empty<T: for<'de> Deserialize<'de> + Default>(
+    req: &mut Request,
+) -> Result<T, Refusal> {
+    let buf = read_body(req)?;
+    if buf.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    parse_json(&buf)
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(buf: &[u8]) -> Result<T, Refusal> {
     // (the reason names a field, never a value: a body may carry a PIN)
-    serde_json::from_slice(&buf).map_err(|e| {
-        bad(format!(
-            "The request isn't valid ({:?} at line {}, column {}).",
-            e.classify(),
-            e.line(),
-            e.column()
-        ))
+    serde_json::from_slice(buf).map_err(|e| {
+        Refusal::new(
+            400,
+            "bad_request",
+            format!(
+                "The request isn't valid ({:?} at line {}, column {}).",
+                e.classify(),
+                e.line(),
+                e.column()
+            ),
+        )
     })
 }
 
@@ -119,6 +146,12 @@ struct GrantRequest {
 struct InviteRequest {
     app: String,
     scope: String,
+}
+
+#[derive(Deserialize, Default)]
+struct NamesOnRequest {
+    #[serde(default)]
+    registration_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +326,25 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             let b: PinRequest = read_json(req)?;
             hub.set_pin(&b.pin, b.old.as_deref())?;
             Ok(json!({ "ok": true }))
+        }
+
+        ("GET", ["names"]) => Ok(hub.names.status()),
+        ("POST", ["names", "on"]) => {
+            let b: NamesOnRequest = read_json_or_empty(req)?;
+            hub.names
+                .turn_on(b.registration_code.as_deref())
+                .map_err(|m| Refusal::new(409, "names_refused", m))?;
+            Ok(hub.names.status())
+        }
+        ("POST", ["names", "off"]) => {
+            hub.names.turn_off().map_err(Refusal::inner)?;
+            Ok(hub.names.status())
+        }
+        ("POST", ["names", "renew"]) => {
+            hub.names
+                .renew_now()
+                .map_err(|m| Refusal::new(409, "names_off", m))?;
+            Ok(hub.names.status())
         }
 
         _ => Err(Refusal::new(

@@ -30,6 +30,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 base64 = "0.22"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+# Stage 3 (owner decisions 2026-11-18): the hub's own ACME client signs with ring (already in
+# the build through rustls), and its requests to the internet trust what the computer trusts.
+ring = "0.17"
+rustls-platform-verifier = "0.7"
 
 # The PIN hash is deliberately expensive; optimise it even in debug builds (as in ShareKeep).
 [profile.dev.package.argon2]

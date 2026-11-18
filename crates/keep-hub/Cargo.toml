@@ -24,6 +24,8 @@ rustls.workspace = true
 rcgen.workspace = true
 base64.workspace = true
 time.workspace = true
+ring.workspace = true
+rustls-platform-verifier.workspace = true
 
 # DPAPI, to seal keys before they are written (seal.rs), as ShareKeep.
 [target."cfg(windows)".dependencies]
