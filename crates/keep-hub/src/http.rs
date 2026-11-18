@@ -144,10 +144,14 @@ impl Answer {
     pub fn to_bytes(&self, head_only: bool) -> Vec<u8> {
         let body = serde_json::to_vec(&self.body).unwrap_or_default();
         let mut out = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n",
             self.status,
             reason(self.status),
-            body.len()
+            body.len(),
+            HUB_HEADERS
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                .collect::<String>()
         )
         .into_bytes();
         if !head_only {
@@ -178,10 +182,20 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
+/// The headers the hub adds to every answer, its own and those it passes on (the spec's
+/// "Headers the hub adds to every answer"). `Strict-Transport-Security`, for phones that
+/// use the hub name, comes with the name in stage 3.
+pub const HUB_HEADERS: &[(&str, &str)] = &[
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+];
+
 /// An app backend's answer head, made ready for the phone: its status, and its lines with
 /// the connection headers replaced by `Connection: close` (the hub closes after every
-/// answer). Everything else is passed on as the backend sent it. `None` when it isn't an
-/// HTTP answer.
+/// answer), and the hub's own headers ([`HUB_HEADERS`]) in place of any of the same name
+/// the backend sent (theirs are already the strictest values). Everything else, the
+/// content type, encoding, caching headers and security policy included, is passed on as
+/// the backend sent it. `None` when it isn't an HTTP answer.
 pub fn answer_head(head: &[u8]) -> Option<(u16, Vec<u8>)> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
@@ -197,14 +211,18 @@ pub fn answer_head(head: &[u8]) -> Option<(u16, Vec<u8>)> {
     out.push_str("\r\n");
     for line in lines {
         let name = line.split(':').next().unwrap_or("").trim();
-        if ["connection", "keep-alive", "proxy-connection"]
+        let replaced = ["connection", "keep-alive", "proxy-connection"]
             .iter()
-            .any(|h| name.eq_ignore_ascii_case(h))
-        {
+            .chain(HUB_HEADERS.iter().map(|(k, _)| k))
+            .any(|h| name.eq_ignore_ascii_case(h));
+        if replaced {
             continue;
         }
         out.push_str(line);
         out.push_str("\r\n");
+    }
+    for (k, v) in HUB_HEADERS {
+        out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("Connection: close\r\n\r\n");
     Some((status, out.into_bytes()))
@@ -286,13 +304,13 @@ mod tests {
     #[test]
     fn a_backends_answer_head_is_passed_on_but_closes() {
         let (status, head) = answer_head(
-            b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Security-Policy: default-src 'self'",
+            b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Security-Policy: default-src 'self'\r\nreferrer-policy: origin\r\nX-Content-Type-Options: nosniff",
         )
         .unwrap();
         assert_eq!(status, 304);
         assert_eq!(
             String::from_utf8(head).unwrap(),
-            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Security-Policy: default-src 'self'\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Security-Policy: default-src 'self'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n"
         );
         assert_eq!(answer_head(b"SSH-2.0-OpenSSH"), None);
         assert_eq!(answer_head(b"HTTP/1.1 abc OK"), None);

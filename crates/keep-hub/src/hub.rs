@@ -61,6 +61,9 @@ pub struct HubOptions {
     pub log: Log,
     /// The PIN's hash cost (cheaper in tests).
     pub pin_cost: pin::Cost,
+    /// A transfer with no bytes moving for this long is closed ([`relay::IDLE`]; shorter
+    /// in tests).
+    pub idle: Duration,
 }
 
 impl HubOptions {
@@ -72,6 +75,7 @@ impl HubOptions {
             clock: Arc::new(util::now_ms),
             log: Arc::new(|l: &str| eprintln!("{l}")),
             pin_cost: pin::COST,
+            idle: relay::IDLE,
         }
     }
 }
@@ -174,8 +178,12 @@ impl Listener {
     /// Stop accepting and wait for the port to close.
     fn close(mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        // Wait for the loop only when it was woken: otherwise it ends by itself with the
+        // next connection, and the hub mustn't hang on it.
+        if relay::wake(self.addr) {
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -200,6 +208,7 @@ pub(crate) struct Hub {
     clock: Clock,
     log: Log,
     pub(crate) pin_cost: pin::Cost,
+    pub(crate) idle: Duration,
     pub(crate) admin_token: String,
     /// Where the admin address really listens.
     admin_port: u16,
@@ -1007,6 +1016,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         clock: opts.clock,
         log: opts.log,
         pin_cost: opts.pin_cost,
+        idle: opts.idle,
         admin_token,
         admin_port: admin_addr.port(),
         tls,

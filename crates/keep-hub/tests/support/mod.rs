@@ -110,9 +110,8 @@ fn request(
     bytes
 }
 
-/// Bytes sent to an app port over TLS, trusting only `ca_der`; what came back until the
-/// hub closed. `Err` when the connection can't be made.
-pub fn https_raw(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Result<Vec<u8>, String> {
+/// A TLS client for an app port, trusting only `ca_der`.
+fn tls_client(addr: SocketAddr, ca_der: &[u8]) -> Result<rustls::ClientConnection, String> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(ca_der.to_vec()))
@@ -125,8 +124,13 @@ pub fn https_raw(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Result<Vec<u8
     .with_root_certificates(roots)
     .with_no_client_auth();
     let name = ServerName::try_from(addr.ip().to_string()).map_err(|e| e.to_string())?;
-    let mut conn =
-        rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+    rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())
+}
+
+/// Bytes sent to an app port over TLS, trusting only `ca_der`; what came back until the
+/// hub closed. `Err` when the connection can't be made.
+pub fn https_raw(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut conn = tls_client(addr, ca_der)?;
     let mut tcp =
         TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
     tcp.set_read_timeout(Some(Duration::from_secs(20)))
@@ -140,6 +144,65 @@ pub fn https_raw(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Result<Vec<u8
         Err(e) => return Err(e.to_string()),
     }
     Ok(answer)
+}
+
+/// An answer read as it arrives, its body hashed and counted, never kept.
+#[derive(Debug)]
+pub struct Streamed {
+    /// The status and headers (no body).
+    pub head: Reply,
+    pub body_len: u64,
+    pub sha256: Vec<u8>,
+    /// `Ok` when the hub ended the connection properly; `Err` when it was cut short.
+    pub end: Result<(), String>,
+    pub elapsed: Duration,
+}
+
+/// Send `bytes` to an app port and stream the answer (a phone downloading a large file).
+pub fn https_stream(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Streamed {
+    use sha2::{Digest, Sha256};
+    let started = std::time::Instant::now();
+    let mut conn = tls_client(addr, ca_der).expect("a TLS client");
+    let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+    tls.write_all(bytes).expect("send");
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut head: Vec<u8> = Vec::new();
+    let mut parsed: Option<Reply> = None;
+    let mut hash = Sha256::new();
+    let mut body_len = 0u64;
+    let end = loop {
+        let n = match tls.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break Err("cut short".to_string())
+            }
+            Err(e) => break Err(e.to_string()),
+        };
+        let mut data = &buf[..n];
+        if parsed.is_none() {
+            head.extend_from_slice(data);
+            let Some(p) = head.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let rest = head.split_off(p + 4);
+            parsed = Some(parse(&head));
+            hash.update(&rest);
+            body_len += rest.len() as u64;
+            data = &[];
+        }
+        hash.update(data);
+        body_len += data.len() as u64;
+    };
+    Streamed {
+        head: parsed.expect("an answer's head"),
+        body_len,
+        sha256: hash.finalize().to_vec(),
+        end,
+        elapsed: started.elapsed(),
+    }
 }
 
 /// A request to the admin address, or straight to a backend (plain HTTP on loopback).
@@ -183,8 +246,45 @@ impl Seen {
     }
 }
 
+/// The large WASM client's size (MoneyKeep's is about 12 MB before compression).
+pub const WASM_LEN: usize = 12 * 1024 * 1024;
+pub const WASM_ETAG: &str = "\"wasm-v1\"";
+
+/// Byte `i` of the large client: made as it is sent, so the test app never holds the file.
+pub fn wasm_byte(i: usize) -> u8 {
+    ((i ^ (i >> 9)).wrapping_mul(131) % 251) as u8
+}
+
+/// The large client's SHA-256, worked out the same way.
+pub fn wasm_sha256() -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut i = 0;
+    while i < WASM_LEN {
+        let n = chunk.len().min(WASM_LEN - i);
+        for (k, b) in chunk[..n].iter_mut().enumerate() {
+            *b = wasm_byte(i + k);
+        }
+        h.update(&chunk[..n]);
+        i += n;
+    }
+    h.finalize().to_vec()
+}
+
+/// The plain client's page and its security policy.
+pub const PLAIN_HTML: &str = "<!doctype html><title>Plain</title><script src=app.js></script>";
+pub const PLAIN_CSP: &str = "default-src 'self'; script-src 'self'; object-src 'none'";
+
 /// A small app backend on a loopback port. It refuses (403) anything without the secret
-/// the hub gave it; `/api/...` answers with what it was sent, anything else with a "file".
+/// the hub gave it; `/api/...` answers with what it was sent. Its files:
+///
+/// - `/app.wasm`: the large client, [`WASM_LEN`] bytes, `application/wasm`, `br` when the
+///   phone accepts it, an `ETag` (304 for `If-None-Match`);
+/// - `/plain/index.html`, `/plain/app.js`: a plain client, with a security policy;
+/// - `/stall`: announces 1000 bytes, sends 10, then nothing;
+/// - `/trickle?n=<bytes>&ms=<pause>`: one byte, a pause, the next;
+/// - anything else: one line naming the app and the path.
 pub struct TestApp {
     pub id: String,
     pub port: u16,
@@ -232,6 +332,191 @@ fn read_request(tcp: &mut TcpStream) -> Option<Request> {
     Some((method, target, headers, body))
 }
 
+fn query_number(target: &str, key: &str) -> Option<u64> {
+    target
+        .split_once('?')?
+        .1
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(&format!("{key}=")))?
+        .parse()
+        .ok()
+}
+
+/// One connection to a test app: read the request, answer, close.
+fn answer(
+    mut tcp: TcpStream,
+    id: &str,
+    seen: &Mutex<Vec<Seen>>,
+    secret: &Mutex<String>,
+    stop: &AtomicBool,
+) {
+    tcp.set_nonblocking(false).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let Some((method, target, headers, body)) = read_request(&mut tcp) else {
+        return;
+    };
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let want = secret.lock().unwrap().clone();
+    let got: Vec<&str> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("keep-hub-auth"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let trusted = !want.is_empty() && got == [want.as_str()];
+    seen.lock().unwrap().push(Seen {
+        method: method.clone(),
+        target: target.clone(),
+        headers: headers.clone(),
+        body: body.clone(),
+        trusted,
+    });
+    let path = target.split('?').next().unwrap_or("").to_string();
+    // (says keep-alive on purpose: the hub must still close after each answer)
+    let send_head = |tcp: &mut TcpStream, status: &str, lines: &[(&str, String)]| {
+        let mut h = format!("HTTP/1.1 {status}\r\nConnection: keep-alive\r\nX-App: {id}\r\n");
+        for (k, v) in lines {
+            h.push_str(&format!("{k}: {v}\r\n"));
+        }
+        h.push_str("\r\n");
+        tcp.write_all(h.as_bytes())
+    };
+    let small =
+        |tcp: &mut TcpStream, status: &str, kind: &str, out: &[u8], extra: &[(&str, String)]| {
+            let mut lines = vec![
+                ("Content-Type", kind.to_string()),
+                ("Content-Length", out.len().to_string()),
+            ];
+            lines.extend(extra.iter().cloned());
+            send_head(tcp, status, &lines)?;
+            if method != "HEAD" {
+                tcp.write_all(out)?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+    let _ = (|| -> std::io::Result<()> {
+        if !trusted {
+            return small(&mut tcp, "403 Forbidden", "text/plain", b"refused", &[]);
+        }
+        if target.starts_with("/api/") {
+            let all: serde_json::Map<String, Value> = headers
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), json!(v)))
+                .collect();
+            let v = json!({
+                "app": id,
+                "target": target,
+                "headers": all,
+                "body": String::from_utf8_lossy(&body),
+            });
+            let out = serde_json::to_vec(&v).unwrap();
+            return small(&mut tcp, "200 OK", "application/json", &out, &[]);
+        }
+        match path.as_str() {
+            "/app.wasm" => {
+                let etag = ("ETag", WASM_ETAG.to_string());
+                let cache = ("Cache-Control", "no-cache".to_string());
+                if header("if-none-match").as_deref() == Some(WASM_ETAG) {
+                    return send_head(&mut tcp, "304 Not Modified", &[etag, cache]);
+                }
+                let encoding = match header("accept-encoding") {
+                    Some(a) if a.contains("br") => "br",
+                    _ => "gzip",
+                };
+                send_head(
+                    &mut tcp,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "application/wasm".into()),
+                        ("Content-Encoding", encoding.into()),
+                        ("Vary", "Accept-Encoding".into()),
+                        ("Content-Length", WASM_LEN.to_string()),
+                        etag,
+                        cache,
+                    ],
+                )?;
+                if method == "HEAD" {
+                    return Ok(());
+                }
+                let mut chunk = vec![0u8; 64 * 1024];
+                let mut i = 0;
+                while i < WASM_LEN {
+                    let n = chunk.len().min(WASM_LEN - i);
+                    for (k, b) in chunk[..n].iter_mut().enumerate() {
+                        *b = wasm_byte(i + k);
+                    }
+                    tcp.write_all(&chunk[..n])?;
+                    i += n;
+                }
+                Ok(())
+            }
+            "/plain/index.html" => small(
+                &mut tcp,
+                "200 OK",
+                "text/html; charset=utf-8",
+                PLAIN_HTML.as_bytes(),
+                &[
+                    ("Content-Security-Policy", PLAIN_CSP.to_string()),
+                    // a weaker one of the hub's own: the hub puts its own in its place
+                    ("Referrer-Policy", "origin".to_string()),
+                ],
+            ),
+            "/plain/app.js" => small(
+                &mut tcp,
+                "200 OK",
+                "text/javascript",
+                b"document.title = 'Plain';",
+                &[("Content-Security-Policy", PLAIN_CSP.to_string())],
+            ),
+            "/stall" => {
+                send_head(
+                    &mut tcp,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "application/octet-stream".into()),
+                        ("Content-Length", "1000".into()),
+                    ],
+                )?;
+                tcp.write_all(&[7u8; 10])?;
+                let until = std::time::Instant::now() + Duration::from_secs(60);
+                while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(())
+            }
+            "/trickle" => {
+                let n = query_number(&target, "n").unwrap_or(10);
+                let ms = query_number(&target, "ms").unwrap_or(100);
+                send_head(
+                    &mut tcp,
+                    "200 OK",
+                    &[
+                        ("Content-Type", "application/octet-stream".into()),
+                        ("Content-Length", n.to_string()),
+                    ],
+                )?;
+                for _ in 0..n {
+                    tcp.write_all(&[1u8])?;
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                Ok(())
+            }
+            _ => small(
+                &mut tcp,
+                "200 OK",
+                "text/plain",
+                format!("{id} file {target}").as_bytes(),
+                &[],
+            ),
+        }
+    })();
+    let _ = tcp.shutdown(Shutdown::Both);
+}
+
 impl TestApp {
     pub fn start(id: &str) -> TestApp {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
@@ -257,67 +542,17 @@ impl TestApp {
                 (id.to_string(), seen.clone(), secret.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
-                    let mut tcp = match listener.accept() {
+                    let tcp = match listener.accept() {
                         Ok((tcp, _)) => tcp,
                         Err(_) => {
                             std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
                     };
-                    tcp.set_nonblocking(false).unwrap();
-                    tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                    let Some((method, target, headers, body)) = read_request(&mut tcp) else {
-                        continue;
-                    };
-                    let want = secret.lock().unwrap().clone();
-                    let got: Vec<&str> = headers
-                        .iter()
-                        .filter(|(k, _)| k.eq_ignore_ascii_case("keep-hub-auth"))
-                        .map(|(_, v)| v.as_str())
-                        .collect();
-                    let trusted = !want.is_empty() && got == [want.as_str()];
-                    let (status, kind, out) = if !trusted {
-                        ("403 Forbidden", "text/plain", b"refused".to_vec())
-                    } else if target.starts_with("/api/") {
-                        let all: serde_json::Map<String, Value> = headers
-                            .iter()
-                            .map(|(k, v)| (k.to_ascii_lowercase(), json!(v)))
-                            .collect();
-                        let v = json!({
-                            "app": id,
-                            "target": target,
-                            "headers": all,
-                            "body": String::from_utf8_lossy(&body),
-                        });
-                        (
-                            "200 OK",
-                            "application/json",
-                            serde_json::to_vec(&v).unwrap(),
-                        )
-                    } else {
-                        (
-                            "200 OK",
-                            "text/plain",
-                            format!("{id} file {target}").into_bytes(),
-                        )
-                    };
-                    seen.lock().unwrap().push(Seen {
-                        method: method.clone(),
-                        target,
-                        headers,
-                        body,
-                        trusted,
-                    });
-                    // (says keep-alive on purpose: the hub must still close after each answer)
-                    let head = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: keep-alive\r\nX-App: {id}\r\n\r\n",
-                        out.len()
-                    );
-                    let _ = tcp.write_all(head.as_bytes());
-                    if method != "HEAD" {
-                        let _ = tcp.write_all(&out);
-                    }
-                    let _ = tcp.shutdown(Shutdown::Both);
+                    // one thread per connection: a stalled download must not hold the app
+                    let (id, seen, secret, stop) =
+                        (id.clone(), seen.clone(), secret.clone(), stop.clone());
+                    std::thread::spawn(move || answer(tcp, &id, &seen, &secret, &stop));
                 }
             })
         };
@@ -374,6 +609,8 @@ pub struct Fixture {
     /// Every line the hub logged.
     pub log: Arc<Mutex<Vec<String>>>,
     pub admin_token: String,
+    /// The hub's limit for a transfer with no bytes moving.
+    pub idle: Duration,
     hub: Option<Running>,
 }
 
@@ -384,6 +621,16 @@ impl Fixture {
 
     /// A hub whose settings the test changes first.
     pub fn with(settings: impl FnOnce(&mut HubConfig)) -> Fixture {
+        Self::build(settings, keep_hub::relay::IDLE)
+    }
+
+    /// A hub that closes a transfer after `idle` with no bytes moving (instead of 30
+    /// seconds), so a test of the rule doesn't wait minutes.
+    pub fn with_idle(idle: Duration) -> Fixture {
+        Self::build(|_| {}, idle)
+    }
+
+    fn build(settings: impl FnOnce(&mut HubConfig), idle: Duration) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let keys = KeyStore::memory();
         // (the real time: the phone in these tests checks the certificate's dates by its own clock)
@@ -406,6 +653,7 @@ impl Fixture {
             clock,
             log: Arc::new(Mutex::new(Vec::new())),
             admin_token,
+            idle,
             hub: None,
         };
         f.start();
@@ -420,6 +668,7 @@ impl Fixture {
             clock: Arc::new(move || clock.load(Ordering::SeqCst)),
             log: Arc::new(move |l: &str| log.lock().unwrap().push(l.to_string())),
             pin_cost: Cost { m: 64, t: 1, p: 1 },
+            idle: self.idle,
         })
         .unwrap();
         self.hub = Some(hub);
@@ -564,6 +813,13 @@ impl Fixture {
     pub fn api(&self, app: &str, token: &str, method: &str, path: &str) -> Reply {
         let auth = format!("Bearer {token}");
         self.phone(app, method, path, &[("Authorization", &auth)], None)
+    }
+
+    /// A GET for a file, streamed (nothing kept but its hash).
+    pub fn download(&self, app: &str, path: &str, headers: &[(&str, &str)]) -> Streamed {
+        let addr = self.port(app);
+        let bytes = request("GET", path, &addr.to_string(), headers, None);
+        https_stream(addr, &self.hub().ca_der, &bytes)
     }
 
     /// Bytes exactly as given to an app's port.

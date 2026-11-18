@@ -19,6 +19,13 @@
 //! The limits are ShareKeep's: at most 64 connections and 8 from one address per app port;
 //! a request head must arrive within 10 seconds; requests without a token that send a body
 //! (pairing) take one of 2 waiting places.
+//!
+//! Web clients (stage 2): answers are streamed through one buffer, whatever their size, so
+//! the hub's memory doesn't grow with a file; a transfer is closed only after [`IDLE`] with
+//! no bytes moving. `Accept-Encoding`, `Content-Encoding`, `Content-Type`, `ETag`,
+//! `If-None-Match`, `Cache-Control`, 304 answers and the app's own security policy pass
+//! through untouched: the hub never compresses, decompresses or caches. It adds its own
+//! headers ([`http::HUB_HEADERS`]) to every answer.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -49,10 +56,12 @@ pub const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PAIR_BODY: u64 = 4096;
 /// An app's backend is on this computer: it accepts at once or it isn't running.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a backend may take to start its answer.
+/// How long a backend may take to start its answer (an app may need time to work out a
+/// report; a file starts at once).
 const FIRST_BYTE: Duration = Duration::from_secs(120);
-/// A transfer with no bytes moving for this long is closed.
-const IDLE: Duration = Duration::from_secs(30);
+/// A transfer with no bytes moving for this long is closed, either way. A transfer that
+/// keeps moving has no time limit, however large (a WASM client is several megabytes).
+pub const IDLE: Duration = Duration::from_secs(30);
 /// The largest answer head a backend may send.
 const MAX_ANSWER_HEAD: usize = 64 * 1024;
 
@@ -147,6 +156,10 @@ impl Drop for Slot {
 
 /// Accept connections on `app`'s public port until the hub stops or the port is closed
 /// (`stop`); each connection carries one request.
+///
+/// The loop waits in `accept` itself, so a phone's connection is taken at once (ShareKeep's
+/// loop looked every 50 milliseconds, which, with one request per connection, delayed every
+/// file). Closing the port sets `stop` and connects once to wake it ([`wake`]).
 pub(crate) fn accept_loop(
     listener: TcpListener,
     hub: Arc<Hub>,
@@ -155,11 +168,15 @@ pub(crate) fn accept_loop(
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
-    if listener.set_nonblocking(true).is_err() {
+    if listener.set_nonblocking(false).is_err() {
         return;
     }
-    while !hub.stopping.load(Ordering::SeqCst) && !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
+    loop {
+        let accepted = listener.accept();
+        if hub.stopping.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match accepted {
             Ok((tcp, peer)) => {
                 if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
                     drop(tcp);
@@ -182,12 +199,23 @@ pub(crate) fn accept_loop(
                     active.fetch_sub(1, Ordering::SeqCst);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            // (e.g. too many open files: wait a moment rather than spin)
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
+}
+
+/// Wake an accept loop waiting on `addr` so it sees its stop flag: one connection that
+/// sends nothing. `false` when nothing could connect (the loop then ends with the next
+/// connection it accepts).
+pub(crate) fn wake(addr: SocketAddr) -> bool {
+    let to = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()))
+        }
+        _ => addr,
+    };
+    TcpStream::connect_timeout(&to, Duration::from_secs(2)).is_ok()
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -313,7 +341,7 @@ fn forward_head(head: &Head, secret: &str, who: Option<&Identity>) -> Vec<u8> {
 /// One phone connection: the TLS handshake, one request, its answer.
 fn serve(tcp: TcpStream, peer: SocketAddr, hub: &Arc<Hub>, app: &str) -> std::io::Result<()> {
     tcp.set_nonblocking(false)?;
-    tcp.set_write_timeout(Some(IDLE))?;
+    tcp.set_write_timeout(Some(hub.idle))?;
     let _ = tcp.set_nodelay(true);
     let conn = rustls::ServerConnection::new(hub.tls.clone()).map_err(io_err)?;
     let mut tls = rustls::StreamOwned::new(conn, tcp);
@@ -500,7 +528,7 @@ fn forward(
     let Ok(mut backend) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) else {
         return refuse(hub, tls, head, &stopped());
     };
-    backend.set_write_timeout(Some(IDLE))?;
+    backend.set_write_timeout(Some(hub.idle))?;
     let _ = backend.set_nodelay(true);
     let failed = || Refusal::new(502, "app_failed", "This app didn't answer properly.");
 
@@ -511,7 +539,7 @@ fn forward(
         let first = rest.get(..rest.len().min(len as usize)).unwrap_or(&[]);
         backend.write_all(first)?;
         let mut left = len - first.len() as u64;
-        tls.sock.set_read_timeout(Some(IDLE))?;
+        tls.sock.set_read_timeout(Some(hub.idle))?;
         while left > 0 {
             let want = chunk.len().min(left as usize);
             let n = tls.read(chunk.get_mut(..want).unwrap_or(&mut []))?;
@@ -551,7 +579,7 @@ fn forward(
     tls.write_all(buf.get(end + 4..).unwrap_or(&[]))?;
 
     // the answer's body, as it comes, until the backend closes
-    backend.set_read_timeout(Some(IDLE))?;
+    backend.set_read_timeout(Some(hub.idle))?;
     loop {
         match backend.read(&mut chunk) {
             Ok(0) => break,

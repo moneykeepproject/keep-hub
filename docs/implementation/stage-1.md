@@ -125,9 +125,8 @@ is 64 hex characters and is the value of `Keep-Hub-Auth`.
   with the firewall checks of stage 5 and the hub's installer of stage 7.
 - **The QR code picture.** The admin address answers with the pairing address
   (`https://<address>:<port>/#pair=<code>`); drawing it is for the Phones screen.
-- The hub's two headers (`nosniff`, `no-referrer`) are on the hub's own answers only.
-  Adding them to passed-through answers, large files, the 30-second rule's tests and HSTS
-  are stage 2.
+- The hub's two headers on passed-through answers, large files and the 30-second rule:
+  done in stage 2 (`stage-2.md`). HSTS comes with the hub name in stage 3.
 - Everything in stages 2 to 7: names and the public certificate, the certificate page and
   two certificates on one port, addresses, Find the problem, the small library, the service.
 

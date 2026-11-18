@@ -5,10 +5,11 @@ and Pick app on that computer: it owns the secure name and certificate, the hous
 PIN, the list of members and phones, and the record of who may use which app, and it
 passes each request to the app it belongs to. Part of the MoneyKeep family (Rust).
 
-**Status: stage 1 of 7 built** (the relay, the registry of apps, members, grants and
-devices, pairing and guests, the admin address). Names and certificates, the certificate
-page, addresses, the troubleshooter, the small library for apps and the service are not
-built yet. See `docs/specs/keep-hub.md` and `docs/implementation/stage-1.md`.
+**Status: stages 1 and 2 of 7 built** (the relay, the registry of apps, members, grants
+and devices, pairing and guests, the admin address; web clients' files of any size,
+compression and caching passed through). Names and certificates, the certificate page,
+addresses, the troubleshooter, the small library for apps and the service are not built
+yet. See `docs/specs/keep-hub.md` and `docs/implementation/`.
 
 ## What it does
 
@@ -39,10 +40,10 @@ The hub holds no app's books and no app's rules.
 | Path | What |
 |---|---|
 | `docs/specs/keep-hub.md` | What the hub must do |
-| `docs/implementation/stage-1.md` | What stage 1 built, the request shapes it chose, and what it left for later stages |
+| `docs/implementation/stage-1.md`, `stage-2.md` | What each stage built, the choices it made, and what it left for later stages |
 | `AGENTS.md` | Rules for every contributor. Read it first |
 | `crates/keep-hub` | The hub: library and the `keep-hub` program |
-| `crates/keep-hub/tests` | The acceptance tests, with two small test apps |
+| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2) |
 | `xtask` | `cargo xtask ci` and the repository rules |
 
 Crates are added as the build stages in `AGENTS.md` are reached.
