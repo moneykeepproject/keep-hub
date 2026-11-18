@@ -1,0 +1,17 @@
+target/
+dist/
+
+# A hub's data folder from a local run: the admin token, the registry, certificates.
+hubdata/
+hub.json
+hub.sqlite
+hub-ca.json
+admin.token
+
+# Keys and certificates are never committed.
+*.pfx
+*.p12
+*.p8
+*.pem
+*.key
+*.crt

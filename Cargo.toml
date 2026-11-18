@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/keep-hub",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MoneyKeep Project contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moneykeepproject/keep-hub"
+
+# The same crates and versions as ShareKeep's hub (no new licences); Cargo.lock started as a
+# copy of ShareKeep's, so the versions match.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rusqlite = { version = "0.37", features = ["bundled"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+zeroize = "1"
+getrandom = "0.3"
+tempfile = "3"
+# The admin address: HTTP/1.1 on loopback. The app ports: TLS (rustls with ring) on the
+# Wi-Fi address, with the hub's own certificate authority made with rcgen.
+tiny_http = { version = "0.12", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+base64 = "0.22"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+# The PIN hash is deliberately expensive; optimise it even in debug builds (as in ShareKeep).
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
