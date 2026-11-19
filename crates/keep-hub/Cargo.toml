@@ -33,3 +33,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tempfile.workspace = true
+# The small library apps copy, tested here against a real hub (tests/library.rs) so the
+# library's own folder needs nothing from this crate.
+keep-hub-app = { path = "../keep-hub-app" }

@@ -1,7 +1,7 @@
 //! Keep Hub: the one program on a household's computer that phones connect to, shared by
 //! every Keep and Pick app on that computer. See `docs/specs/keep-hub.md`.
 //!
-//! Built so far (stages 1 to 5 of AGENTS.md section 5): the relay on each app's port
+//! Built so far (stages 1 to 6 of AGENTS.md section 5): the relay on each app's port
 //! ([`relay`]), the registry of apps, members, grants and devices ([`registry`]), pairing
 //! and guests ([`hub`]), the admin address ([`admin`]), web clients' files passed through
 //! whatever their size, compression or caching ([`relay`], [`http`]), and the hub name with
@@ -16,6 +16,9 @@
 //! limits of the TLS relay ([`relay`]). From MoneyKeep's server: the firewall check and
 //! fix, and the adapter scripts ([`machine`]). Keep Hub copies rather than depends on them, so it
 //! builds on its own.
+//!
+//! Apps work with the hub through the small library in `crates/keep-hub-app` (stage 6),
+//! which each app copies.
 //!
 //! The hub holds no app's books and no app's rules.
 

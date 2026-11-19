@@ -1,0 +1,24 @@
+# The small library an app copies to work with Keep Hub. Copy this folder into the app's
+# repository as it is: it depends on nothing in keep-hub, and its versions are written out
+# (not taken from a workspace) so the folder builds wherever it lands.
+[package]
+name = "keep-hub-app"
+description = "What a Keep or Pick app needs from Keep Hub: find it, register, check Keep-Hub-Auth on the app's backend, and the admin calls for the Phones screen"
+version = "0.1.0"
+edition = "2021"
+authors = ["MoneyKeep Project contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moneykeepproject/keep-hub"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zeroize = "1"
+
+# DPAPI, to seal the shared secret before it is written (seal.rs), as the hub and ShareKeep.
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+
+[dev-dependencies]
+tempfile = "3"

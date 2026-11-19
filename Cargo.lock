@@ -410,6 +410,7 @@ dependencies = [
  "argon2",
  "base64 0.22.1",
  "getrandom 0.3.4",
+ "keep-hub-app",
  "rcgen",
  "ring",
  "rusqlite",
@@ -421,6 +422,18 @@ dependencies = [
  "tempfile",
  "time",
  "tiny_http",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "keep-hub-app"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
  "windows-sys 0.61.2",
  "zeroize",
 ]
