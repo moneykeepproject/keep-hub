@@ -1,0 +1,21 @@
+Keep Hub
+Copyright (c) 2026 MoneyKeep Project contributors
+
+Keep Hub is licensed under either of
+
+  * Apache License, Version 2.0 (LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0)
+  * MIT license (LICENSE-MIT or https://opensource.org/licenses/MIT)
+
+at your option.
+
+Keep Hub is the shared hub of the MoneyKeep family's Keep and Pick apps: the one
+program on a household's computer that the household's phones connect to. It
+holds no app's books and no app's rules.
+
+Keep Hub is an independent project and is not affiliated with or endorsed by
+any other software vendor. Its certificates for hub names come from Let's
+Encrypt, a service of the Internet Security Research Group.
+
+Every third-party crate compiled into the program is listed with its version,
+its licence and the licence texts it ships in THIRD-PARTY-LICENSES.txt, installed
+beside the program.

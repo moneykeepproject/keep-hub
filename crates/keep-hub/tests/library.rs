@@ -15,7 +15,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use keep_hub_app::{
-    ensure_registered, find, Found, HubAuth, HubClient, Registration, RECORD_FILE, SECRET_FILE,
+    ensure_registered, find, make_this_the_hub, offer, Found, HubAuth, HubClient, Launcher, Next,
+    Offer, Registration, RECORD_FILE, SECRET_FILE,
 };
 use serde_json::{json, Value};
 use support::{free_port, Fixture, PIN};
@@ -186,6 +187,96 @@ fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// keep-launcher, faked: how often the app opened it at the hub's entry.
+struct FakeLauncher {
+    installed: bool,
+    opened: std::cell::Cell<u32>,
+}
+
+impl Launcher for FakeLauncher {
+    fn installed(&self) -> bool {
+        self.installed
+    }
+    fn open_hub_entry(&self) -> Result<(), String> {
+        self.opened.set(self.opened.get() + 1);
+        Ok(())
+    }
+}
+
+/// Every file in a folder, with its size and bytes' hash (to see that nothing changed).
+fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                let bytes = std::fs::read(&p).unwrap();
+                out.push((p, bytes.len() as u64, bytes));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start() {
+    // no hub on the computer: offered, and yes opens keep-launcher at the hub's entry
+    let empty = tempfile::tempdir().unwrap();
+    assert!(matches!(offer(empty.path()), Offer::MakeThisTheHub));
+    let launcher = FakeLauncher {
+        installed: true,
+        opened: std::cell::Cell::new(0),
+    };
+    assert_eq!(make_this_the_hub(&launcher).unwrap(), Next::LauncherOpened);
+    assert_eq!(launcher.opened.get(), 1);
+    // without keep-launcher: the hub's download page
+    let none = FakeLauncher {
+        installed: false,
+        opened: std::cell::Cell::new(0),
+    };
+    assert!(matches!(
+        make_this_the_hub(&none).unwrap(),
+        Next::DownloadPage(p) if p.starts_with("https://")
+    ));
+    assert_eq!(none.opened.get(), 0);
+    assert!(
+        std::fs::read_dir(empty.path()).unwrap().next().is_none(),
+        "nothing installed"
+    );
+
+    // a running hub: on with the phone setup
+    let f = hub_on_known_port();
+    assert!(matches!(offer(f.dir.path()), Offer::Ready(_, _)));
+
+    // a stopped hub counts as found: offered a start, the launcher isn't opened and nothing
+    // in the hub's folder changes
+    let stopped = tempfile::tempdir().unwrap();
+    for file in ["hub.json", "admin.token"] {
+        std::fs::copy(f.dir.path().join(file), stopped.path().join(file)).unwrap();
+    }
+    drop(f);
+    std::thread::sleep(Duration::from_millis(100));
+    let before = snapshot(stopped.path());
+    let launcher = FakeLauncher {
+        installed: true,
+        opened: std::cell::Cell::new(0),
+    };
+    match offer(stopped.path()) {
+        Offer::StartHub(hub) => assert_eq!(hub.status().unwrap_err().code, "hub_unreachable"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(launcher.opened.get(), 0, "the launcher isn't opened");
+    assert_eq!(
+        snapshot(stopped.path()),
+        before,
+        "nothing installed or changed"
+    );
 }
 
 #[test]

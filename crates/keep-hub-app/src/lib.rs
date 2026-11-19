@@ -5,7 +5,9 @@
 //! - **On the app's backend** (its local server): [`HubAuth`] refuses any request that
 //!   didn't come through the hub (the `Keep-Hub-Auth` header) and reads who sent it (the
 //!   member, the device, a guest's scope). [`listen`] binds the backend to 127.0.0.1 only.
-//! - **In the app's desktop program:** [`find`] looks for the hub on this computer;
+//! - **In the app's desktop program:** [`offer`] says what to offer when the person turns
+//!   on phones (make this computer the hub through keep-launcher, start a stopped hub, or go
+//!   on); [`find`] looks for the hub on this computer;
 //!   [`HubClient`] talks to its admin address, for every request the Phones screen makes
 //!   (members, grants, phones, pairing codes, invites, the PIN, the name, Find the
 //!   problem); [`ensure_registered`] registers the app the first time and again when its
@@ -41,6 +43,8 @@
 
 mod auth;
 mod client;
+mod offer;
+mod owner;
 mod register;
 pub mod seal;
 
@@ -48,6 +52,9 @@ pub use auth::{listen, Caller, Header, HubAuth, Refused};
 pub use client::{
     default_data_folder, find, AppState, Device, Found, Grant, HubApp, HubClient, HubError,
     HubStatus, Invite, Member, Pairing, ProblemCheck, Problems,
+};
+pub use offer::{
+    make_this_the_hub, offer, start_command, Launcher, Next, Offer, DOWNLOAD_PAGE, LAUNCHER_ENTRY,
 };
 pub use register::{ensure_registered, Registered, Registration, RECORD_FILE, SECRET_FILE};
 

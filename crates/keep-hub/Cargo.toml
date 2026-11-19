@@ -27,9 +27,12 @@ time.workspace = true
 ring.workspace = true
 rustls-platform-verifier.workspace = true
 
-# DPAPI, to seal keys before they are written (seal.rs), as ShareKeep.
+# DPAPI, to seal keys before they are written (seal.rs), and a file's owner (owner.rs), as
+# ShareKeep. Running as a Windows service (main.rs service-run), as ShareKeep's hub and
+# MoneyKeep's capture server (owner decision 2026-11-18).
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography"] }
+windows-service = "0.8"
 
 [dev-dependencies]
 tempfile.workspace = true

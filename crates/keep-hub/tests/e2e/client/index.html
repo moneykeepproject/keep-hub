@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" data-kind="@KIND@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keep Hub test client (@KIND@)</title>
+<script src="app.js" defer></script>
+</head>
+<body>
+<h1>Test client: @KIND@</h1>
+<p>WebAssembly: <span id="wasm">…</span></p>
+<form id="pairing" hidden>
+  <label>Household PIN <input id="pin" inputmode="numeric" autocomplete="off"></label>
+  <button id="pair" type="submit">Pair this phone</button>
+</form>
+<p>Hello: <span id="hello">…</span></p>
+<p><button id="again" type="button">Ask again</button></p>
+<p id="status"></p>
+</body>
+</html>

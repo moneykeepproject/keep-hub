@@ -4,7 +4,11 @@
 //! cargo xtask ci          fmt check, clippy -D warnings, tests, then the repository rules
 //! cargo xtask workflows   only release.yml may name the project's own Mac (self-hosted)
 //! cargo xtask guards      no panics in shipped code; sources keep LF line endings
+//! cargo xtask installer   the Windows setup (installer.rs)
 //! ```
+
+mod installer;
+mod licences;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,8 +21,12 @@ fn main() -> ExitCode {
         "ci" => ci(&root),
         "workflows" => report(check_workflows(&root)),
         "guards" => report(check_guards(&root)),
+        "installer" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            installer::installer(&root, &rest)
+        }
         _ => {
-            eprintln!("usage: cargo xtask <ci|workflows|guards>");
+            eprintln!("usage: cargo xtask <ci|workflows|guards|installer>");
             return ExitCode::from(2);
         }
     };
@@ -211,7 +219,10 @@ fn check_guards(root: &Path) -> Vec<String> {
     }
     for path in files(
         root,
-        &["rs", "toml", "lock", "md", "yml", "yaml", "json", "sh"],
+        &[
+            "rs", "toml", "lock", "md", "yml", "yaml", "json", "sh", "command", "ps1", "nsi",
+            "plist", "py", "html", "js", "wat",
+        ],
     ) {
         match fs::read(&path) {
             Ok(bytes) if bytes.contains(&b'\r') => {
@@ -265,7 +276,7 @@ fn files(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
         let p = e.path();
         if p.is_dir() {
             let name = file_name(&p);
-            if name != "target" && name != ".git" {
+            if name != "target" && name != ".git" && name != "dist" {
                 out.extend(files(&p, exts));
             }
         } else if p.extension().is_some_and(|x| exts.iter().any(|e| x == *e)) {

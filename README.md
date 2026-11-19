@@ -5,12 +5,12 @@ and Pick app on that computer: it owns the secure name and certificate, the hous
 PIN, the list of members and phones, and the record of who may use which app, and it
 passes each request to the app it belongs to. Part of the MoneyKeep family (Rust).
 
-**Status: stages 1 to 6 of 7 built** (the relay, the registry of apps, members, grants
+**Status: all 7 stages built** (the relay, the registry of apps, members, grants
 and devices, pairing and guests, the admin address; web clients' files passed through;
 the hub name and its Let's Encrypt certificate; both certificates on every app port and
 the certificate page; the home address followed as it changes, the firewall, and Find
-the problem; the small library apps copy). Running as a service and the installer pieces
-are not built yet. See `docs/specs/keep-hub.md` and `docs/implementation/`.
+the problem; the small library apps copy; running as a Windows service or a macOS daemon,
+the Windows setup and the Mac disk image). See `docs/specs/keep-hub.md` and `docs/implementation/`.
 
 ## What it does
 
@@ -41,12 +41,15 @@ The hub holds no app's books and no app's rules.
 | Path | What |
 |---|---|
 | `docs/specs/keep-hub.md` | What the hub must do |
-| `docs/implementation/stage-1.md` … `stage-6.md` | What each stage built, the choices it made, and what it left for later stages |
+| `docs/implementation/stage-1.md` … `stage-7.md` | What each stage built, the choices it made, and what it left for later stages |
 | `AGENTS.md` | Rules for every contributor. Read it first |
 | `crates/keep-hub` | The hub: library and the `keep-hub` program |
 | `crates/keep-hub-app` | The small library each app copies: find the hub, register, check `Keep-Hub-Auth` on the app's backend, and the Phones screen's requests. See `docs/implementation/stage-6.md` |
-| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, `library.rs`: stage 6, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
-| `xtask` | `cargo xtask ci` and the repository rules |
+| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, `library.rs`: stage 6, `service.rs` and `browser.rs`: stage 7, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
+| `installer/windows`, `installer/macos` | The Windows setup (NSIS) and the Mac disk image's scripts |
+| `scripts/ci/windows-install.ps1` | The Windows setup run for real: install, update, an older version refused, remove with apps registered, install again |
+| `.github/workflows` | CI on Linux, Windows and macOS; the Windows setup's run; the draft release |
+| `xtask` | `cargo xtask ci`, the repository rules and `cargo xtask installer` |
 
 Crates are added as the build stages in `AGENTS.md` are reached.
 
@@ -60,3 +63,12 @@ cargo xtask ci
 ## Licence
 
 MIT OR Apache-2.0, at your option, as the other MoneyKeep Apps.
+
+## Building the setup
+
+```sh
+cargo xtask installer        # Windows, with NSIS 3: dist/keep-hub-<version>-windows-x64-setup.exe
+installer/macos/make-dmg.sh <version> target/release   # on a Mac, after cargo build --release -p keep-hub
+```
+
+Users never build anything: keep-launcher installs the hub from its releases.

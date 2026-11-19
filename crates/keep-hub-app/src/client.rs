@@ -23,14 +23,22 @@ const ADMIN_PORT: u16 = 16081;
 /// The largest answer read (the admin address's lists are small).
 const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 
-/// The hub's data folder where the spec puts it: `%ProgramData%\Keep Hub` on Windows. The
-/// spec doesn't name the folder on other systems yet, so there the app passes its own.
+/// The hub's data folder: `%ProgramData%\Keep Hub` on Windows (the spec), and on a Mac
+/// `~/Library/Application Support/Keep Hub`, where the hub's disk image puts it (the hub runs
+/// as the person who installed it, as ShareKeep's). Elsewhere none: the app passes its own.
 pub fn default_data_folder() -> Option<PathBuf> {
     if cfg!(windows) {
         let base = std::env::var_os("ProgramData")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         Some(base.join("Keep Hub"))
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h)
+                .join("Library")
+                .join("Application Support")
+                .join("Keep Hub")
+        })
     } else {
         None
     }
@@ -80,9 +88,24 @@ pub enum Found {
 }
 
 /// Look for the hub whose data folder is `data`: installed, and running?
+///
+/// On Windows the folder and the admin token must belong to the administrators, SYSTEM or the
+/// hub's service: any user can make a folder of that name in `%ProgramData%`, and an app that
+/// believed its token would register with whatever answered.
 pub fn find(data: &Path) -> Found {
-    if !data.join(HUB_FILE).is_file() {
+    if !data.join(HUB_FILE).is_file() && !data.join(TOKEN_FILE).is_file() {
         return Found::NotInstalled;
+    }
+    for p in [data.to_path_buf(), data.join(TOKEN_FILE)] {
+        if let Err(why) = crate::owner::protected(&p) {
+            return Found::NoAccess(HubError::here(
+                "not_the_hubs_folder",
+                format!(
+                    "A folder named {} is on this computer, but Keep Hub's setup didn't make it ({why}). Remove it, then install Keep Hub again.",
+                    data.display()
+                ),
+            ));
+        }
     }
     let hub = match HubClient::open(data) {
         Ok(h) => h,
@@ -704,7 +727,7 @@ mod tests {
     #[test]
     fn the_spec_puts_the_data_folder_in_programdata_on_windows() {
         let found = default_data_folder();
-        assert_eq!(found.is_some(), cfg!(windows));
+        assert_eq!(found.is_some(), cfg!(windows) || cfg!(target_os = "macos"));
         if let Some(p) = found {
             assert!(p.ends_with("Keep Hub"));
         }

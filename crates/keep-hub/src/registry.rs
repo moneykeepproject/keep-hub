@@ -197,6 +197,25 @@ impl Registry {
         Self::open_with(dir, MIGRATIONS)
     }
 
+    /// The registered apps, read without changing anything (no migrations, no writing): for
+    /// the uninstaller, which asks again when apps still use the hub. Works while the hub runs.
+    pub fn read_apps(dir: &Path) -> StoreResult<Vec<App>> {
+        let path = dir.join(REGISTRY_FILE);
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql)?;
+        let mut stmt = conn
+            .prepare(&format!("SELECT {APP} FROM apps ORDER BY public_port"))
+            .map_err(sql)?;
+        let rows = stmt.query_map([], app_row).map_err(sql)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(sql)
+    }
+
     /// Open with a given list of migrations (a later hub has a longer list).
     pub fn open_with(dir: &Path, migrations: &[&str]) -> StoreResult<Registry> {
         let mut conn = Connection::open(dir.join(REGISTRY_FILE)).map_err(sql)?;
