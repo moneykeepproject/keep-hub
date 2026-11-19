@@ -129,6 +129,65 @@ fn tls_client(addr: SocketAddr, ca_der: &[u8]) -> Result<rustls::ClientConnectio
     rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())
 }
 
+/// Bytes sent to an app port over TLS asking for the name `sni` (not the address),
+/// trusting only `roots`: the answer, and the certificate the hub answered with.
+pub fn https_named(
+    addr: SocketAddr,
+    roots: &[Vec<u8>],
+    sni: &str,
+    bytes: &[u8],
+) -> Result<(Reply, Vec<u8>), String> {
+    let mut store = rustls::RootCertStore::empty();
+    for r in roots {
+        store
+            .add(CertificateDer::from(r.clone()))
+            .map_err(|e| e.to_string())?;
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| e.to_string())?
+    .with_root_certificates(store)
+    .with_no_client_auth();
+    let name = ServerName::try_from(sni.to_string()).map_err(|e| e.to_string())?;
+    let mut conn =
+        rustls::ClientConnection::new(Arc::new(config), name).map_err(|e| e.to_string())?;
+    let mut tcp =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    tcp.set_read_timeout(Some(Duration::from_secs(20)))
+        .map_err(|e| e.to_string())?;
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+    tls.write_all(bytes).map_err(|e| e.to_string())?;
+    let mut answer = Vec::new();
+    match tls.read_to_end(&mut answer) {
+        Ok(_) => {}
+        Err(e) if !answer.is_empty() && e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let cert = conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.to_vec())
+        .unwrap_or_default();
+    Ok((parse(&answer), cert))
+}
+
+/// The certificate an app port answers with for a connection by address.
+pub fn cert_by_address(addr: SocketAddr, ca_der: &[u8]) -> Vec<u8> {
+    let mut conn = tls_client(addr, ca_der).expect("a TLS client");
+    let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+    tls.write_all(b"GET /hub/check HTTP/1.1\r\nHost: x\r\n\r\n")
+        .expect("send");
+    let mut answer = Vec::new();
+    let _ = tls.read_to_end(&mut answer);
+    conn.peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.to_vec())
+        .unwrap_or_default()
+}
+
 /// Bytes sent to an app port over TLS, trusting only `ca_der`; what came back until the
 /// hub closed. `Err` when the connection can't be made.
 pub fn https_raw(addr: SocketAddr, ca_der: &[u8], bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -650,6 +709,7 @@ impl Fixture {
         let clock = Arc::new(AtomicI64::new(keep_hub::util::now_ms()));
         let mut cfg = HubConfig::new(Ipv4Addr::LOCALHOST);
         cfg.ports.admin = 0; // any free port
+        cfg.ports.helper = 0;
         settings(&mut cfg);
         keep_hub::setup(
             dir.path(),
@@ -831,6 +891,19 @@ impl Fixture {
     }
 
     /// A GET for a file, streamed (nothing kept but its hash).
+    /// The current answer of an app port to a phone that asks for the hub name `name`,
+    /// trusting `roots` (the certificate authority of the name's certificate).
+    pub fn phone_by_name(
+        &self,
+        app: &str,
+        roots: &[Vec<u8>],
+        name: &str,
+        path: &str,
+    ) -> Result<(Reply, Vec<u8>), String> {
+        let bytes = request("GET", path, name, &[], None);
+        https_named(self.port(app), roots, name, &bytes)
+    }
+
     pub fn download(&self, app: &str, path: &str, headers: &[(&str, &str)]) -> Streamed {
         let addr = self.port(app);
         let bytes = request("GET", path, &addr.to_string(), headers, None);

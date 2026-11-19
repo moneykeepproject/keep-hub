@@ -26,7 +26,7 @@ use crate::config::HubConfig;
 use crate::keys::KeyStore;
 use crate::registry::{App, Device, Member, Registry, PIN_KEY};
 use crate::util::{self, StoreResult};
-use crate::{admin, ca, names, pin, relay};
+use crate::{admin, ca, names, page, pin, relay};
 
 /// The hub protocols this hub accepts from an app. A newer hub keeps every older number.
 pub const PROTOCOLS: &[u32] = &[1];
@@ -214,9 +214,11 @@ pub(crate) struct Hub {
     pub(crate) pin_cost: pin::Cost,
     pub(crate) idle: Duration,
     pub(crate) admin_token: String,
-    /// Where the admin address really listens.
+    /// Where the admin address and the certificate page really listen.
     admin_port: u16,
+    helper_port: u16,
     pub(crate) tls: Arc<rustls::ServerConfig>,
+    pub(crate) resolver: Arc<ca::Resolver>,
     pub(crate) gate: Arc<relay::Gate>,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) names: Arc<names::Names>,
@@ -357,6 +359,50 @@ impl Hub {
         let info = st.registry.app(app).ok().flatten()?;
         let secret = st.secrets.get(app)?.clone();
         Some((info, secret))
+    }
+
+    /// Give the app ports the hub name's certificate as it now stands (after a renewal,
+    /// turning names on or off). Phones already connected keep their connection.
+    pub(crate) fn refresh_name(&self) {
+        let cert = self.names.serving();
+        let set = self.resolver.set_named(cert.as_ref().map(|c| {
+            (
+                c.name.as_str(),
+                c.chain.as_slice(),
+                c.key.as_slice(),
+                c.staging,
+            )
+        }));
+        match set {
+            Ok(true) if cert.is_some() => self.log("names: certificate in use on the app ports"),
+            Ok(true) => self.log("names: app ports answer by address only"),
+            Ok(false) => {}
+            Err(e) => self.log(&format!("names: {e}")),
+        }
+    }
+
+    /// The addresses that open `app` with a pairing code or invite in `fragment`
+    /// (`pair=…` or `invite=…`): by the hub name when it has a real certificate, by address,
+    /// and the certificate page for phones that connect by address.
+    fn open_addresses(&self, app: &App, key: &str, code: &str) -> Value {
+        let by_address = format!(
+            "https://{}:{}/#{key}={code}",
+            self.cfg.address, app.public_port
+        );
+        let by_name = self
+            .resolver
+            .name()
+            .filter(|n| self.resolver.trusted_name(Some(n)))
+            .map(|n| format!("https://{n}:{}/#{key}={code}", app.public_port));
+        json!({
+            "url": by_name.clone().unwrap_or_else(|| by_address.clone()),
+            "url_by_name": by_name,
+            "url_by_address": by_address,
+            "certificate_page": format!(
+                "http://{}:{}/?app={}&{key}={code}",
+                self.cfg.address, self.helper_port, app.id
+            ),
+        })
     }
 
     // ----- pairing --------------------------------------------------------------------------------
@@ -635,11 +681,10 @@ impl Hub {
                 tries: 0,
             },
         );
-        Ok(json!({
-            "code": shown(&code),
-            "expires": expires,
-            "url": format!("https://{}:{}/#pair={}", self.cfg.address, a.public_port, shown(&code)),
-        }))
+        let mut v = self.open_addresses(&a, "pair", &shown(&code));
+        v["code"] = json!(shown(&code));
+        v["expires"] = json!(expires);
+        Ok(v)
     }
 
     /// Cancel a pairing code. `false` when there is no such code.
@@ -679,12 +724,12 @@ impl Hub {
             .registry
             .add_invite(&code, app, scope, now, expires)
             .map_err(Refusal::inner)?;
-        Ok(json!({
-            "id": id,
-            "code": shown(&code),
-            "expires": expires,
-            "url": format!("https://{}:{}/#invite={}", self.cfg.address, a.public_port, shown(&code)),
-        }))
+        drop(st);
+        let mut v = self.open_addresses(&a, "invite", &shown(&code));
+        v["id"] = json!(id);
+        v["code"] = json!(shown(&code));
+        v["expires"] = json!(expires);
+        Ok(v)
     }
 
     // ----- apps and their ports -------------------------------------------------------------------
@@ -758,7 +803,12 @@ impl Hub {
                 format!("{title} holds financial records, so it can't accept guests."),
             ));
         }
-        let own = [self.cfg.ports.helper, self.cfg.ports.admin, self.admin_port];
+        let own = [
+            self.cfg.ports.helper,
+            self.cfg.ports.admin,
+            self.admin_port,
+            self.helper_port,
+        ];
         for (port, what) in [(r.public_port, "public"), (r.loopback_port, "loopback")] {
             if port < 1024 || own.contains(&port) {
                 return Err(bad(format!(
@@ -920,6 +970,8 @@ impl Hub {
 pub struct Running {
     /// The admin address (this computer only).
     pub admin: SocketAddr,
+    /// The certificate page (plain HTTP on the home network).
+    pub helper: SocketAddr,
     /// The hub's own certificate authority: its public facts and its certificate.
     pub info: ca::Info,
     pub ca_der: Vec<u8>,
@@ -945,6 +997,7 @@ impl Running {
     pub fn stop(mut self) {
         self.hub.stopping.store(true, Ordering::SeqCst);
         self.hub.names.poke();
+        relay::wake(self.helper);
         let listeners: Vec<Listener> = {
             let mut st = self.hub.lock();
             st.listeners.drain().map(|(_, l)| l).collect()
@@ -996,6 +1049,22 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         .ok_or_else(|| "the hub's admin listener has no address".to_string())?;
     let admin_server = Arc::new(admin_server);
 
+    // the certificate page: its own server on loopback, behind a front with limits
+    let helper_listener = TcpListener::bind((cfg.address, cfg.ports.helper)).map_err(|e| {
+        format!(
+            "the hub can't listen on {}:{}: {e}. Is another program using that port?",
+            cfg.address, cfg.ports.helper
+        )
+    })?;
+    let helper_addr = helper_listener.local_addr().map_err(|e| e.to_string())?;
+    let page_server = Server::http(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        .map_err(|e| format!("the hub can't start its certificate page: {e}"))?;
+    let page_backend = page_server
+        .server_addr()
+        .to_ip()
+        .ok_or_else(|| "the certificate page has no address".to_string())?;
+    let page_server = Arc::new(page_server);
+
     let outside = match opts.outside {
         Some(o) => o,
         None => names::Outside::system().unwrap_or_else(|e| {
@@ -1042,7 +1111,9 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         idle: opts.idle,
         admin_token,
         admin_port: admin_addr.port(),
+        helper_port: helper_addr.port(),
         tls,
+        resolver: resolver.clone(),
         gate: relay::Gate::new(),
         stopping: Arc::new(AtomicBool::new(false)),
         names,
@@ -1062,7 +1133,26 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         }
     }
 
+    hub.refresh_name();
     let mut threads = Vec::new();
+    {
+        let stop = hub.stopping.clone();
+        threads.push(spawn("hub-page-front", move || {
+            page::front(helper_listener, page_backend, stop)
+        })?);
+    }
+    for i in 0..2 {
+        let (server, hub) = (page_server.clone(), hub.clone());
+        threads.push(spawn(&format!("hub-page-{i}"), move || {
+            while !hub.stopping.load(Ordering::SeqCst) {
+                match server.recv_timeout(Duration::from_millis(200)) {
+                    Ok(Some(req)) => page::handle(&hub, req),
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        })?);
+    }
     for i in 0..ADMIN_WORKERS {
         let (server, hub) = (admin_server.clone(), hub.clone());
         threads.push(spawn(&format!("hub-admin-{i}"), move || {
@@ -1081,6 +1171,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         threads.push(spawn("hub-names", move || {
             while !hub.stopping.load(Ordering::SeqCst) {
                 hub.names.run_once();
+                hub.refresh_name();
                 hub.names.wait_for_work(Duration::from_secs(60));
             }
         })?);
@@ -1110,6 +1201,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
     }
     Ok(Running {
         admin: admin_addr,
+        helper: helper_addr,
         info: material.info,
         ca_der: material.ca_der,
         hub,

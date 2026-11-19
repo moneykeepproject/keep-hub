@@ -121,13 +121,13 @@ impl Drop for Ticket {
 }
 
 /// One connection's place in the per-address count; given back when dropped.
-struct Slot {
+pub(crate) struct Slot {
     per: Arc<Mutex<HashMap<IpAddr, usize>>>,
     ip: IpAddr,
 }
 
 impl Slot {
-    fn take(per: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Option<Slot> {
+    pub(crate) fn take(per: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Option<Slot> {
         let mut m = per.lock().ok()?;
         let n = m.entry(ip).or_default();
         if *n >= MAX_PER_ADDRESS {
@@ -234,10 +234,16 @@ fn read_until(tcp: &TcpStream, until: Instant) -> std::io::Result<()> {
     tcp.set_read_timeout(Some(left))
 }
 
+/// Whether this phone asked for the hub name and got its real certificate (then HSTS).
+fn by_name(hub: &Hub, tls: &Tls) -> bool {
+    hub.resolver.trusted_name(tls.conn.server_name())
+}
+
 /// Send one of the hub's own answers and close.
 fn finish(hub: &Hub, tls: &mut Tls, method: &str, path: &str, a: &Answer) -> std::io::Result<()> {
     hub.log_request(method, path, a.status);
-    tls.write_all(&a.to_bytes(method == "HEAD"))?;
+    let hsts = by_name(hub, tls);
+    tls.write_all(&a.to_bytes(method == "HEAD", hsts))?;
     close(tls)
 }
 
@@ -571,7 +577,8 @@ fn forward(
             _ => return refuse(hub, tls, head, &failed()),
         }
     };
-    let Some((status, answer)) = http::answer_head(buf.get(..end).unwrap_or(&[])) else {
+    let hsts = by_name(hub, tls);
+    let Some((status, answer)) = http::answer_head(buf.get(..end).unwrap_or(&[]), hsts) else {
         return refuse(hub, tls, head, &failed());
     };
     hub.log_request(&head.method, head.path(), status);

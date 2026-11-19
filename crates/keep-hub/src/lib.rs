@@ -1,12 +1,13 @@
 //! Keep Hub: the one program on a household's computer that phones connect to, shared by
 //! every Keep and Pick app on that computer. See `docs/specs/keep-hub.md`.
 //!
-//! Built so far (stages 1 to 3 of AGENTS.md section 5): the relay on each app's port
+//! Built so far (stages 1 to 4 of AGENTS.md section 5): the relay on each app's port
 //! ([`relay`]), the registry of apps, members, grants and devices ([`registry`]), pairing
 //! and guests ([`hub`]), the admin address ([`admin`]), web clients' files passed through
 //! whatever their size, compression or caching ([`relay`], [`http`]), and the hub name with
 //! its certificate ([`names`], using [`nameservice`], [`acme`], [`dns`], [`client`] and
-//! [`der`]).
+//! [`der`]), both certificates on every app port ([`ca`]) and the certificate page
+//! ([`page`]).
 //!
 //! Copied from ShareKeep's hub (`crates/sk-hub`) as the starting point: the certificate
 //! authority and TLS settings ([`ca`]), the PIN hashing ([`pin`]), the key store ([`keys`],
@@ -28,6 +29,7 @@ pub mod hub;
 pub mod keys;
 pub mod names;
 pub mod nameservice;
+pub mod page;
 pub mod pin;
 pub mod registry;
 pub mod relay;

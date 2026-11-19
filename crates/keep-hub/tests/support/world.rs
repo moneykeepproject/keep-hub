@@ -140,6 +140,9 @@ pub struct World {
     pub proofs_hidden: AtomicBool,
     /// The name service doesn't answer.
     pub service_down: AtomicBool,
+    /// The name service also takes 127.0.0.1 (the test hub's address). The real one, and
+    /// this fake by default, take home addresses only.
+    pub allow_loopback: AtomicBool,
 }
 
 /// A raw P-256 public key, for rcgen to certify.
@@ -189,6 +192,7 @@ impl World {
             public_down: AtomicBool::new(false),
             proofs_hidden: AtomicBool::new(false),
             service_down: AtomicBool::new(false),
+            allow_loopback: AtomicBool::new(false),
         })
     }
 
@@ -202,6 +206,11 @@ impl World {
                 clock.fetch_add(d.as_millis() as i64, Ordering::SeqCst);
             }),
         }
+    }
+
+    /// The certificate authority the fake ACME server issues from (DER), for a phone to trust.
+    pub fn acme_ca(&self) -> Vec<u8> {
+        keep_hub::der::pem_certificates(&self.acme.lock().unwrap().ca_pem).remove(0)
     }
 
     pub fn now_s(&self) -> i64 {
@@ -268,7 +277,8 @@ impl World {
             ("PUT", "address") => {
                 let a = body["address"].as_str().unwrap_or("").to_string();
                 let ip: Option<Ipv4Addr> = a.parse().ok();
-                if !ip.is_some_and(|ip| ip.is_private()) {
+                let loopback = self.allow_loopback.load(Ordering::SeqCst);
+                if !ip.is_some_and(|ip| ip.is_private() || (loopback && ip.is_loopback())) {
                     return err(400, "address_not_private");
                 }
                 ns.a.insert(name.clone(), a.clone());

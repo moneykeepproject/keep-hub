@@ -12,9 +12,10 @@
 //!   it ends, with the same CA.
 //! - **The keys** in the hub's key store ([`crate::keys`]).
 //!
-//! Stage 1 uses this certificate on every app port, for phones that connect by address.
-//! The hub name and its public certificate (stage 3), and the certificate page and the
-//! choice between the two certificates by the name asked for (stage 4), are not here yet.
+//! Every app port answers with this certificate for phones that connect by address, and
+//! with the hub name's certificate (`names.rs`) for phones that ask for the hub name
+//! ([`Resolver`]). The certificate page that installs this authority on a phone is
+//! `page.rs`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -418,28 +419,61 @@ pub fn remove(dir: &Path, secrets: &Secrets) -> Vec<String> {
 }
 // ----- the TLS settings -------------------------------------------------------------------------
 
-/// The server certificate in use; a renewal swaps it without dropping phones.
-#[derive(Debug)]
-pub struct Resolver {
-    current: RwLock<Arc<rustls::sign::CertifiedKey>>,
+/// The hub name's certificate as the names engine gives it: the name, the chain (DER, leaf
+/// first), the key (PKCS#8), and whether it is from Let's Encrypt's staging service.
+pub type NamedCert<'a> = (&'a str, &'a [Vec<u8>], &'a [u8], bool);
+
+/// The hub name's certificate (stage 4: both certificates on one port).
+struct Named {
+    name: String,
+    staging: bool,
+    leaf: Vec<u8>,
+    key: Arc<rustls::sign::CertifiedKey>,
 }
 
-fn certified(m: &Material) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(m.key.to_vec()));
+/// The certificates the app ports answer with, chosen by the name the phone asked for
+/// (Server Name Indication, RFC 6066 section 3): the hub name's certificate when a phone
+/// asks for the hub name, the hub's own when it asks by address (a phone sends no name
+/// for an address) or for any other name. A renewal swaps either without dropping phones.
+pub struct Resolver {
+    current: RwLock<Arc<rustls::sign::CertifiedKey>>,
+    named: RwLock<Option<Named>>,
+}
+
+impl std::fmt::Debug for Resolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolver")
+            .field("name", &self.name())
+            .finish_non_exhaustive()
+    }
+}
+
+fn certified_key(chain: &[Vec<u8>], key: &[u8]) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec()));
     let signer = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| format!("the server key cannot be used: {e}"))?;
     Ok(Arc::new(rustls::sign::CertifiedKey::new(
-        vec![CertificateDer::from(m.cert_der.clone())],
+        chain
+            .iter()
+            .map(|c| CertificateDer::from(c.clone()))
+            .collect(),
         signer,
     )))
+}
+
+fn certified(m: &Material) -> Result<Arc<rustls::sign::CertifiedKey>, String> {
+    certified_key(std::slice::from_ref(&m.cert_der), &m.key)
 }
 
 impl Resolver {
     pub fn new(m: &Material) -> Result<Self, String> {
         Ok(Self {
             current: RwLock::new(certified(m)?),
+            named: RwLock::new(None),
         })
     }
+
+    /// The hub's own certificate, renewed.
     pub fn set(&self, m: &Material) -> Result<(), String> {
         let c = certified(m)?;
         if let Ok(mut cur) = self.current.write() {
@@ -447,13 +481,80 @@ impl Resolver {
         }
         Ok(())
     }
+
+    /// The hub name's certificate (`None`: names off, or no certificate). `true` when it
+    /// changed.
+    pub fn set_named(&self, cert: Option<NamedCert<'_>>) -> Result<bool, String> {
+        let new = match cert {
+            Some((name, chain, key, staging)) => {
+                let leaf = chain.first().cloned().unwrap_or_default();
+                if self
+                    .named
+                    .read()
+                    .ok()
+                    .and_then(|n| n.as_ref().map(|n| n.leaf == leaf && n.name == name))
+                    .unwrap_or(false)
+                {
+                    return Ok(false);
+                }
+                Some(Named {
+                    name: name.to_ascii_lowercase(),
+                    staging,
+                    leaf,
+                    key: certified_key(chain, key)?,
+                })
+            }
+            None => {
+                if self.named.read().map(|n| n.is_none()).unwrap_or(false) {
+                    return Ok(false);
+                }
+                None
+            }
+        };
+        if let Ok(mut n) = self.named.write() {
+            *n = new;
+        }
+        Ok(true)
+    }
+
+    /// The hub name being answered for, if any.
+    pub fn name(&self) -> Option<String> {
+        self.named
+            .read()
+            .ok()
+            .and_then(|n| n.as_ref().map(|n| n.name.clone()))
+    }
+
+    /// Whether a phone that asked for `sni` gets the hub name's certificate, and it is a
+    /// real one (not from Let's Encrypt's staging service): then HSTS applies.
+    pub fn trusted_name(&self, sni: Option<&str>) -> bool {
+        let Some(sni) = sni else { return false };
+        self.named
+            .read()
+            .ok()
+            .and_then(|n| {
+                n.as_ref()
+                    .map(|n| !n.staging && n.name.eq_ignore_ascii_case(sni))
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl rustls::server::ResolvesServerCert for Resolver {
     fn resolve(
         &self,
-        _hello: rustls::server::ClientHello<'_>,
+        hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if let Some(sni) = hello.server_name() {
+            let named = self.named.read().ok().and_then(|n| {
+                n.as_ref()
+                    .filter(|n| n.name.eq_ignore_ascii_case(sni))
+                    .map(|n| n.key.clone())
+            });
+            if named.is_some() {
+                return named;
+            }
+        }
         self.current.read().ok().map(|c| c.clone())
     }
 }

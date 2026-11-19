@@ -51,7 +51,10 @@ fn run() -> Result<(), String> {
         }
         "run" => {
             let running = keep_hub::start(HubOptions::new(data))?;
-            eprintln!("Keep Hub running: this computer http://{}", running.admin);
+            eprintln!(
+                "Keep Hub running: this computer http://{}  certificate page http://{}",
+                running.admin, running.helper
+            );
             running.wait();
             Ok(())
         }

@@ -102,7 +102,7 @@ fn at11_a_plain_clients_files_and_policy_arrive_unchanged_with_the_hubs_headers(
     assert_eq!(js.text(), "document.title = 'Plain';");
     assert_eq!(js.header("content-type"), Some("text/javascript"));
     assert_eq!(js.header("referrer-policy"), Some("no-referrer"));
-    // no HSTS for a phone that came by address (it comes with the hub name, stage 3)
+    // no HSTS for a phone that came by address (only by the hub name: tests/fallback.rs)
     assert_eq!(page.header("strict-transport-security"), None);
 }
 

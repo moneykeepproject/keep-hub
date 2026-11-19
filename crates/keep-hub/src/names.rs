@@ -18,9 +18,9 @@
 //! when requests were sent), `hub-name.crt` (the certificate chain), and in the key store,
 //! sealed, the name service's token, the account key and the certificate's key.
 //!
-//! Serving the certificate to phones (beside the hub's own, chosen by the name the phone
-//! asks for) is stage 4; finding a new home address is stage 5. Until then the address is
-//! the one in `hub.json`.
+//! The app ports serve the certificate to phones that ask for the hub name, beside the
+//! hub's own ([`crate::ca::Resolver`], refreshed by the hub after every run). Finding a new
+//! home address is stage 5; until then the address is the one in `hub.json`.
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -151,8 +151,9 @@ struct Saved {
     cert_staging: bool,
 }
 
-/// The certificate in use: its chain (DER, leaf first), key (PKCS#8) and dates.
+/// The certificate in use: its name, chain (DER, leaf first), key (PKCS#8) and dates.
 pub struct NameCert {
+    pub name: String,
     pub chain: Vec<Vec<u8>>,
     pub key: Zeroizing<Vec<u8>>,
     pub info: der::CertInfo,
@@ -347,6 +348,7 @@ impl Names {
             return None;
         }
         Some(NameCert {
+            name,
             chain,
             key,
             info,
@@ -454,6 +456,14 @@ impl Names {
             "fallback_offered": l.state == NameState::Blocked,
             "message": l.message,
         })
+    }
+
+    /// The certificate phones asking for the hub name get: none while names are off.
+    pub fn serving(&self) -> Option<NameCert> {
+        if !self.live().settings.enabled {
+            return None;
+        }
+        self.certificate()
     }
 
     /// Wait until poked or `timeout` passes; `true` when poked.

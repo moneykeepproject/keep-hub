@@ -140,16 +140,16 @@ impl Answer {
         }
     }
 
-    /// The bytes to send (`head_only` for an answer to HEAD).
-    pub fn to_bytes(&self, head_only: bool) -> Vec<u8> {
+    /// The bytes to send (`head_only` for an answer to HEAD; `hsts` when the phone used
+    /// the hub name).
+    pub fn to_bytes(&self, head_only: bool, hsts: bool) -> Vec<u8> {
         let body = serde_json::to_vec(&self.body).unwrap_or_default();
         let mut out = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{}Connection: close\r\n\r\n",
             self.status,
             reason(self.status),
             body.len(),
-            HUB_HEADERS
-                .iter()
+            added(hsts)
                 .map(|(k, v)| format!("{k}: {v}\r\n"))
                 .collect::<String>()
         )
@@ -183,20 +183,29 @@ pub fn reason(status: u16) -> &'static str {
 }
 
 /// The headers the hub adds to every answer, its own and those it passes on (the spec's
-/// "Headers the hub adds to every answer"). `Strict-Transport-Security`, for phones that
-/// use the hub name, comes with the name in stage 3.
+/// "Headers the hub adds to every answer").
 pub const HUB_HEADERS: &[(&str, &str)] = &[
     ("X-Content-Type-Options", "nosniff"),
     ("Referrer-Policy", "no-referrer"),
 ];
 
+/// Added too when the phone used the hub name with its real certificate (RFC 6797). One day
+/// (owner decision 2026-11-18): little lock-in if the name's certificate ever lapses. No
+/// `includeSubDomains`: the name is this hub's alone.
+pub const HSTS: (&str, &str) = ("Strict-Transport-Security", "max-age=86400");
+
+/// The headers to add to one answer.
+fn added(hsts: bool) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    HUB_HEADERS.iter().chain(hsts.then_some(&HSTS))
+}
+
 /// An app backend's answer head, made ready for the phone: its status, and its lines with
 /// the connection headers replaced by `Connection: close` (the hub closes after every
-/// answer), and the hub's own headers ([`HUB_HEADERS`]) in place of any of the same name
-/// the backend sent (theirs are already the strictest values). Everything else, the
-/// content type, encoding, caching headers and security policy included, is passed on as
-/// the backend sent it. `None` when it isn't an HTTP answer.
-pub fn answer_head(head: &[u8]) -> Option<(u16, Vec<u8>)> {
+/// answer), and the hub's own headers ([`HUB_HEADERS`], and [`HSTS`] when `hsts`) in place
+/// of any of the same name the backend sent (the hub's are already the strictest values).
+/// Everything else, the content type, encoding, caching headers and security policy
+/// included, is passed on as the backend sent it. `None` when it isn't an HTTP answer.
+pub fn answer_head(head: &[u8], hsts: bool) -> Option<(u16, Vec<u8>)> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     let first = lines.next()?;
@@ -213,7 +222,7 @@ pub fn answer_head(head: &[u8]) -> Option<(u16, Vec<u8>)> {
         let name = line.split(':').next().unwrap_or("").trim();
         let replaced = ["connection", "keep-alive", "proxy-connection"]
             .iter()
-            .chain(HUB_HEADERS.iter().map(|(k, _)| k))
+            .chain(HUB_HEADERS.iter().chain([&HSTS]).map(|(k, _)| k))
             .any(|h| name.eq_ignore_ascii_case(h));
         if replaced {
             continue;
@@ -221,7 +230,7 @@ pub fn answer_head(head: &[u8]) -> Option<(u16, Vec<u8>)> {
         out.push_str(line);
         out.push_str("\r\n");
     }
-    for (k, v) in HUB_HEADERS {
+    for (k, v) in added(hsts) {
         out.push_str(&format!("{k}: {v}\r\n"));
     }
     out.push_str("Connection: close\r\n\r\n");
@@ -291,13 +300,13 @@ mod tests {
     #[test]
     fn the_hubs_own_answers_close_and_carry_its_headers() {
         let a = Answer::error(401, "not_paired", "Pair this phone first.");
-        let text = String::from_utf8(a.to_bytes(false)).unwrap();
+        let text = String::from_utf8(a.to_bytes(false, false)).unwrap();
         assert!(text.starts_with("HTTP/1.1 401 Unauthorized\r\n"));
         assert!(text.contains("X-Content-Type-Options: nosniff\r\n"));
         assert!(text.contains("Referrer-Policy: no-referrer\r\n"));
         assert!(text.contains("Connection: close\r\n"));
         assert!(text.ends_with(r#"{"error":"not_paired","message":"Pair this phone first."}"#));
-        let head = String::from_utf8(a.to_bytes(true)).unwrap();
+        let head = String::from_utf8(a.to_bytes(true, false)).unwrap();
         assert!(head.ends_with("\r\n\r\n"));
     }
 
@@ -305,6 +314,7 @@ mod tests {
     fn a_backends_answer_head_is_passed_on_but_closes() {
         let (status, head) = answer_head(
             b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Security-Policy: default-src 'self'\r\nreferrer-policy: origin\r\nX-Content-Type-Options: nosniff",
+            false,
         )
         .unwrap();
         assert_eq!(status, 304);
@@ -312,7 +322,20 @@ mod tests {
             String::from_utf8(head).unwrap(),
             "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Security-Policy: default-src 'self'\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n"
         );
-        assert_eq!(answer_head(b"SSH-2.0-OpenSSH"), None);
-        assert_eq!(answer_head(b"HTTP/1.1 abc OK"), None);
+        assert_eq!(answer_head(b"SSH-2.0-OpenSSH", false), None);
+        assert_eq!(answer_head(b"HTTP/1.1 abc OK", false), None);
+        // by the hub name: the hub's HSTS, in place of the backend's
+        let (_, head) = answer_head(
+            b"HTTP/1.1 200 OK\r\nStrict-Transport-Security: max-age=63072000; includeSubDomains",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(head).unwrap(),
+            "HTTP/1.1 200 OK\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nStrict-Transport-Security: max-age=86400\r\nConnection: close\r\n\r\n"
+        );
+        let own =
+            String::from_utf8(Answer::ok(serde_json::json!({})).to_bytes(false, true)).unwrap();
+        assert!(own.contains("Strict-Transport-Security: max-age=86400\r\n"));
     }
 }
