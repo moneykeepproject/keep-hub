@@ -625,7 +625,7 @@ fn the_hubs_https_client_reads_answers_and_refuses_a_server_it_doesnt_trust() {
     let app = support::TestApp::start("alpha");
     f.register(&app, false, false);
     let port = f.port("alpha").port();
-    let client = HttpsClient::with_roots(&[f.hub().ca_der.clone()]).unwrap();
+    let client = HttpsClient::with_roots(&[f.hub().ca_der()]).unwrap();
     let r = client
         .send(
             "GET",
@@ -653,7 +653,7 @@ fn the_hubs_https_client_reads_answers_and_refuses_a_server_it_doesnt_trust() {
     );
     // another hub's authority: refused before any request is sent
     let other = Fixture::new();
-    let stranger = HttpsClient::with_roots(&[other.hub().ca_der.clone()]).unwrap();
+    let stranger = HttpsClient::with_roots(&[other.hub().ca_der()]).unwrap();
     let e = stranger
         .send(
             "GET",

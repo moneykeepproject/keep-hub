@@ -28,9 +28,12 @@
 //! POST   /admin/v1/names/on       {registration_code?}  turn on (the code the first time)
 //! POST   /admin/v1/names/off                    turn off (the name and certificate are kept)
 //! POST   /admin/v1/names/renew                  ask for a new certificate now
+//! POST   /admin/v1/names/address                send the address to the name service again
+//! GET    /admin/v1/addresses                    this computer's home addresses and adapters
+//! PUT    /admin/v1/address        {adapter}     which adapter's address to use ("automatic")
+//! POST   /admin/v1/problems                     Find the problem: run the checks
+//! GET    /admin/v1/problems                     the last results
 //! ```
-//!
-//! "Find the problem" joins this list with stage 5.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -152,6 +155,11 @@ struct InviteRequest {
 struct NamesOnRequest {
     #[serde(default)]
     registration_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AdapterRequest {
+    adapter: String,
 }
 
 #[derive(Deserialize)]
@@ -329,6 +337,34 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
         }
 
         ("GET", ["names"]) => Ok(hub.names.status()),
+        ("POST", ["names", "address"]) => {
+            hub.names.resend_address();
+            Ok(json!({ "ok": true }))
+        }
+        ("GET", ["addresses"]) => {
+            let cfg = crate::config::HubConfig::load(&hub.data).map_err(Refusal::inner)?;
+            Ok(json!({
+                "current": hub.address(),
+                "adapter": cfg.address.adapter,
+                "addresses": hub.machine.addresses(),
+            }))
+        }
+        ("PUT", ["address"]) => {
+            let b: AdapterRequest = read_json(req)?;
+            hub.choose_adapter(&b.adapter)
+                .map_err(|m| Refusal::new(400, "bad_adapter", m))?;
+            Ok(json!({ "current": hub.address() }))
+        }
+        ("POST", ["problems"]) => {
+            let results = crate::problems::run(hub);
+            hub.lock().problems = Some(results.clone());
+            Ok(results)
+        }
+        ("GET", ["problems"]) => Ok(hub
+            .lock()
+            .problems
+            .clone()
+            .unwrap_or_else(|| json!({ "checks": [], "stopped_at": null, "at": null }))),
         ("POST", ["names", "on"]) => {
             let b: NamesOnRequest = read_json_or_empty(req)?;
             hub.names

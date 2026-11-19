@@ -430,7 +430,12 @@ pub(crate) fn handle(hub: &Arc<Hub>, req: Request) {
 /// [`crate::relay::MAX_PER_ADDRESS`] from one address, each closed after [`HELPER_IDLE`] without traffic,
 /// passed to the page's own server on `backend`. Waits in `accept`; closing wakes it
 /// ([`crate::relay::wake`]).
-pub(crate) fn front(listener: TcpListener, backend: SocketAddr, stopping: Arc<AtomicBool>) {
+pub(crate) fn front(
+    listener: TcpListener,
+    backend: SocketAddr,
+    stop: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+) {
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(std::collections::HashMap::<IpAddr, usize>::new()));
     if listener.set_nonblocking(false).is_err() {
@@ -438,7 +443,7 @@ pub(crate) fn front(listener: TcpListener, backend: SocketAddr, stopping: Arc<At
     }
     loop {
         let accepted = listener.accept();
-        if stopping.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) || stopping.load(Ordering::SeqCst) {
             return;
         }
         match accepted {

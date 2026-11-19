@@ -24,6 +24,7 @@ use zeroize::Zeroizing;
 
 use crate::config::HubConfig;
 use crate::keys::KeyStore;
+use crate::machine::{self, Machine};
 use crate::registry::{App, Device, Member, Registry, PIN_KEY};
 use crate::util::{self, StoreResult};
 use crate::{admin, ca, names, page, pin, relay};
@@ -67,7 +68,16 @@ pub struct HubOptions {
     /// The internet, for the hub name (`None`: the real one, trusting what this computer
     /// trusts; tests give fakes).
     pub outside: Option<names::Outside>,
+    /// This computer: its address, adapters and firewall (`None`: the real one).
+    pub machine: Option<Arc<dyn Machine>>,
+    /// How often the hub looks at the default route for a new address.
+    pub address_poll: Duration,
 }
+
+/// How often the hub looks for a new address (owner decision 2026-11-18: a cheap look at
+/// the default route, instead of the system's network-change events). The full look at
+/// the adapters is every `address.check_minutes`.
+pub const ADDRESS_POLL: Duration = Duration::from_secs(15);
 
 impl HubOptions {
     /// The production settings for a hub keeping its data in `data`.
@@ -80,6 +90,8 @@ impl HubOptions {
             pin_cost: pin::COST,
             idle: relay::IDLE,
             outside: None,
+            machine: None,
+            address_poll: ADDRESS_POLL,
         }
     }
 }
@@ -96,8 +108,11 @@ pub fn setup(
 ) -> StoreResult<ca::Info> {
     std::fs::create_dir_all(data).map_err(|e| format!("{} can't be made: {e}", data.display()))?;
     cfg.save(data)?;
-    let target = ca::Target { ip: cfg.address };
-    let m = ca::ensure(data, keys, &target, computer, now_ms / 1000)?;
+    let ip = cfg
+        .address
+        .current
+        .ok_or("The hub needs this computer's home address to be set up.")?;
+    let m = ca::ensure(data, keys, &ca::Target { ip }, computer, now_ms / 1000)?;
     if !data.join(ADMIN_TOKEN_FILE).exists() {
         let t = util::hex(&util::random::<32>()?);
         util::write_private(&data.join(ADMIN_TOKEN_FILE), t.as_bytes())?;
@@ -200,6 +215,10 @@ pub(crate) struct State {
     /// The secret shared with each app, for `Keep-Hub-Auth`.
     secrets: HashMap<String, Zeroizing<String>>,
     listeners: HashMap<String, Listener>,
+    /// The certificate page's front on the home network.
+    page: Option<Listener>,
+    /// The last "Find the problem" results.
+    pub(crate) problems: Option<Value>,
 }
 
 pub(crate) struct Hub {
@@ -216,7 +235,12 @@ pub(crate) struct Hub {
     pub(crate) admin_token: String,
     /// Where the admin address and the certificate page really listen.
     admin_port: u16,
-    helper_port: u16,
+    helper_port: std::sync::atomic::AtomicU16,
+    /// The certificate page's own server on loopback.
+    page_backend: SocketAddr,
+    /// The home address in use (`None`: not on a home network).
+    address: Mutex<Option<Ipv4Addr>>,
+    pub(crate) machine: Arc<dyn Machine>,
     pub(crate) tls: Arc<rustls::ServerConfig>,
     pub(crate) resolver: Arc<ca::Resolver>,
     pub(crate) gate: Arc<relay::Gate>,
@@ -385,10 +409,11 @@ impl Hub {
     /// (`pair=…` or `invite=…`): by the hub name when it has a real certificate, by address,
     /// and the certificate page for phones that connect by address.
     fn open_addresses(&self, app: &App, key: &str, code: &str) -> Value {
-        let by_address = format!(
-            "https://{}:{}/#{key}={code}",
-            self.cfg.address, app.public_port
-        );
+        let ip = self
+            .address()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "(no home address)".into());
+        let by_address = format!("https://{ip}:{}/#{key}={code}", app.public_port);
         let by_name = self
             .resolver
             .name()
@@ -399,8 +424,9 @@ impl Hub {
             "url_by_name": by_name,
             "url_by_address": by_address,
             "certificate_page": format!(
-                "http://{}:{}/?app={}&{key}={code}",
-                self.cfg.address, self.helper_port, app.id
+                "http://{ip}:{}/?app={}&{key}={code}",
+                self.helper_port(),
+                app.id
             ),
         })
     }
@@ -734,13 +760,23 @@ impl Hub {
 
     // ----- apps and their ports -------------------------------------------------------------------
 
-    /// Open `app`'s public port.
+    /// The home address in use.
+    pub(crate) fn address(&self) -> Option<Ipv4Addr> {
+        *self.address.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The certificate page's port (its address is [`Hub::address`]).
+    pub(crate) fn helper_port(&self) -> u16 {
+        self.helper_port.load(Ordering::SeqCst)
+    }
+
+    /// Open `app`'s public port on the home address.
     fn open_port(self: &Arc<Self>, app: &str, port: u16) -> StoreResult<Listener> {
-        let listener = TcpListener::bind((self.cfg.address, port)).map_err(|e| {
-            format!(
-                "Port {port} can't be opened on {}: {e}. Is another program using it?",
-                self.cfg.address
-            )
+        let ip = self
+            .address()
+            .ok_or("This computer isn't on a home network, so no port is opened.")?;
+        let listener = TcpListener::bind((ip, port)).map_err(|e| {
+            format!("Port {port} can't be opened on {ip}: {e}. Is another program using it?")
         })?;
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -807,7 +843,7 @@ impl Hub {
             self.cfg.ports.helper,
             self.cfg.ports.admin,
             self.admin_port,
-            self.helper_port,
+            self.helper_port(),
         ];
         for (port, what) in [(r.public_port, "public"), (r.loopback_port, "loopback")] {
             if port < 1024 || own.contains(&port) {
@@ -841,9 +877,10 @@ impl Hub {
             apps.into_iter().find(|a| a.id == r.id)
         };
         // the port: kept when it's already this app's, opened otherwise (before the old one
-        // closes, so a failure leaves the app as it was)
+        // closes, so a failure leaves the app as it was). Away from a home network nothing
+        // is open: the port opens when an address comes.
         let open_at = self.port_of(&r.id).map(|a| a.port());
-        let opened = if open_at == Some(r.public_port) {
+        let opened = if open_at == Some(r.public_port) || self.address().is_none() {
             None
         } else {
             Some(
@@ -959,10 +996,156 @@ impl Hub {
             "hub": "keep-hub",
             "version": VERSION,
             "protocols": PROTOCOLS,
-            "address": self.cfg.address,
+            "address": self.address(),
             "names": self.names.status()["state"],
             "apps": apps,
         }))
+    }
+}
+
+// ----- the home address ------------------------------------------------------------------------
+
+impl Hub {
+    /// Open the certificate page's front on the home address.
+    fn open_page(self: &Arc<Self>) -> StoreResult<Listener> {
+        let ip = self
+            .address()
+            .ok_or("This computer isn't on a home network, so the certificate page isn't open.")?;
+        let port = self.helper_port();
+        let listener = TcpListener::bind((ip, port)).map_err(|e| {
+            format!("the hub can't listen on {ip}:{port}: {e}. Is another program using that port?")
+        })?;
+        let addr = listener.local_addr().map_err(|e| e.to_string())?;
+        self.helper_port.store(addr.port(), Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (backend, stop, stopping) =
+                (self.page_backend, stop.clone(), self.stopping.clone());
+            spawn("hub-page-front", move || {
+                page::front(listener, backend, stop, stopping)
+            })?
+        };
+        Ok(Listener {
+            stop,
+            thread: Some(thread),
+            addr,
+        })
+    }
+
+    /// Open every registered app's port and the certificate page on the home address. A
+    /// port that can't be opened is logged and left closed: the others keep working.
+    fn open_all(self: &Arc<Self>) {
+        let apps = self.lock().registry.apps().unwrap_or_default();
+        for a in &apps {
+            if !self.lock().secrets.contains_key(&a.id) {
+                continue;
+            }
+            match self.open_port(&a.id, a.public_port) {
+                Ok(l) => {
+                    if let Some(old) = self.lock().listeners.insert(a.id.clone(), l) {
+                        old.close();
+                    }
+                }
+                Err(e) => self.log(&e),
+            }
+        }
+        match self.open_page() {
+            Ok(l) => {
+                if let Some(old) = self.lock().page.replace(l) {
+                    old.close();
+                }
+            }
+            Err(e) => self.log(&e),
+        }
+    }
+
+    /// Close every app port and the certificate page.
+    fn close_all(&self) {
+        let (ports, page) = {
+            let mut st = self.lock();
+            (
+                st.listeners.drain().map(|(_, l)| l).collect::<Vec<_>>(),
+                st.page.take(),
+            )
+        };
+        for l in ports.into_iter().chain(page) {
+            l.close();
+        }
+    }
+
+    /// The home address now: the default route's, or the chosen adapter's (looked up
+    /// only when `full`).
+    fn find_address(&self, full: bool) -> Option<Ipv4Addr> {
+        let cfg = HubConfig::load(&self.data).unwrap_or_else(|_| self.cfg.clone());
+        if cfg.address.automatic() {
+            return self.machine.default_address();
+        }
+        if !full {
+            return self.address();
+        }
+        machine::choose(&cfg.address.adapter, None, || self.machine.addresses())
+    }
+
+    /// Follow a change of the home address: a new authority for phones that connect by
+    /// address (the spec: they install it again), every port and the page on the new
+    /// address, the address in `hub.json`, and the name service told (through the names
+    /// engine). Phones that use the name are unaffected.
+    pub(crate) fn move_to(self: &Arc<Self>, new: Option<Ipv4Addr>) {
+        let _one = self.changing_apps.lock().unwrap_or_else(|p| p.into_inner());
+        let old = self.address();
+        if old == new {
+            return;
+        }
+        match new {
+            Some(ip) => {
+                match ca::ensure(
+                    &self.data,
+                    &self.keys,
+                    &ca::Target { ip },
+                    &ca::computer_name(),
+                    self.now() / 1000,
+                ) {
+                    Ok(m) => {
+                        let _ = self.resolver.set(&m);
+                        if m.ca_created {
+                            self.log("address changed: a new certificate for phones that connect by address");
+                        }
+                    }
+                    Err(e) => self.log(&e),
+                }
+                *self.address.lock().unwrap_or_else(|p| p.into_inner()) = Some(ip);
+                self.close_all();
+                self.open_all();
+                self.log("address changed: ports opened on the new address");
+            }
+            None => {
+                *self.address.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                self.close_all();
+                self.log("address lost: not on a home network");
+            }
+        }
+        if let Ok(mut cfg) = HubConfig::load(&self.data) {
+            cfg.address.current = new;
+            if let Err(e) = cfg.save(&self.data) {
+                self.log(&e);
+            }
+        }
+        self.names.set_address(new);
+    }
+
+    /// Choose the adapter whose address to publish (`automatic`, or an adapter's name), and
+    /// look again at once.
+    pub(crate) fn choose_adapter(self: &Arc<Self>, adapter: &str) -> Result<(), String> {
+        let a = adapter.trim();
+        if a.is_empty() || a.len() > 64 || a.chars().any(char::is_control) {
+            return Err("Give an adapter's name, or \"automatic\".".into());
+        }
+        let mut cfg = HubConfig::load(&self.data)?;
+        cfg.address.adapter = a.to_string();
+        cfg.save(&self.data)?;
+        let found = self.find_address(true);
+        self.move_to(found);
+        Ok(())
     }
 }
 
@@ -970,11 +1153,6 @@ impl Hub {
 pub struct Running {
     /// The admin address (this computer only).
     pub admin: SocketAddr,
-    /// The certificate page (plain HTTP on the home network).
-    pub helper: SocketAddr,
-    /// The hub's own certificate authority: its public facts and its certificate.
-    pub info: ca::Info,
-    pub ca_der: Vec<u8>,
     hub: Arc<Hub>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -993,18 +1171,34 @@ impl Running {
         self.hub.port_of(app)
     }
 
+    /// The home address in use.
+    pub fn address(&self) -> Option<Ipv4Addr> {
+        self.hub.address()
+    }
+
+    /// The certificate page (plain HTTP on the home network), when open.
+    pub fn helper(&self) -> Option<SocketAddr> {
+        self.hub.lock().page.as_ref().map(|l| l.addr)
+    }
+
+    /// The hub's own certificate authority: its public facts.
+    pub fn info(&self) -> ca::Info {
+        ca::read_info(&self.hub.data).unwrap_or_default()
+    }
+
+    /// The hub's own certificate authority's certificate (DER).
+    pub fn ca_der(&self) -> Vec<u8> {
+        std::fs::read_to_string(self.hub.data.join(ca::CA_CERT_FILE))
+            .ok()
+            .and_then(|t| ca::from_pem(&t))
+            .unwrap_or_default()
+    }
+
     /// Stop every listener and wait for them.
     pub fn stop(mut self) {
         self.hub.stopping.store(true, Ordering::SeqCst);
         self.hub.names.poke();
-        relay::wake(self.helper);
-        let listeners: Vec<Listener> = {
-            let mut st = self.hub.lock();
-            st.listeners.drain().map(|(_, l)| l).collect()
-        };
-        for l in listeners {
-            l.close();
-        }
+        self.hub.close_all();
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -1025,14 +1219,52 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> StoreResult<JoinHandl
         .map_err(|e| format!("the hub can't start a thread: {e}"))
 }
 
-/// Start the hub set up in `opts.data`: the admin address, and the port of every app
-/// registered so far. A hub installed alone, with no app registered, listens on the admin
-/// address only (and, from stage 4, the certificate page).
+/// Start the hub set up in `opts.data`: the admin address, the certificate page and the
+/// port of every app registered so far, on the home address it finds. A hub installed
+/// alone, with no app registered, listens on the admin address and the certificate page
+/// only. A hub not on a home network listens on the admin address only, and opens the
+/// rest when an address appears.
 pub fn start(opts: HubOptions) -> StoreResult<Running> {
     let cfg = HubConfig::load(&opts.data)?;
     let now = (opts.clock)();
-    let target = ca::Target { ip: cfg.address };
-    let material = ca::ensure_existing(&opts.data, &opts.keys, &target, now / 1000)?;
+    let machine: Arc<dyn Machine> = opts
+        .machine
+        .clone()
+        .unwrap_or_else(|| Arc::new(machine::System));
+
+    // the home address now, and the authority for it
+    let home = if cfg.address.automatic() {
+        machine.default_address()
+    } else {
+        machine::choose(&cfg.address.adapter, None, || machine.addresses())
+    };
+    let made_for: Option<Ipv4Addr> = ca::read_info(&opts.data).and_then(|i| i.address.parse().ok());
+    let material = match (home, made_for) {
+        // moved while the hub was stopped: a new authority for the new address
+        (Some(ip), Some(was)) if ip != was => ca::ensure(
+            &opts.data,
+            &opts.keys,
+            &ca::Target { ip },
+            &ca::computer_name(),
+            now / 1000,
+        )?,
+        (_, Some(was)) => {
+            ca::ensure_existing(&opts.data, &opts.keys, &ca::Target { ip: was }, now / 1000)?
+        }
+        (Some(ip), None) => ca::ensure(
+            &opts.data,
+            &opts.keys,
+            &ca::Target { ip },
+            &ca::computer_name(),
+            now / 1000,
+        )?,
+        (None, None) => return Err(format!("{} (the certificate's address)", ca::DAMAGED)),
+    };
+    if home != cfg.address.current {
+        let mut c = cfg.clone();
+        c.address.current = home;
+        c.save(&opts.data)?;
+    }
     let resolver = Arc::new(ca::Resolver::new(&material)?);
     let tls = ca::server_config(resolver.clone())?;
     let registry = Registry::open(&opts.data)?;
@@ -1050,13 +1282,6 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
     let admin_server = Arc::new(admin_server);
 
     // the certificate page: its own server on loopback, behind a front with limits
-    let helper_listener = TcpListener::bind((cfg.address, cfg.ports.helper)).map_err(|e| {
-        format!(
-            "the hub can't listen on {}:{}: {e}. Is another program using that port?",
-            cfg.address, cfg.ports.helper
-        )
-    })?;
-    let helper_addr = helper_listener.local_addr().map_err(|e| e.to_string())?;
     let page_server = Server::http(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| format!("the hub can't start its certificate page: {e}"))?;
     let page_backend = page_server
@@ -1080,6 +1305,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         opts.clock.clone(),
         opts.log.clone(),
     ));
+    names.set_address(home);
 
     let mut secrets = HashMap::new();
     for a in &apps {
@@ -1100,9 +1326,12 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
             failures: VecDeque::new(),
             secrets,
             listeners: HashMap::new(),
+            page: None,
+            problems: None,
         }),
         changing_apps: Mutex::new(()),
         data: opts.data.clone(),
+        helper_port: std::sync::atomic::AtomicU16::new(cfg.ports.helper),
         cfg,
         keys: opts.keys,
         clock: opts.clock,
@@ -1111,36 +1340,38 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         idle: opts.idle,
         admin_token,
         admin_port: admin_addr.port(),
-        helper_port: helper_addr.port(),
+        page_backend,
+        address: Mutex::new(home),
+        machine,
         tls,
-        resolver: resolver.clone(),
+        resolver,
         gate: relay::Gate::new(),
         stopping: Arc::new(AtomicBool::new(false)),
         names,
     });
 
-    // Every registered app's port. One that can't be opened is logged and left closed: the
-    // other apps keep working.
-    for a in &apps {
-        if !hub.lock().secrets.contains_key(&a.id) {
-            continue;
-        }
-        match hub.open_port(&a.id, a.public_port) {
-            Ok(l) => {
-                hub.lock().listeners.insert(a.id.clone(), l);
+    if home.is_some() {
+        // the certificate page must open (its port is the hub's own); app ports may fail
+        let page = hub.open_page()?;
+        hub.lock().page = Some(page);
+        let apps = hub.lock().registry.apps().unwrap_or_default();
+        for a in &apps {
+            if !hub.lock().secrets.contains_key(&a.id) {
+                continue;
             }
-            Err(e) => hub.log(&e),
+            match hub.open_port(&a.id, a.public_port) {
+                Ok(l) => {
+                    hub.lock().listeners.insert(a.id.clone(), l);
+                }
+                Err(e) => hub.log(&e),
+            }
         }
+    } else {
+        hub.log("not on a home network: phones can't connect until there is a home address");
     }
 
     hub.refresh_name();
     let mut threads = Vec::new();
-    {
-        let stop = hub.stopping.clone();
-        threads.push(spawn("hub-page-front", move || {
-            page::front(helper_listener, page_backend, stop)
-        })?);
-    }
     for i in 0..2 {
         let (server, hub) = (page_server.clone(), hub.clone());
         threads.push(spawn(&format!("hub-page-{i}"), move || {
@@ -1177,6 +1408,31 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         })?);
     }
     {
+        // The home address: the default route every `address_poll`, the chosen adapter
+        // every `address.check_minutes`.
+        let (hub, poll) = (hub.clone(), opts.address_poll);
+        threads.push(spawn("hub-address", move || {
+            let mut last_full = hub.now();
+            while !hub.stopping.load(Ordering::SeqCst) {
+                let until = std::time::Instant::now() + poll;
+                while std::time::Instant::now() < until && !hub.stopping.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(50).min(poll));
+                }
+                let minutes = HubConfig::load(&hub.data)
+                    .map(|c| c.address.check_minutes)
+                    .unwrap_or(crate::config::CHECK_MINUTES);
+                let full = hub.now() - last_full >= i64::from(minutes.max(1)) * 60_000;
+                if full {
+                    last_full = hub.now();
+                }
+                let found = hub.find_address(full);
+                if found != hub.address() {
+                    hub.move_to(found);
+                }
+            }
+        })?);
+    }
+    {
         // Renew the hub's own server certificate when it's due (hourly check), without
         // dropping phones.
         let hub = hub.clone();
@@ -1187,9 +1443,11 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
                 let now = hub.now();
                 if now - last_check >= 3_600_000 {
                     last_check = now;
-                    match ca::ensure_existing(&hub.data, &hub.keys, &target, now / 1000) {
+                    let Some(ip) = hub.address() else { continue };
+                    match ca::ensure_existing(&hub.data, &hub.keys, &ca::Target { ip }, now / 1000)
+                    {
                         Ok(m) if m.renewed => {
-                            let _ = resolver.set(&m);
+                            let _ = hub.resolver.set(&m);
                             hub.log("certificate renewed");
                         }
                         Ok(_) => {}
@@ -1201,9 +1459,6 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
     }
     Ok(Running {
         admin: admin_addr,
-        helper: helper_addr,
-        info: material.info,
-        ca_der: material.ca_der,
         hub,
         threads,
     })

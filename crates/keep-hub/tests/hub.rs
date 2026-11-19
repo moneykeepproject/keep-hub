@@ -904,7 +904,7 @@ fn registering_again_keeps_the_phones_and_gives_a_new_secret() {
     assert_ne!(f.port("alpha"), old_port);
     assert!(support::https_raw(
         old_port,
-        &f.hub().ca_der,
+        &f.hub().ca_der(),
         b"GET /hub/check HTTP/1.1\r\n\r\n"
     )
     .is_err());
@@ -920,7 +920,9 @@ fn unregistering_closes_the_port_and_revokes_the_apps_devices() {
 
     f.admin_ok("DELETE", "/admin/v1/apps/alpha", None);
     assert!(f.hub().app_port("alpha").is_none());
-    assert!(support::https_raw(port, &f.hub().ca_der, b"GET /hub/check HTTP/1.1\r\n\r\n").is_err());
+    assert!(
+        support::https_raw(port, &f.hub().ca_der(), b"GET /hub/check HTTP/1.1\r\n\r\n").is_err()
+    );
     assert_eq!(f.admin("DELETE", "/admin/v1/apps/alpha", None).status, 404);
     // the other app carries on
     assert_eq!(f.api("beta", &token_b, "GET", "/api/items").status, 200);

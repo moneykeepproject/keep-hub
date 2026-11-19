@@ -18,8 +18,9 @@
 | 7 | Standard | HTML Living Standard: origin, storage, service workers; W3C Web Application Manifest; Content Security Policy Level 3 (`wasm-unsafe-eval`); WebAssembly Web API (streaming compilation needs `application/wasm`) | A web app's saved data is kept per scheme, host and port |
 | 8 | Standard | RFC 9110 (HTTP), RFC 6750 (bearer tokens), RFC 8484 (DNS over HTTPS) | |
 | 9 | Vendor doc | OPNsense manual, Unbound DNS, Private Domains; Plex support article on secure connections | Routers with DNS rebinding protection block public names that point to home addresses |
-| 10 | Owner decision | 2026-11-18: the hub is its own release package, installed and updated by keep-launcher; an app offers it and hands over to the launcher; one shared hub per computer; one name and certificate per computer; a port per app; one household PIN; access granted per app; a new shared hub with VacaPick as its first app; MoneyKeep and ShareKeep move later; WASM and plain web clients both supported; wrong pairing tries pause the address they came from, and everyone only after a hundred; removing a grant does not revoke devices; a phone's request id is passed on in `Keep-Request-Id`; the request and answer details the implementer chose in stage 1 are adopted as written here; every member is an administrator or a standard member; every phone, a second one included, needs an administrator's approval; administrators approve at the hub computer only, not from a phone | |
+| 10 | Owner decision | 2026-11-18: the hub is its own release package, installed and updated by keep-launcher; an app offers it and hands over to the launcher; one shared hub per computer; one name and certificate per computer; a port per app; one household PIN; access granted per app; a new shared hub with VacaPick as its first app; MoneyKeep and ShareKeep move later; WASM and plain web clients both supported; wrong pairing tries pause the address they came from, and everyone only after a hundred; removing a grant does not revoke devices; a phone's request id is passed on in `Keep-Request-Id`; the request and answer details the implementer chose in stage 1 are adopted as written here; every member is an administrator or a standard member; every phone, a second one included, needs an administrator's approval; administrators approve at the hub computer only, not from a phone; HSTS is sent for one day; the hub has its own ACME client; the hub's outgoing requests trust what the operating system trusts; the public resolver is Cloudflare's, then Google's; the implementer's readings in stages 2 to 4 are adopted as written here | |
 | 11 | Spec | keep-launcher `README.md`, `docs/known-limits.md` | The launcher installs each app from its official release package, checked against the release's SHA-256 checksums; on a Mac it cannot install or update yet (no Developer ID) |
+| 12 | Standard | RFC 6797 (HTTP Strict Transport Security) | `max-age` in seconds; `includeSubDomains` is optional |
 
 No target product was observed.
 
@@ -176,9 +177,16 @@ kind of client. To make both kinds work well:
 - **Secure context.** Service workers, WebAssembly streaming, the clipboard and
   installing to the home screen all need HTTPS that the browser trusts. The hub name
   provides it with nothing installed on the phone.
-- **Headers the hub adds to every answer:** `X-Content-Type-Options: nosniff`,
-  `Referrer-Policy: no-referrer`, and `Strict-Transport-Security` when the phone used the
-  hub name.
+- **Headers the hub adds to every answer,** its own and those it passes on:
+  `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. A backend's own
+  header of the same name is replaced, never sent twice.
+- **`Strict-Transport-Security: max-age=86400`** (one day, without `includeSubDomains`)
+  is added when the phone used the hub name and the name's certificate is a real one. It
+  is not sent to a phone that came by address, and not with a staging certificate. A
+  backend's own header of this name is replaced. One day keeps the lock-in small if the
+  name's certificate ever lapses; the value can be raised later.
+- **Slow answers.** A backend may take up to 120 seconds to start its answer, so an app
+  can work out a slow report. Once bytes move, only the 30-second rule above applies.
 
 ### Members, grants and devices
 
@@ -255,7 +263,10 @@ Rules:
    grant for the app, the hub makes one first.
 2. The hub makes a pairing code for that member and app: 8 characters shown as
    `ABCD-EFGH`, typed forgivingly, one use, 10 minutes. The QR code carries
-   `https://<name>:<app port>/#pair=<code>`.
+   `https://<name>:<app port>/#pair=<code>`. With the code, and with a guest invite, the
+   admin address gives four addresses: `url` (by name when the name has a real
+   certificate, otherwise by address), `url_by_name`, `url_by_address`, and
+   `certificate_page`.
 3. The phone opens the address. The app's web client sends the code, the PIN and a device
    name to `/hub/pair`.
 4. The hub checks the code belongs to this app's port, checks the PIN, makes the device
@@ -328,32 +339,67 @@ Turning names on:
 
 1. Register with the name service; keep the id and token sealed in the data folder.
 2. Find the home address (see Addresses) and send Set address.
-3. Make a private key (ECDSA P-256), open an ACME account, order a certificate for the
-   one name, and receive the DNS proof value.
+3. Make a private key (ECDSA P-256), open an ACME account with no contact address, order
+   a certificate for the one name, and receive the DNS proof value.
 4. Send Set proof. Ask a public resolver over DNS over HTTPS until the proof is visible,
-   for at most 2 minutes, then tell Let's Encrypt to check.
+   for at most 2 minutes, then tell Let's Encrypt to check. The public resolver is
+   Cloudflare's, and Google's if Cloudflare's cannot be reached. This is fixed, not a
+   setting.
 5. Save the certificate, send Clear proof, start answering by name. State: Ready.
 6. Self-test: look the name up through the computer's own resolver and through the
    public resolver. If the public one answers and the home one does not, or answers
-   without the address, the state is Blocked and the fallback is offered.
+   without the address, the state is Blocked and the fallback is offered. Blocked is
+   decided only when the public resolver gives this computer's address. When the public
+   resolver cannot tell, the state stays as it was.
+
+Turning names off:
+
+- The hub stops using the name and keeps its registration and its certificate, so
+  turning on again needs no registration code. Nothing is released at the name service.
+- The app ports go back to answering by address only.
+
+The registration code:
+
+- It is needed only the first time. It is sent as typed, kept in memory until used, and
+  never stored or logged.
+- A name belongs to its name service. With a different `names.service` the hub needs a
+  new registration code, and a certificate from the other Let's Encrypt service is not
+  used.
 
 Renewing:
 
 - Checked once a day. Renewal starts when a third of the certificate's lifetime remains,
   worked out from the certificate's own dates.
-- A failed renewal is retried daily. The apps are told (through the admin address) only
-  when 14 days or fewer remain.
+- A failed renewal is retried daily, and so is a failed first certificate. The apps are
+  told (through the admin address) only when 14 days or fewer remain.
+- "Renew now" on the admin address tries at once. The 7-day limit below still holds.
+- A proof that never becomes visible is cleared after the 2 minutes and tried again the
+  next day.
 - A new certificate replaces the old one without dropping connected phones.
 
 Limits:
 
 - The hub never asks for more than 3 certificates for its name in 7 days, below Let's
-  Encrypt's limit of 5, so a fault cannot lock the name out for a week.
+  Encrypt's limit of 5, so a fault cannot lock the name out for a week. What is counted
+  is each order sent, and it is counted before sending, so a crash cannot let a fourth
+  through.
 - A refusal for the weekly domain limit puts the hub in Waiting and it tries again after
-  the time Let's Encrypt gives.
+  the time Let's Encrypt gives. That time is read in seconds only. A date, or none,
+  means try the next day.
 - Tests and development use Let's Encrypt's staging service and the staging name
-  service. A setting selects them. A staging certificate is never offered to phones as
-  trusted.
+  service. `names.staging` selects Let's Encrypt's staging service, and `names.service`
+  must then hold the staging name service's address. With `names.staging` on and
+  `names.service` still the real service, turning on is refused, so a test hub can never
+  touch real names.
+- A staging certificate is served by name and never as trusted: no
+  `Strict-Transport-Security`, and pairing codes keep to the address.
+
+Building blocks:
+
+- **The ACME client is the hub's own:** RFC 8555 with the DNS challenge only, signing
+  with ring and making the certificate request with rcgen, both already in the build.
+- **The hub's own outgoing requests** (to the name service, Let's Encrypt and the public
+  resolvers) trust what the operating system trusts, through `rustls-platform-verifier`.
 
 ### Addresses
 
@@ -373,11 +419,20 @@ declines the name service:
 
 - The hub's own authority (ECDSA P-256, 10 years, name-constrained to the hub's address)
   and a server certificate (825 days, renewed 30 days before it ends).
-- The certificate page on port 16080 with the steps for Android, iPhone and iPad and
-  computers, the fingerprint to compare, and the two downloads.
+- The certificate page on port 16080: the fingerprint to compare, the two downloads,
+  the steps for the kind of device that asked, then the steps for the others (Android,
+  iPhone and iPad, Windows and Mac computers), and a link to each registered app.
+- Opened from a pairing code, as `/?app=<id>&pair=<code>` (or `invite=<code>`), the page
+  ends with the link that pairs. A code is used only if it is 8 letters and digits;
+  anything else is ignored and never shown back.
+- The page answers `GET` and `HEAD` only, and sends any other path to `/`. It sits
+  behind a front with today's limits: 32 connections, 8 from one address, closed after 15
+  seconds without traffic.
 - **Both at once.** Each app port answers with the Let's Encrypt certificate when the
   phone asked for the hub name, and with the hub's own certificate when it asked by
-  address. A phone paired one way and a phone paired the other work side by side.
+  address or for any other name. A phone paired one way and a phone paired the other
+  work side by side. A renewed certificate is used for new connections; a connection in
+  progress keeps the one it started with.
 - A phone paired by address is a different installed app from one paired by name. Moving
   between them means pairing again.
 - A changed address still means a new authority and re-installing on phones that use the
@@ -592,7 +647,8 @@ built, the address is given at `keep-hub setup`, as in ShareKeep.
     renewal is retried the next day; the warning appears only at 14 days or fewer.
 17. A fourth certificate request for the name inside 7 days is not sent.
 18. One port, two certificates: a connection that asks for the hub name gets the Let's
-    Encrypt certificate; one that asks by address gets the hub's own.
+    Encrypt certificate; one that asks by address, or for any other name, gets the hub's
+    own. A phone paired by name and one paired by address work side by side.
 19. An app whose backend is stopped answers 503 `app_stopped` on its port while other
     apps keep working.
 20. Find the problem returns the checks in order and stops at the first failure, with a
@@ -638,12 +694,32 @@ built, the address is given at `keep-hub setup`, as in ShareKeep.
     and a new code from an administrator pairs it. No request on an app's port, with an
     administrator's device token, makes a pairing code, a grant or an invite.
 
+39. An answer to a phone that used the hub name with a real certificate carries
+    `Strict-Transport-Security: max-age=86400`, on the hub's own answers and on those
+    passed on, replacing a backend's own. A phone that came by address gets none, and so
+    does one served a staging certificate.
+40. Making a pairing code answers with `url`, `url_by_name`, `url_by_address` and
+    `certificate_page`. `url` is by name when the name has a real certificate and by
+    address otherwise, including with a staging certificate.
+41. The certificate page opened with `?app=<id>&pair=<code>` ends with the link that
+    pairs for that app; a parameter that is not 8 letters and digits is not shown back; a
+    `POST` gets no page; another path is sent to `/`.
+42. Turning names off leaves the ports answering by address only and keeps the
+    registration and certificate; turning on again needs no code and asks for no new
+    certificate while the old one is good.
+43. With `names.staging` on and `names.service` the real service, turning on is refused
+    and nothing is sent.
+44. A backend that sends nothing for 119 seconds and then answers is passed on; the
+    hub's `nosniff` and `no-referrer` replace a backend's own headers of those names.
+
 ## Open points
 
 - The words keep-launcher shows for the hub, and whether it lists the hub among the apps
   or in a separate place.
-- The Rust library for ACME. It must support the DNS challenge, work with rustls and ring
-  as the workspace already uses, and carry a licence the project accepts.
+- The staging name service's address. `names.service` must hold it for a test hub, and
+  neither spec gives it yet.
+- The certificate page's steps for Windows and Mac computers are new and need checking
+  on a real PC and a real Mac.
 - Which program shows the Phones screen when several apps are installed: each app with a
   shared component, or keep-launcher.
 - When MoneyKeep and ShareKeep move onto the shared hub, and how their paired phones are

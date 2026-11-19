@@ -172,7 +172,8 @@ impl std::fmt::Debug for NameCert {
 struct Live {
     settings: NamesSettings,
     warn_days: u32,
-    address: Ipv4Addr,
+    /// The home address (`None`: not on a home network).
+    address: Option<Ipv4Addr>,
     state: NameState,
     message: Option<String>,
     blocked: bool,
@@ -273,7 +274,7 @@ impl Names {
             live: Mutex::new(Live {
                 settings: cfg.names.clone(),
                 warn_days: cfg.cert.warn_days,
-                address: cfg.address,
+                address: cfg.address.current,
                 state: NameState::Off,
                 message: None,
                 blocked: false,
@@ -476,6 +477,46 @@ impl Names {
         std::mem::replace(&mut l.poked, false)
     }
 
+    /// The home address changed (or was lost): send it at once, and test the name again.
+    pub fn set_address(&self, address: Option<Ipv4Addr>) {
+        let mut saved = self.load();
+        if saved.address_retry_at != 0 {
+            saved.address_retry_at = 0;
+            let _ = self.save(&saved);
+        }
+        let mut l = self.live();
+        l.address = address;
+        l.tested = false;
+        l.poked = true;
+        drop(l);
+        self.wake.notify_all();
+    }
+
+    /// Send the address to the name service again ("Update the name").
+    pub fn resend_address(&self) {
+        let mut saved = self.load();
+        saved.address_sent = None;
+        saved.address_retry_at = 0;
+        let _ = self.save(&saved);
+        self.poke();
+    }
+
+    /// The `names.*` settings in use, and the warning days.
+    pub fn settings(&self) -> (NamesSettings, u32) {
+        let l = self.live();
+        (l.settings.clone(), l.warn_days)
+    }
+
+    /// The hub's name, once registered.
+    pub fn name(&self) -> Option<String> {
+        self.load().name
+    }
+
+    /// The outside world the engine uses (for Find the problem).
+    pub fn outside(&self) -> &Outside {
+        &self.outside
+    }
+
     /// Wake [`Names::wait_for_work`] (the hub stopping).
     pub fn poke(&self) {
         self.live().poked = true;
@@ -500,6 +541,13 @@ impl Names {
             self.set(NameState::Off, Some(p));
             return;
         }
+        let Some(address) = address else {
+            self.set(
+                NameState::Waiting,
+                Some("This computer isn't on a home network (it has no home or office address), so the name can't point to it.".into()),
+            );
+            return;
+        };
         let mut saved = self.load();
 
         // 1. the registration

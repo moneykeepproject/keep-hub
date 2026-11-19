@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+pub mod machine;
 pub mod world;
 
 use std::io::{Read, Write};
@@ -21,6 +22,7 @@ use keep_hub::pin::Cost;
 use keep_hub::{HubConfig, HubOptions, KeyStore, Running};
 use rustls::pki_types::{CertificateDer, ServerName};
 use serde_json::{json, Value};
+use world::{World, ACME_DIR, CODE, SERVICE};
 
 pub const PIN: &str = "246810";
 
@@ -674,6 +676,10 @@ pub struct Fixture {
     pub idle: Duration,
     /// The internet as the hub sees it: none, unless a test gives a fake world.
     pub outside: keep_hub::names::Outside,
+    /// This computer as the hub sees it: at 127.0.0.1 until a test moves it.
+    pub machine: Arc<machine::FakeMachine>,
+    /// How often the hub looks for a new address (short in tests).
+    pub address_poll: Duration,
     hub: Option<Running>,
 }
 
@@ -728,6 +734,8 @@ impl Fixture {
             admin_token,
             idle,
             outside: keep_hub::names::Outside::unavailable("the tests have no network"),
+            machine: Arc::new(machine::FakeMachine::at(Ipv4Addr::LOCALHOST)),
+            address_poll: Duration::from_millis(100),
             hub: None,
         };
         f.start();
@@ -744,6 +752,8 @@ impl Fixture {
             pin_cost: Cost { m: 64, t: 1, p: 1 },
             idle: self.idle,
             outside: Some(self.outside.clone()),
+            machine: Some(self.machine.clone()),
+            address_poll: self.address_poll,
         })
         .unwrap();
         self.hub = Some(hub);
@@ -867,7 +877,7 @@ impl Fixture {
     ) -> Reply {
         let addr = self.port(app);
         let bytes = request(method, path, &addr.to_string(), headers, body);
-        parse(&https_raw(addr, &self.hub().ca_der, &bytes).expect("an answer from the hub"))
+        parse(&https_raw(addr, &self.hub().ca_der(), &bytes).expect("an answer from the hub"))
     }
 
     pub fn phone_json(
@@ -907,13 +917,14 @@ impl Fixture {
     pub fn download(&self, app: &str, path: &str, headers: &[(&str, &str)]) -> Streamed {
         let addr = self.port(app);
         let bytes = request("GET", path, &addr.to_string(), headers, None);
-        https_stream(addr, &self.hub().ca_der, &bytes)
+        https_stream(addr, &self.hub().ca_der(), &bytes)
     }
 
     /// Bytes exactly as given to an app's port.
     pub fn phone_raw(&self, app: &str, bytes: &[u8]) -> Reply {
         parse(
-            &https_raw(self.port(app), &self.hub().ca_der, bytes).expect("an answer from the hub"),
+            &https_raw(self.port(app), &self.hub().ca_der(), bytes)
+                .expect("an answer from the hub"),
         )
     }
 }
@@ -924,4 +935,42 @@ impl Drop for Fixture {
             h.stop();
         }
     }
+}
+
+/// A hub whose name is ready, with one app; the name.
+pub fn named_hub(staging: bool) -> (Fixture, Arc<World>, TestApp, String) {
+    let (f, world) = Fixture::with_world(|cfg| {
+        cfg.names.service = SERVICE.into();
+        cfg.names.acme = ACME_DIR.into();
+        cfg.names.staging = staging;
+    });
+    world.allow_loopback.store(true, Ordering::SeqCst);
+    let app = TestApp::start("vacapick");
+    f.register(&app, false, false);
+    f.admin_ok(
+        "POST",
+        "/admin/v1/names/on",
+        Some(json!({ "registration_code": CODE })),
+    );
+    let mut st = Value::Null;
+    for _ in 0..200 {
+        st = f.admin_ok("GET", "/admin/v1/names", None);
+        if st["state"] == "ready" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(st["state"], "ready", "{st}");
+    let name = st["name"].as_str().unwrap().to_string();
+    // the app ports take the certificate right after the work
+    let roots = [world.acme_ca()];
+    for _ in 0..200 {
+        if f.phone_by_name("vacapick", &roots, &name, "/hub/check")
+            .is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    (f, world, app, name)
 }

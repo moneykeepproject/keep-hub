@@ -6,52 +6,11 @@
 
 mod support;
 
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use keep_hub::der;
-use serde_json::{json, Value};
-use support::world::{World, ACME_DIR, CODE, SERVICE};
-use support::{Fixture, TestApp, PIN};
-
-/// A hub whose name is ready, with one app; the name.
-fn named_hub(staging: bool) -> (Fixture, Arc<World>, TestApp, String) {
-    let (f, world) = Fixture::with_world(|cfg| {
-        cfg.names.service = SERVICE.into();
-        cfg.names.acme = ACME_DIR.into();
-        cfg.names.staging = staging;
-    });
-    world.allow_loopback.store(true, Ordering::SeqCst);
-    let app = TestApp::start("vacapick");
-    f.register(&app, false, false);
-    f.admin_ok(
-        "POST",
-        "/admin/v1/names/on",
-        Some(json!({ "registration_code": CODE })),
-    );
-    let mut st = Value::Null;
-    for _ in 0..200 {
-        st = f.admin_ok("GET", "/admin/v1/names", None);
-        if st["state"] == "ready" {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert_eq!(st["state"], "ready", "{st}");
-    let name = st["name"].as_str().unwrap().to_string();
-    // the app ports take the certificate right after the work
-    let roots = [world.acme_ca()];
-    for _ in 0..200 {
-        if f.phone_by_name("vacapick", &roots, &name, "/hub/check")
-            .is_ok()
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    (f, world, app, name)
-}
+use serde_json::json;
+use support::{named_hub, Fixture, TestApp, PIN};
 
 fn names_of(cert: &[u8]) -> Vec<String> {
     der::cert_info(cert).unwrap().dns_names
@@ -76,7 +35,7 @@ fn at18_one_port_answers_with_the_name_certificate_by_name_and_the_hubs_own_by_a
     assert_eq!(r.header("strict-transport-security"), Some("max-age=86400"));
 
     // by address, on the same port: the hub's own certificate, no HSTS
-    let by_address = support::cert_by_address(f.port("vacapick"), &f.hub().ca_der);
+    let by_address = support::cert_by_address(f.port("vacapick"), &f.hub().ca_der());
     assert!(
         names_of(&by_address).is_empty(),
         "the hub's own is for the address"
@@ -117,7 +76,10 @@ fn at18_a_phone_paired_by_name_and_one_paired_by_address_work_side_by_side() {
     );
     assert_eq!(
         code["certificate_page"],
-        format!("http://{}/?app=vacapick&pair={c}", f.hub().helper)
+        format!(
+            "http://{}/?app=vacapick&pair={c}",
+            f.hub().helper().unwrap()
+        )
     );
 
     // paired by name
@@ -253,7 +215,13 @@ fn a_new_name_certificate_replaces_the_old_without_dropping_a_phone() {
 // ----- the certificate page ---------------------------------------------------------------------
 
 fn page(f: &Fixture, path: &str, ua: &str) -> support::Reply {
-    support::http(f.hub().helper, "GET", path, &[("User-Agent", ua)], None)
+    support::http(
+        f.hub().helper().unwrap(),
+        "GET",
+        path,
+        &[("User-Agent", ua)],
+        None,
+    )
 }
 
 #[test]
@@ -274,7 +242,7 @@ fn the_certificate_page_gives_the_fingerprint_both_downloads_and_the_steps() {
         .unwrap()
         .starts_with("default-src 'none'"));
     let html = r.text();
-    assert!(html.contains(&f.hub().info.fingerprint));
+    assert!(html.contains(&f.hub().info().fingerprint));
     assert!(html.contains("Download certificate (Android)"));
     assert!(html.contains("Download certificate (iPhone or iPad)"));
     for section in [
@@ -332,7 +300,7 @@ fn both_downloads_carry_the_hubs_authority_and_a_phone_that_installs_it_can_conn
         Some("attachment; filename=\"keep-hub-ca.crt\"")
     );
     let downloaded = der::pem_certificates(&r.text());
-    assert_eq!(downloaded, [f.hub().ca_der.clone()]);
+    assert_eq!(downloaded, [f.hub().ca_der()]);
     // the downloaded authority is enough to reach the app port by address
     let cert = support::cert_by_address(f.port("vacapick"), &downloaded[0]);
     assert!(!cert.is_empty());
@@ -343,7 +311,7 @@ fn both_downloads_carry_the_hubs_authority_and_a_phone_that_installs_it_can_conn
         Some("application/x-apple-aspen-config")
     );
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&f.hub().ca_der);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(f.hub().ca_der());
     assert!(r.text().contains(&b64));
     assert!(r.text().contains("com.apple.security.root"));
 }
@@ -354,7 +322,7 @@ fn other_addresses_on_the_page_go_to_its_start_and_only_get_is_answered() {
     let r = page(&f, "/elsewhere", "Android");
     assert_eq!(r.status, 302);
     assert_eq!(r.header("location"), Some("/"));
-    let r = support::http(f.hub().helper, "POST", "/", &[], Some(b"x"));
+    let r = support::http(f.hub().helper().unwrap(), "POST", "/", &[], Some(b"x"));
     assert_eq!(r.status, 405);
     assert!(f.log_lines().contains(&"GET /elsewhere 302".to_string()));
 }
@@ -386,7 +354,10 @@ fn without_a_name_a_pairing_code_gives_the_address_and_the_certificate_page() {
     assert!(code["url_by_name"].is_null());
     assert_eq!(code["url"], code["url_by_address"]);
     let page_url = code["certificate_page"].as_str().unwrap();
-    let path = page_url.split_once(&f.hub().helper.to_string()).unwrap().1;
+    let path = page_url
+        .split_once(&f.hub().helper().unwrap().to_string())
+        .unwrap()
+        .1;
     let html = page(&f, path, "Android").text();
     assert!(html.contains("Step 2"), "{path}");
     assert!(html.contains(code["url_by_address"].as_str().unwrap()));

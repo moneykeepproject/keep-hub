@@ -1,9 +1,9 @@
 //! `hub.json`: where the hub listens. Public facts only (no keys, no PIN). Copied from
 //! ShareKeep's hub, `config.rs`.
 //!
-//! Each app's public port is in the registry, given when the app registers. Stage 1 keeps
-//! the hub computer's address here, as ShareKeep does; finding it and following its
-//! changes comes with stage 5 (Addresses).
+//! Each app's public port is in the registry, given when the app registers. The hub finds
+//! its home address itself and follows its changes (`hub.rs`); the one in use is kept here,
+//! beside the `address.*` settings.
 
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
@@ -22,12 +22,16 @@ pub const INVITE_DAYS: u32 = 7;
 
 pub const CONFIG_FILE: &str = "hub.json";
 
+/// How often the hub looks for a new address (`address.check_minutes`).
+pub const CHECK_MINUTES: u32 = 5;
+
 /// The hub's settings, with the spec's keys: `ports.helper` is `{"ports": {"helper": …}}`.
-/// A key that is left out has its default. (The `address` settings join with stage 5.)
+/// A key that is left out has its default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubConfig {
-    /// The hub computer's address on the home network.
-    pub address: Ipv4Addr,
+    /// The `address.*` settings, and the home address in use.
+    #[serde(default)]
+    pub address: AddressSettings,
     #[serde(default)]
     pub ports: Ports,
     #[serde(default)]
@@ -38,6 +42,72 @@ pub struct HubConfig {
     pub names: NamesSettings,
     #[serde(default)]
     pub cert: CertSettings,
+}
+
+/// The `address.*` settings, and the address in use (`current`, written by the hub).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AddressSettings {
+    /// The home address in use (`None`: not on a home network).
+    pub current: Option<Ipv4Addr>,
+    /// Which adapter's address to publish: `automatic` (the default route's) or an
+    /// adapter's name.
+    pub adapter: String,
+    /// How often to look for a new address, in minutes.
+    pub check_minutes: u32,
+}
+
+impl Default for AddressSettings {
+    fn default() -> Self {
+        AddressSettings {
+            current: None,
+            adapter: "automatic".into(),
+            check_minutes: CHECK_MINUTES,
+        }
+    }
+}
+
+impl AddressSettings {
+    /// Whether the adapter is chosen automatically.
+    pub fn automatic(&self) -> bool {
+        let a = self.adapter.trim();
+        a.is_empty() || a.eq_ignore_ascii_case("automatic")
+    }
+}
+
+/// `address` as written by stages 1 to 4 (a plain address) or now (the settings).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AddressForm {
+    Plain(Ipv4Addr),
+    Settings {
+        #[serde(default)]
+        current: Option<Ipv4Addr>,
+        #[serde(default)]
+        adapter: Option<String>,
+        #[serde(default)]
+        check_minutes: Option<u32>,
+    },
+}
+
+impl<'de> Deserialize<'de> for AddressSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let d0 = AddressSettings::default();
+        Ok(match AddressForm::deserialize(d)? {
+            AddressForm::Plain(ip) => AddressSettings {
+                current: Some(ip),
+                ..d0
+            },
+            AddressForm::Settings {
+                current,
+                adapter,
+                check_minutes,
+            } => AddressSettings {
+                current,
+                adapter: adapter.unwrap_or(d0.adapter),
+                check_minutes: check_minutes.unwrap_or(d0.check_minutes),
+            },
+        })
+    }
 }
 
 /// The `names.*` settings.
@@ -125,9 +195,13 @@ impl Default for Guest {
 }
 
 impl HubConfig {
+    /// Settings for a hub at `address` (the address it found, or was given at setup).
     pub fn new(address: Ipv4Addr) -> Self {
         HubConfig {
-            address,
+            address: AddressSettings {
+                current: Some(address),
+                ..AddressSettings::default()
+            },
             ports: Ports::default(),
             pair: Pair::default(),
             guest: Guest::default(),
@@ -179,6 +253,16 @@ mod tests {
         assert_eq!(cfg.pair.code_minutes, 3);
         assert_eq!((cfg.ports.helper, cfg.ports.admin), (16080, 17000));
         assert_eq!(cfg.guest.invite_days, 7);
+        // the address as stages 1 to 4 wrote it
+        assert_eq!(cfg.address.current, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        assert!(cfg.address.automatic());
+        assert_eq!(cfg.address.check_minutes, 5);
+        let text = r#"{ "address": { "current": null, "adapter": "Ethernet" } }"#;
+        std::fs::write(dir.path().join(CONFIG_FILE), text).unwrap();
+        let cfg = HubConfig::load(dir.path()).unwrap();
+        assert_eq!(cfg.address.current, None);
+        assert!(!cfg.address.automatic());
+        assert_eq!(cfg.address.check_minutes, 5);
         std::fs::write(dir.path().join(CONFIG_FILE), "{").unwrap();
         assert!(HubConfig::load(dir.path()).unwrap_err().contains("damaged"));
     }

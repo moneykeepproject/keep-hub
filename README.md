@@ -5,11 +5,11 @@ and Pick app on that computer: it owns the secure name and certificate, the hous
 PIN, the list of members and phones, and the record of who may use which app, and it
 passes each request to the app it belongs to. Part of the MoneyKeep family (Rust).
 
-**Status: stages 1 to 4 of 7 built** (the relay, the registry of apps, members, grants
+**Status: stages 1 to 5 of 7 built** (the relay, the registry of apps, members, grants
 and devices, pairing and guests, the admin address; web clients' files passed through;
 the hub name and its Let's Encrypt certificate; both certificates on every app port and
-the certificate page). Addresses, the troubleshooter, the small library for apps and the
-service are not built yet. See `docs/specs/keep-hub.md` and `docs/implementation/`.
+the certificate page; the home address followed as it changes, the firewall, and Find
+the problem). The small library for apps and the service are not built yet. See `docs/specs/keep-hub.md` and `docs/implementation/`.
 
 ## What it does
 
@@ -40,10 +40,10 @@ The hub holds no app's books and no app's rules.
 | Path | What |
 |---|---|
 | `docs/specs/keep-hub.md` | What the hub must do |
-| `docs/implementation/stage-1.md` … `stage-4.md` | What each stage built, the choices it made, and what it left for later stages |
+| `docs/implementation/stage-1.md` … `stage-5.md` | What each stage built, the choices it made, and what it left for later stages |
 | `AGENTS.md` | Rules for every contributor. Read it first |
 | `crates/keep-hub` | The hub: library and the `keep-hub` program |
-| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, with a fake name service, ACME server and DNS in `support/world.rs`) |
+| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
 | `xtask` | `cargo xtask ci` and the repository rules |
 
 Crates are added as the build stages in `AGENTS.md` are reached.
