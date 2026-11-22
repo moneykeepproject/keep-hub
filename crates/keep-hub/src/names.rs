@@ -456,7 +456,22 @@ impl Names {
             "requests_last_7_days": recent,
             "fallback_offered": l.state == NameState::Blocked,
             "message": l.message,
+            // Revision 3: where a person asks for a registration code, and whether one is
+            // needed (the hub has never registered with this name service).
+            "code_page": l.settings.code_page(),
+            "code_needed": self.registration(&saved, &l.settings).is_none(),
         })
+    }
+
+    /// Change `names.code_page` (Revision 3). A page the rules refuse leaves the old one.
+    pub fn set_code_page(&self, page: &str) -> Result<(), String> {
+        let page = page.trim();
+        crate::config::check_code_page(page)?;
+        let mut cfg = HubConfig::load(&self.data)?;
+        cfg.names.code_page = page.to_string();
+        cfg.save(&self.data)?;
+        self.live().settings.code_page = page.to_string();
+        Ok(())
     }
 
     /// The certificate phones asking for the hub name get: none while names are off.

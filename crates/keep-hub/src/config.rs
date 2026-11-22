@@ -42,6 +42,26 @@ pub struct HubConfig {
     pub names: NamesSettings,
     #[serde(default)]
     pub cert: CertSettings,
+    #[serde(default)]
+    pub admin: AdminSettings,
+}
+
+/// How long an administrator's session lasts after its last use (stage 8).
+pub const SESSION_MINUTES: u32 = 15;
+
+/// The `admin.*` settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminSettings {
+    pub session_minutes: u32,
+}
+
+impl Default for AdminSettings {
+    fn default() -> Self {
+        AdminSettings {
+            session_minutes: SESSION_MINUTES,
+        }
+    }
 }
 
 /// The `address.*` settings, and the address in use (`current`, written by the hub).
@@ -110,6 +130,32 @@ impl<'de> Deserialize<'de> for AddressSettings {
     }
 }
 
+/// Where a person asks for a registration code (`names.code_page`, Revision 3).
+pub const CODE_PAGE: &str = "https://getmoneykeep.org/phone-access/";
+/// The longest `names.code_page`, in characters.
+pub const CODE_PAGE_MAX: usize = 200;
+
+/// Whether `page` may be `names.code_page`: an `https://` address with a host, of at most
+/// [`CODE_PAGE_MAX`] characters, with no spaces or control characters. The reason when not.
+pub fn check_code_page(page: &str) -> Result<(), String> {
+    let why = format!(
+        "The page for registration codes must be an https:// address of at most {CODE_PAGE_MAX} characters."
+    );
+    if page.chars().count() > CODE_PAGE_MAX
+        || page.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(why);
+    }
+    let Some(rest) = page.strip_prefix("https://") else {
+        return Err(why);
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains('@') {
+        return Err(why);
+    }
+    Ok(())
+}
+
 /// The `names.*` settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -123,6 +169,21 @@ pub struct NamesSettings {
     /// Use Let's Encrypt's staging service (and `service` must then be the staging name
     /// service).
     pub staging: bool,
+    /// Where a person asks for a registration code (Revision 3). Shown to the apps; the
+    /// hub never opens it.
+    pub code_page: String,
+}
+
+impl NamesSettings {
+    /// `code_page`, or the default when `hub.json` holds one that isn't allowed (it was
+    /// edited by hand): the apps never get a page the setting's rules refuse.
+    pub fn code_page(&self) -> &str {
+        if check_code_page(&self.code_page).is_ok() {
+            &self.code_page
+        } else {
+            CODE_PAGE
+        }
+    }
 }
 
 impl Default for NamesSettings {
@@ -132,6 +193,7 @@ impl Default for NamesSettings {
             service: crate::nameservice::NAME_SERVICE.to_string(),
             acme: crate::acme::LETS_ENCRYPT.to_string(),
             staging: false,
+            code_page: CODE_PAGE.to_string(),
         }
     }
 }
@@ -207,6 +269,7 @@ impl HubConfig {
             guest: Guest::default(),
             names: NamesSettings::default(),
             cert: CertSettings::default(),
+            admin: AdminSettings::default(),
         }
     }
 
@@ -240,8 +303,44 @@ mod tests {
             "https://acme-v02.api.letsencrypt.org/directory"
         );
         assert_eq!(cfg.cert.warn_days, 14);
+        assert_eq!(
+            cfg.names.code_page,
+            "https://getmoneykeep.org/phone-access/"
+        );
         cfg.save(dir.path()).unwrap();
         assert_eq!(HubConfig::load(dir.path()).unwrap(), cfg);
+    }
+
+    /// Revision 3: `names.code_page` is an https address of at most 200 characters.
+    #[test]
+    fn the_code_page_is_an_https_address_of_200_characters_at_most() {
+        assert!(check_code_page(CODE_PAGE).is_ok());
+        let long = format!("https://example.org/{}", "a".repeat(CODE_PAGE_MAX - 20));
+        assert_eq!(long.chars().count(), CODE_PAGE_MAX);
+        assert!(check_code_page(&long).is_ok());
+        for bad in [
+            "http://getmoneykeep.org/phone-access/",
+            "https://",
+            "https:///path",
+            "https://user@example.org/",
+            "https://example.org/a b",
+            "getmoneykeep.org/phone-access/",
+            "",
+            &format!("{long}a"),
+        ] {
+            assert!(check_code_page(bad).is_err(), "{bad}");
+        }
+        let mut s = NamesSettings {
+            code_page: "http://example.org/".into(),
+            ..NamesSettings::default()
+        };
+        assert_eq!(
+            s.code_page(),
+            CODE_PAGE,
+            "a hand-edited bad page isn't shown"
+        );
+        s.code_page = "https://example.org/codes".into();
+        assert_eq!(s.code_page(), "https://example.org/codes");
     }
 
     #[test]

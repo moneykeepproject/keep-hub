@@ -58,7 +58,7 @@ const MAX_PAIR_BODY: u64 = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a backend may take to start its answer (an app may need time to work out a
 /// report; a file starts at once).
-const FIRST_BYTE: Duration = Duration::from_secs(120);
+pub const FIRST_BYTE: Duration = Duration::from_secs(120);
 /// A transfer with no bytes moving for this long is closed, either way. A transfer that
 /// keeps moving has no time limit, however large (a WASM client is several megabytes).
 pub const IDLE: Duration = Duration::from_secs(30);
@@ -324,6 +324,7 @@ fn forward_head(head: &Head, secret: &str, who: Option<&Identity>) -> Vec<u8> {
     out.push_str(&format!("Keep-Hub-Auth: {secret}\r\n"));
     if let Some(id) = who {
         out.push_str(&format!("Keep-Member: {}\r\n", id.member.id));
+        out.push_str(&format!("Keep-Member-Class: {}\r\n", id.member.class));
         out.push_str(&format!(
             "Keep-Member-Name: {}\r\n",
             util::percent_encode(&id.member.name)
@@ -404,7 +405,11 @@ fn serve(tcp: TcpStream, peer: SocketAddr, hub: &Arc<Hub>, app: &str) -> std::io
                     Ok(id) => {
                         let title = hub.backend(app).map(|(a, _)| a.title);
                         let a = Answer::ok(json!({
-                            "member": { "id": id.member.id, "name": id.member.name },
+                            "member": {
+                                "id": id.member.id,
+                                "name": id.member.name,
+                                "class": id.member.class,
+                            },
                             "device": { "id": id.device.id, "name": id.device.name },
                             "guest_scope": id.member.guest_scope,
                             "app": { "id": app, "title": title },
@@ -416,6 +421,20 @@ fn serve(tcp: TcpStream, peer: SocketAddr, hub: &Arc<Hub>, app: &str) -> std::io
                 }
             }
             ("POST", "/hub/pair") => pair(hub, &mut tls, &head, rest, peer.ip(), app),
+            // The person removes the app from this phone: its own device is revoked.
+            ("POST", "/hub/unpair") => {
+                let done = head
+                    .bearer()
+                    .ok_or_else(Refusal::not_paired)
+                    .and_then(|t| hub.unpair(app, t));
+                match done {
+                    Ok(()) => {
+                        let a = Answer::ok(json!({ "ok": true }));
+                        finish(hub, &mut tls, method, &path, &a)
+                    }
+                    Err(r) => refuse(hub, &mut tls, &head, &r),
+                }
+            }
             _ => {
                 let a = Answer::error(404, "not_found", "The hub has nothing at that address.");
                 finish(hub, &mut tls, method, &path, &a)
@@ -516,8 +535,13 @@ fn forward(
         }
     };
     if who.is_none() && len > 0 {
-        // without a token only pairing sends a body
-        let r = Refusal::new(400, "bad_request", "The request can't be read.");
+        // without a token only pairing sends a body (acceptance test 36: a GET with a body
+        // is refused as a POST is)
+        let r = Refusal::new(
+            405,
+            "method_not_allowed",
+            "Without a paired phone's token, only GET and HEAD without a body pass.",
+        );
         return refuse(hub, tls, head, &r);
     }
     let stopped = || {
@@ -563,7 +587,7 @@ fn forward(
     // (a backend may answer before it has read a whole body; so go on to its answer)
 
     // the answer's head
-    backend.set_read_timeout(Some(FIRST_BYTE))?;
+    backend.set_read_timeout(Some(hub.first_byte))?;
     let mut buf: Vec<u8> = Vec::new();
     let end = loop {
         if let Some(end) = http::head_end(&buf) {
@@ -671,7 +695,7 @@ mod tests {
     #[test]
     fn a_forwarded_head_carries_the_hubs_headers_and_none_of_the_phones() {
         let h = head(
-            "POST /api/items?x=1 HTTP/1.1\r\nHost: 192.168.1.20:16443\r\nAuthorization: Bearer device-token\r\nKeep-Member: 1\r\nkeep-hub-auth: guess\r\nKeep-Alive: timeout=5\r\nConnection: keep-alive, X-Hop\r\nX-Hop: 1\r\nKeep-Request-Id: req-42\r\nContent-Type: application/json\r\nContent-Length: 2",
+            "POST /api/items?x=1 HTTP/1.1\r\nHost: 192.168.1.20:16443\r\nAuthorization: Bearer device-token\r\nKeep-Member: 1\r\nKeep-Member-Class: administrator\r\nkeep-hub-auth: guess\r\nKeep-Alive: timeout=5\r\nConnection: keep-alive, X-Hop\r\nX-Hop: 1\r\nKeep-Request-Id: req-42\r\nContent-Type: application/json\r\nContent-Length: 2",
         );
         let who = Identity {
             member: Member {
@@ -680,6 +704,8 @@ mod tests {
                 guest_app: None,
                 guest_scope: None,
                 created: 0,
+                class: "standard".into(),
+                password_set: false,
             },
             device: Device {
                 id: 3,
@@ -694,7 +720,7 @@ mod tests {
         let text = String::from_utf8(forward_head(&h, "the-secret", Some(&who))).unwrap();
         assert_eq!(
             text,
-            "POST /api/items?x=1 HTTP/1.1\r\nHost: 192.168.1.20:16443\r\nContent-Type: application/json\r\nContent-Length: 2\r\nKeep-Hub-Auth: the-secret\r\nKeep-Member: 7\r\nKeep-Member-Name: Zo%C3%AB\r\nKeep-Device: 3\r\nKeep-Device-Name: Zo%C3%AB%27s%20phone\r\nKeep-Request-Id: req-42\r\nConnection: close\r\n\r\n"
+            "POST /api/items?x=1 HTTP/1.1\r\nHost: 192.168.1.20:16443\r\nContent-Type: application/json\r\nContent-Length: 2\r\nKeep-Hub-Auth: the-secret\r\nKeep-Member: 7\r\nKeep-Member-Class: standard\r\nKeep-Member-Name: Zo%C3%AB\r\nKeep-Device: 3\r\nKeep-Device-Name: Zo%C3%AB%27s%20phone\r\nKeep-Request-Id: req-42\r\nConnection: close\r\n\r\n"
         );
         // a web client's file: the shared secret, and nobody's name
         let h = head("GET /app.wasm HTTP/1.1\r\nKeep-Member: 1\r\nKeep-Request-Id: x\r\nAccept-Encoding: br, gzip\r\nIf-None-Match: \"v1\"");

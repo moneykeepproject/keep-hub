@@ -96,3 +96,7 @@ Work one stage at a time. Finish a stage's tests before starting the next.
 5. Addresses and Find the problem.
 6. The small library apps copy, with its tests.
 7. Running as a service, and the installer pieces.
+8. The administrator model (spec tests 8 and 27 to 44).
+9. Revisions 2 and 3 (spec tests 45 to 55).
+10. Revision 4: the probe, the tunnel hostname, Fix as an admin request, and the Linux
+    service with its `.deb` (spec tests 56 to 63).

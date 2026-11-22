@@ -13,6 +13,12 @@
 //! keep-hub remove-service                       Windows, elevated: the service and the
 //!                                               firewall rule go; the data folder stays
 //! keep-hub service-run      --data <folder>     the Windows service itself
+//! keep-hub reset-administrator --name <name> [--data <folder>]
+//!                                               a new password for a named administrator,
+//!                                               read from the standard input (one line);
+//!                                               needs the computer's administrator rights,
+//!                                               as the data folder does (on Windows the
+//!                                               folder is %ProgramData%\Keep Hub by default)
 //! ```
 //!
 //! Users never run this by hand: the hub is its own release package, which keep-launcher
@@ -40,6 +46,32 @@ fn echo(line: &str) {
 /// On a Mac, Keep Hub's own program never runs as root: the disk image's two scripts place and
 /// remove launchd's file themselves.
 const MAC_INSTALL: &str = "On a Mac, open \"Install Keep Hub\" (or \"Remove Keep Hub\") from the Keep Hub disk image: they register the hub with launchd without running Keep Hub as root.";
+
+/// `reset-administrator`: when no administrator can sign in. The new password comes on the
+/// standard input, so it is never in the command line (which other programs can see).
+fn reset_administrator(args: &[String]) -> Result<(), String> {
+    let name = arg(args, "--name").ok_or("--name <administrator> is needed")?;
+    let data = match arg(args, "--data") {
+        Some(d) => PathBuf::from(d),
+        None if cfg!(windows) => service::windows_data().ok_or("%ProgramData% isn't set")?,
+        None => return Err("--data <folder> is needed".into()),
+    };
+    if !data.join(keep_hub::registry::REGISTRY_FILE).exists() {
+        return Err(format!(
+            "There are no hub records in {} (or this account can't read them: run this as an administrator of the computer).",
+            data.display()
+        ));
+    }
+    eprintln!("Type the new password for {name} and press Enter (at least 8 characters):");
+    let mut line = zeroize::Zeroizing::new(String::new());
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("the password couldn't be read: {e}"))?;
+    let password = line.trim_end_matches(['\r', '\n']);
+    let id = keep_hub::reset_administrator(&data, &name, password)?;
+    println!("Administrator {name} (member {id}) has a new password. Phones, members and grants are unchanged.");
+    Ok(())
+}
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -73,10 +105,11 @@ fn run() -> Result<(), String> {
             std::process::exit(i32::from(exit.code()));
         }
         "remove-service" => return remove_service(),
+        "reset-administrator" => return reset_administrator(&args),
         "setup" | "run" | "status" | "registered-apps" | "service-run" => {}
         _ => {
             return Err(
-                "usage: keep-hub <setup|run|status|registered-apps|addresses|fix-firewall|install-service|remove-service|service-run> [--data <folder>] [--address <home IPv4>|auto]"
+                "usage: keep-hub <setup|run|status|registered-apps|addresses|fix-firewall|install-service|remove-service|service-run|reset-administrator> [--data <folder>] [--address <home IPv4>|auto] [--name <administrator>]"
                     .into(),
             )
         }

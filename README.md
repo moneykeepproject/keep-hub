@@ -20,6 +20,10 @@ the Windows setup and the Mac disk image). See `docs/specs/keep-hub.md` and `doc
   phone client keeps its own saved data.
 - **One household PIN, access granted per app.** A phone is paired for one member and
   one app. Knowing the PIN does not open an app without a grant.
+- **Administrators and standard members.** Administrators sign in on the hub computer
+  with their own password to add members, give grants and approve every phone. A
+  household may instead choose that the computer's sign-in is enough (no password, no
+  PIN), and secure itself later; an app may pair its phones by code alone.
 - **Any web client.** An app can ship a Slint WASM client or a plain HTML and
   JavaScript one. The hub passes its files through unchanged.
 - **A fallback** for homes where names cannot work: the hub's own certificate authority,

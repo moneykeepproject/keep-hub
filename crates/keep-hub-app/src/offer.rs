@@ -34,6 +34,9 @@ pub enum Offer {
     StartHub(HubClient),
     /// Installed, but this app can't use it: why, in words for the person.
     CantUse(HubError),
+    /// Running and not set up: ask for the first administrator and the household PIN
+    /// ([`HubClient::set_up`]), then go on.
+    SetUp(HubClient),
     /// Running: register and go on.
     Ready(HubClient, HubStatus),
 }
@@ -44,6 +47,7 @@ pub fn offer(data: &Path) -> Offer {
         Found::NotInstalled => Offer::MakeThisTheHub,
         Found::NoAccess(e) => Offer::CantUse(e),
         Found::Stopped(hub) => Offer::StartHub(hub),
+        Found::NotSetUp(hub) => Offer::SetUp(hub),
         Found::Running(hub, status) => Offer::Ready(hub, status),
     }
 }

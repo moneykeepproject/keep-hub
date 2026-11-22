@@ -194,6 +194,8 @@ fn at22_end_to_end_in_a_headless_browser() {
     let running = keep_hub::start(opts).unwrap();
     let token = keep_hub::admin_token(dir.path()).unwrap();
     let hub = HubClient::at(running.admin, &token);
+    hub.set_up(support::ADMIN_NAME, support::ADMIN_PASSWORD, PIN)
+        .unwrap();
     hub.names_on(Some(&code)).unwrap();
     let mut st = Value::Null;
     for _ in 0..120 {
@@ -211,7 +213,6 @@ fn at22_end_to_end_in_a_headless_browser() {
     let name = st["name"].as_str().unwrap().to_string();
 
     // two test apps, made with the library
-    hub.set_pin(PIN, None).unwrap();
     let member = "Ann";
     let ann = hub.add_member(member).unwrap();
     let mut keep = Vec::new();
@@ -228,7 +229,7 @@ fn at22_end_to_end_in_a_headless_browser() {
             backend.port,
         );
         ensure_registered(&hub, &reg, data.path()).unwrap();
-        let pairing = hub.make_pairing_code(ann, &reg.id, None).unwrap();
+        let pairing = hub.make_pairing_code(ann, &reg.id).unwrap();
         clients.push(json!({
             "kind": kind,
             "url": format!("https://{name}:{public}/#pair={}", pairing.code),
@@ -277,7 +278,8 @@ fn run_browser(dir: &Path, job: Value) {
 fn the_browser_part_against_a_local_hub() {
     let f = support::Fixture::new();
     let hub = HubClient::at(f.hub().admin, &f.admin_token);
-    hub.set_pin(PIN, None).unwrap();
+    hub.sign_in(support::ADMIN_NAME, support::ADMIN_PASSWORD)
+        .unwrap();
     let member = "Ann";
     let ann = hub.add_member(member).unwrap();
     // a stand-in name, mapped to the hub's address in the browser
@@ -295,7 +297,7 @@ fn the_browser_part_against_a_local_hub() {
             backend.port,
         );
         ensure_registered(&hub, &reg, data.path()).unwrap();
-        let pairing = hub.make_pairing_code(ann, &reg.id, None).unwrap();
+        let pairing = hub.make_pairing_code(ann, &reg.id).unwrap();
         clients.push(json!({
             "kind": kind,
             "url": format!("https://{name}:{}/#pair={}", reg.public_port, pairing.code),

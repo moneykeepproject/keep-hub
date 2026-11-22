@@ -65,7 +65,33 @@ pub const MIGRATIONS: &[&str] = &[
          created   INTEGER NOT NULL,
          expires   INTEGER NOT NULL
      );",
+    // 1 → 2 (stage 8): every member is an administrator, a standard member or a guest;
+    // an administrator's password is kept only as an Argon2id record. A registry made
+    // before has no administrator yet: its household members are standard members until
+    // the first set-up makes one.
+    "ALTER TABLE members ADD COLUMN class TEXT NOT NULL DEFAULT 'standard';
+     ALTER TABLE members ADD COLUMN password TEXT;
+     UPDATE members SET class = 'guest' WHERE guest_app IS NOT NULL;",
+    // 2 → 3 (stage 9, Revision 2 A): how an app's phones pair. Apps registered before
+    // pair with a code and the household PIN, as they always did.
+    "ALTER TABLE apps ADD COLUMN pairing TEXT NOT NULL DEFAULT 'code_and_pin';",
 ];
+
+/// A member's class (the spec, "Administrators and standard members").
+pub const ADMINISTRATOR: &str = "administrator";
+pub const STANDARD: &str = "standard";
+pub const GUEST: &str = "guest";
+
+/// How an app's phones pair (Revision 2 A): a pairing code and the household PIN, or the
+/// code alone.
+pub const CODE_AND_PIN: &str = "code_and_pin";
+pub const CODE: &str = "code";
+
+/// The key in the `kv` table that records an open household (Revision 2 B): one where the
+/// computer's sign-in is enough. Absent: the household is secured.
+pub const HOUSEHOLD_KEY: &str = "household";
+/// The value of [`HOUSEHOLD_KEY`] for an open household.
+pub const OPEN: &str = "open";
 
 /// A registered app.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +105,15 @@ pub struct App {
     pub money: bool,
     pub guests: bool,
     pub registered: i64,
+    /// [`CODE_AND_PIN`] or [`CODE`].
+    pub pairing: String,
+}
+
+impl App {
+    /// Whether this app's phones pair with the code alone, no PIN.
+    pub fn pairs_by_code_alone(&self) -> bool {
+        self.pairing == CODE
+    }
 }
 
 /// A person in the household, or a guest of one app.
@@ -91,6 +126,21 @@ pub struct Member {
     /// For a guest: what the invite was for (the app's own text).
     pub guest_scope: Option<String>,
     pub created: i64,
+    /// `administrator`, `standard` or `guest`.
+    pub class: String,
+    /// An administrator with a password can sign in (the password itself is never read
+    /// out of the registry except to check it).
+    pub password_set: bool,
+}
+
+impl Member {
+    pub fn is_administrator(&self) -> bool {
+        self.class == ADMINISTRATOR
+    }
+
+    pub fn is_guest(&self) -> bool {
+        self.guest_app.is_some()
+    }
 }
 
 /// A member may use an app.
@@ -148,11 +198,12 @@ fn app_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<App> {
         money: r.get(6)?,
         guests: r.get(7)?,
         registered: r.get(8)?,
+        pairing: r.get(9)?,
     })
 }
 
 const APP: &str =
-    "id, title, version, protocol, public_port, loopback_port, money, guests, registered";
+    "id, title, version, protocol, public_port, loopback_port, money, guests, registered, pairing";
 
 fn member_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Member> {
     Ok(Member {
@@ -161,10 +212,12 @@ fn member_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Member> {
         guest_app: r.get(2)?,
         guest_scope: r.get(3)?,
         created: r.get(4)?,
+        class: r.get(5)?,
+        password_set: r.get::<_, Option<String>>(6)?.is_some(),
     })
 }
 
-const MEMBER: &str = "id, name, guest_app, guest_scope, created";
+const MEMBER: &str = "id, name, guest_app, guest_scope, created, class, password";
 
 fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     Ok(Device {
@@ -209,8 +262,22 @@ impl Registry {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(sql)?;
+        // (a registry no hub has opened since an update may not have the newer columns)
+        let has_pairing: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('apps') WHERE name = 'pairing'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(sql)?
+            > 0;
+        let columns = if has_pairing {
+            APP.to_string()
+        } else {
+            APP.replace(", pairing", &format!(", '{CODE_AND_PIN}'"))
+        };
         let mut stmt = conn
-            .prepare(&format!("SELECT {APP} FROM apps ORDER BY public_port"))
+            .prepare(&format!("SELECT {columns} FROM apps ORDER BY public_port"))
             .map_err(sql)?;
         let rows = stmt.query_map([], app_row).map_err(sql)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(sql)
@@ -219,6 +286,9 @@ impl Registry {
     /// Open with a given list of migrations (a later hub has a longer list).
     pub fn open_with(dir: &Path, migrations: &[&str]) -> StoreResult<Registry> {
         let mut conn = Connection::open(dir.join(REGISTRY_FILE)).map_err(sql)?;
+        // `keep-hub reset-administrator` writes while the hub runs: each waits for the other.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(sql)?;
         conn.pragma_update(None, "journal_mode", "DELETE")
             .map_err(sql)?;
         Self::migrate(&mut conn, migrations)?;
@@ -266,6 +336,32 @@ impl Registry {
             .map_err(sql)
     }
 
+    pub fn remove(&self, key: &str) -> StoreResult<()> {
+        self.conn
+            .execute("DELETE FROM kv WHERE key = ?1", [key])
+            .map(|_| ())
+            .map_err(sql)
+    }
+
+    /// Secure an open household in one transaction: `member`'s password, the household
+    /// PIN, and the open-household mark ([`HOUSEHOLD_KEY`]) removed.
+    pub fn secure(&mut self, member: u32, password: &str, pin: &str) -> StoreResult<()> {
+        let tx = self.conn.transaction().map_err(sql)?;
+        tx.execute(
+            "UPDATE members SET password = ?2 WHERE id = ?1 AND class = 'administrator'",
+            rusqlite::params![member, password],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+            [PIN_KEY, pin],
+        )
+        .map_err(sql)?;
+        tx.execute("DELETE FROM kv WHERE key = ?1", [HOUSEHOLD_KEY])
+            .map_err(sql)?;
+        tx.commit().map_err(sql)
+    }
+
     // ----- apps ---------------------------------------------------------------------------------
 
     pub fn apps(&self) -> StoreResult<Vec<App>> {
@@ -292,10 +388,11 @@ impl Registry {
     pub fn put_app(&self, a: &App) -> StoreResult<()> {
         self.conn
             .execute(
-                "INSERT INTO apps (id, title, version, protocol, public_port, loopback_port, money, guests, registered)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "INSERT INTO apps (id, title, version, protocol, public_port, loopback_port, money, guests, registered, pairing)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT (id) DO UPDATE SET title = ?2, version = ?3, protocol = ?4,
-                     public_port = ?5, loopback_port = ?6, money = ?7, guests = ?8, registered = ?9",
+                     public_port = ?5, loopback_port = ?6, money = ?7, guests = ?8, registered = ?9,
+                     pairing = ?10",
                 rusqlite::params![
                     a.id,
                     a.title,
@@ -305,7 +402,8 @@ impl Registry {
                     a.loopback_port,
                     a.money,
                     a.guests,
-                    a.registered
+                    a.registered,
+                    a.pairing
                 ],
             )
             .map(|_| ())
@@ -334,14 +432,90 @@ impl Registry {
 
     // ----- members ------------------------------------------------------------------------------
 
+    /// A standard member.
     pub fn add_member(&self, name: &str, now: i64) -> StoreResult<u32> {
+        self.add_member_as(name, STANDARD, now)
+    }
+
+    /// A household member of `class` (`administrator` or `standard`), with no password.
+    pub fn add_member_as(&self, name: &str, class: &str, now: i64) -> StoreResult<u32> {
         self.conn
             .execute(
-                "INSERT INTO members (name, created) VALUES (?1, ?2)",
-                rusqlite::params![name, now],
+                "INSERT INTO members (name, created, class) VALUES (?1, ?2, ?3)",
+                rusqlite::params![name, now, class],
             )
             .map_err(sql)?;
         Ok(self.conn.last_insert_rowid() as u32)
+    }
+
+    /// Change a household member's class. Made a standard member, an administrator's
+    /// password goes (a standard member has none). `false` when there is no such member.
+    pub fn set_class(&self, id: u32, class: &str) -> StoreResult<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE members SET class = ?2,
+                     password = CASE WHEN ?2 = 'administrator' THEN password ELSE NULL END
+                 WHERE id = ?1 AND guest_app IS NULL",
+                rusqlite::params![id, class],
+            )
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    /// Set (or, with `None`, clear) an administrator's password record.
+    pub fn set_password(&self, id: u32, record: Option<&str>) -> StoreResult<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE members SET password = ?2 WHERE id = ?1 AND class = 'administrator'",
+                rusqlite::params![id, record],
+            )
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    /// An administrator's password record, to check a sign-in.
+    pub fn password_of(&self, id: u32) -> StoreResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT password FROM members WHERE id = ?1 AND class = 'administrator'",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)
+            .map(Option::flatten)
+    }
+
+    /// How many administrators the household has.
+    pub fn administrators(&self) -> StoreResult<u32> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM members WHERE class = 'administrator'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql)
+    }
+
+    /// Remove a member, of the household or a guest (owner decision 2026-11-19): their
+    /// phones are revoked (the rows stay for the list), their grants go, and so do they.
+    /// `false` when there is no such member.
+    pub fn remove_member(&mut self, id: u32, now: i64) -> StoreResult<bool> {
+        let tx = self.conn.transaction().map_err(sql)?;
+        tx.execute(
+            "UPDATE devices SET revoked = ?2 WHERE member = ?1 AND revoked IS NULL",
+            rusqlite::params![id, now],
+        )
+        .map_err(sql)?;
+        tx.execute("DELETE FROM grants WHERE member = ?1", [id])
+            .map_err(sql)?;
+        let n = tx
+            .execute("DELETE FROM members WHERE id = ?1", [id])
+            .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+        Ok(n > 0)
     }
 
     /// `false` when there is no such member.
@@ -560,7 +734,7 @@ impl Registry {
             return Ok(None);
         }
         tx.execute(
-            "INSERT INTO members (name, guest_app, guest_scope, created) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO members (name, guest_app, guest_scope, created, class) VALUES (?1, ?2, ?3, ?4, 'guest')",
             rusqlite::params![name, invite.app, invite.scope, now],
         )
         .map_err(sql)?;
@@ -596,6 +770,7 @@ mod tests {
             money: false,
             guests: true,
             registered: 5,
+            pairing: CODE_AND_PIN.into(),
         }
     }
 
@@ -697,6 +872,68 @@ mod tests {
         let r = Registry::open(dir.path()).unwrap();
         assert!(r.device_by_token("tok").unwrap().is_some());
         assert_eq!(r.get(PIN_KEY).unwrap().as_deref(), Some("hash"));
+    }
+
+    /// A registry made before stage 8 (migration 1 only): its household members become
+    /// standard members and its guests guests; there is no administrator until the first
+    /// set-up, and nothing else changes.
+    #[test]
+    fn a_registry_from_before_classes_gets_them_and_no_administrator() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut r = Registry::open_with(dir.path(), &MIGRATIONS[..1]).unwrap();
+            r.conn
+                .execute("INSERT INTO members (name, created) VALUES ('Sam', 1)", [])
+                .unwrap();
+            r.give_grant(1, "trips", 1).unwrap();
+            r.add_device("tok", 1, "trips", "phone", 1).unwrap();
+            r.add_invite("INVITE01", "trips", "trip-1", 1, 99).unwrap();
+            let invite = r.invite_by_code("INVITE01").unwrap().unwrap();
+            // (the guest insert of migration 1's day: no class column yet)
+            let tx = r.conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO members (name, guest_app, guest_scope, created) VALUES ('Kim', ?1, ?2, 1)",
+                rusqlite::params![invite.app, invite.scope],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let r = Registry::open(dir.path()).unwrap();
+        let m = r.members().unwrap();
+        assert_eq!(
+            m.iter()
+                .map(|m| (m.name.as_str(), m.class.as_str(), m.password_set))
+                .collect::<Vec<_>>(),
+            [("Sam", STANDARD, false), ("Kim", GUEST, false)]
+        );
+        assert_eq!(r.administrators().unwrap(), 0);
+        assert!(r.device_by_token("tok").unwrap().is_some());
+        assert!(r.has_grant(1, "trips").unwrap());
+    }
+
+    /// A registry made before Revision 2 (migrations 1 and 2): its apps pair with a code
+    /// and the PIN, as they did; the uninstaller's read sees the same before and after.
+    #[test]
+    fn a_registry_from_before_pairing_choices_keeps_code_and_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let r = Registry::open_with(dir.path(), &MIGRATIONS[..2]).unwrap();
+            r.conn
+                .execute(
+                    "INSERT INTO apps (id, title, version, protocol, public_port, loopback_port, money, guests, registered)
+                     VALUES ('trips', 'Trips', '1.0', 1, 16443, 26443, 0, 1, 5)",
+                    [],
+                )
+                .unwrap();
+        }
+        let before = Registry::read_apps(dir.path()).unwrap();
+        assert_eq!(before[0].pairing, CODE_AND_PIN);
+        let r = Registry::open(dir.path()).unwrap();
+        let a = r.app("trips").unwrap().unwrap();
+        assert_eq!(a.pairing, CODE_AND_PIN);
+        assert!(!a.pairs_by_code_alone());
+        assert_eq!(Registry::read_apps(dir.path()).unwrap(), before);
+        assert_eq!(r.get(HOUSEHOLD_KEY).unwrap(), None, "a secured household");
     }
 
     /// Acceptance test 21.

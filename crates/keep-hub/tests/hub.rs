@@ -234,7 +234,8 @@ fn only_what_the_hub_checked_reaches_a_backend() {
     let r = f.phone("alpha", "POST", "/upload", &[], Some(b"x"));
     assert_eq!((r.status, r.error().as_str()), (405, "method_not_allowed"));
     let r = f.phone("alpha", "GET", "/index.html", &[], Some(b"x"));
-    assert_eq!(r.status, 400);
+    // (stage 8: 405 as the spec's test 36 has it; it was 400 `bad_request`)
+    assert_eq!((r.status, r.error().as_str()), (405, "method_not_allowed"));
     // a body must say how long it is
     let auth = format!("Bearer {token}");
     let r = f.phone(
@@ -421,34 +422,32 @@ fn at06_ten_failures_pause_pairing_for_ten_minutes() {
 
 #[test]
 fn pairing_needs_a_pin_a_live_code_and_a_name() {
+    // (stage 8: the first set-up sets the household PIN, so a household always has one, and
+    // an administrator sets a new one without the old: "A forgotten household PIN")
     let f = Fixture::new();
     let alpha = TestApp::start("alpha");
     f.register(&alpha, false, false);
     let sam = f.add_member("Sam");
-    // no household PIN yet: no code can be made
-    let r = f.admin(
-        "POST",
-        "/admin/v1/pairing-codes",
-        Some(json!({ "member": sam, "app": "alpha" })),
-    );
-    assert_eq!((r.status, r.error().as_str()), (409, "pin_not_set"));
+    assert_eq!(f.admin_ok("GET", "/admin/v1/pin", None)["set"], true);
     // a PIN is 6 to 12 digits
     for bad in ["12345", "1234567890123", "12345a"] {
         let r = f.admin("PUT", "/admin/v1/pin", Some(json!({ "pin": bad })));
         assert_eq!((r.status, r.error().as_str()), (400, "bad_pin"), "{bad}");
     }
-    assert_eq!(f.admin_ok("GET", "/admin/v1/pin", None)["set"], false);
-    f.set_pin();
-    assert_eq!(f.admin_ok("GET", "/admin/v1/pin", None)["set"], true);
-    // changing it needs the old one
-    let r = f.admin("PUT", "/admin/v1/pin", Some(json!({ "pin": "135790" })));
-    assert_eq!((r.status, r.error().as_str()), (403, "pin_needed"));
-    let r = f.admin(
-        "PUT",
-        "/admin/v1/pin",
-        Some(json!({ "pin": "135790", "old": "000000" })),
+    // an administrator changes it without the old one; the old one stops pairing
+    f.admin_ok("PUT", "/admin/v1/pin", Some(json!({ "pin": "135790" })));
+    let code = f.code(sam, "alpha");
+    let r = f.phone_json("alpha", "POST", "/hub/pair", &[], &pair_request(&code, PIN));
+    assert_eq!((r.status, r.error().as_str()), (403, "wrong_code"));
+    let r = f.phone_json(
+        "alpha",
+        "POST",
+        "/hub/pair",
+        &[],
+        &pair_request(&code, "135790"),
     );
-    assert_eq!((r.status, r.error().as_str()), (403, "pin_wrong"));
+    assert_eq!(r.status, 200, "{}", r.text());
+    f.set_pin();
     // only a hash is kept
     let registry = std::fs::read(f.dir.path().join("hub.sqlite")).unwrap();
     assert!(!registry.windows(PIN.len()).any(|w| w == PIN.as_bytes()));
@@ -588,44 +587,60 @@ fn at07_removing_a_grant_makes_the_members_tokens_answer_no_access() {
 }
 
 #[test]
-fn at08_granting_an_app_that_declared_money_needs_the_pin() {
+fn at08_a_grant_needs_an_administrators_session_and_no_pin() {
+    // (the spec's test 8 as changed: "Every grant is an administrator's act")
     let f = Fixture::new();
     let books = TestApp::start("books");
     let trips = TestApp::start("trips");
     f.register(&books, true, false);
     f.register(&trips, false, false);
     let sam = f.add_member("Sam");
-    let grant = |app: &str, pin: Option<&str>| {
-        let mut b = json!({ "member": sam, "app": app });
-        if let Some(p) = pin {
-            b["pin"] = json!(p);
-        }
-        f.admin("POST", "/admin/v1/grants", Some(b))
-    };
-    // an app without money: no PIN, even before one is set
-    assert_eq!(grant("trips", None).status, 200);
-    // an app with money: a PIN must exist, be given, and be right
-    let r = grant("books", None);
-    assert_eq!((r.status, r.error().as_str()), (409, "pin_not_set"));
-    f.set_pin();
-    let r = grant("books", None);
-    assert_eq!((r.status, r.error().as_str()), (403, "pin_needed"));
-    let r = grant("books", Some("000000"));
-    assert_eq!((r.status, r.error().as_str()), (403, "pin_wrong"));
-    // the same when a pairing code would make the grant
-    let r = f.admin(
+    let grant = |app: &str| json!({ "member": sam, "app": app });
+    // without a session: refused, money or not, and no grant is made
+    for app in ["books", "trips"] {
+        let r = f.admin_with(None, "POST", "/admin/v1/grants", Some(grant(app)));
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (401, "administrator_needed"),
+            "{app}"
+        );
+        let r = f.admin_with(
+            Some("not-a-session"),
+            "POST",
+            "/admin/v1/grants",
+            Some(grant(app)),
+        );
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (401, "administrator_needed")
+        );
+    }
+    let r = f.admin_with(
+        None,
         "POST",
         "/admin/v1/pairing-codes",
-        Some(json!({ "member": sam, "app": "books" })),
+        Some(grant("books")),
     );
-    assert_eq!((r.status, r.error().as_str()), (403, "pin_needed"));
+    assert_eq!(
+        (r.status, r.error().as_str()),
+        (401, "administrator_needed")
+    );
     let grants = f.admin_ok("GET", "/admin/v1/grants", None);
-    assert_eq!(grants["grants"].as_array().unwrap().len(), 1);
-
-    assert_eq!(grant("books", Some(PIN)).status, 200);
+    assert!(grants["grants"].as_array().unwrap().is_empty());
+    // with a session: both succeed, and no PIN is asked (a PIN sent by an older program
+    // is ignored, right or wrong)
+    assert_eq!(
+        f.admin("POST", "/admin/v1/grants", Some(grant("trips")))
+            .status,
+        200
+    );
+    let mut with_old_pin = grant("books");
+    with_old_pin["pin"] = json!("000000");
+    let r = f.admin("POST", "/admin/v1/grants", Some(with_old_pin));
+    assert_eq!(r.status, 200, "{}", r.text());
     let grants = f.admin_ok("GET", "/admin/v1/grants", None);
     assert_eq!(grants["grants"].as_array().unwrap().len(), 2);
-    // with the grant there, a code needs no PIN on the hub computer (the phone still does)
+    // a code needs no PIN on the hub computer (the phone still does)
     let code = f.admin_ok(
         "POST",
         "/admin/v1/pairing-codes",
@@ -710,8 +725,15 @@ fn at09_a_guest_invite_pairs_without_a_pin_once_and_carries_its_scope() {
     assert_eq!(r.json()["headers"]["keep-member-name"], "Kim");
     assert_eq!(trips.seen().len(), 1);
     // a guest is no household member: no grants or codes for other apps
-    let guest = f.admin_ok("GET", "/admin/v1/members", None)["members"][0].clone();
-    assert_eq!(guest["guest_app"], "trips");
+    let members = f.admin_ok("GET", "/admin/v1/members", None)["members"].clone();
+    let guest = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["guest_app"] == "trips")
+        .unwrap()
+        .clone();
+    assert_eq!(guest["class"], "guest");
     let r = f.admin(
         "POST",
         "/admin/v1/grants",
@@ -971,12 +993,17 @@ fn the_admin_address_needs_the_admin_token_and_keeps_the_members_list() {
     );
     let members = f.admin_ok("GET", "/admin/v1/members", None);
     let list = members["members"].as_array().unwrap();
-    assert_eq!(list.len(), 1);
+    // (stage 8: the first administrator, then Samira)
+    assert_eq!(list.len(), 2);
     assert_eq!(
-        (&list[0]["id"], &list[0]["name"]),
-        (&json!(sam), &json!("Samira"))
+        (&list[1]["id"], &list[1]["name"], &list[1]["class"]),
+        (&json!(sam), &json!("Samira"), &json!("standard"))
     );
-    assert!(list[0]["guest_app"].is_null() && list[0]["guest_scope"].is_null());
+    assert!(list[1]["guest_app"].is_null() && list[1]["guest_scope"].is_null());
+    // no password, or anything from one, is ever in the list
+    assert_eq!(list[0]["class"], "administrator");
+    assert!(list[0].get("password").is_none());
+    assert!(!members.to_string().contains("argon2"));
     assert_eq!(f.admin("GET", "/admin/v1/nothing", None).status, 404);
     assert_eq!(
         f.admin("POST", "/admin/v1/members", Some(json!({ "nome": "x" })))

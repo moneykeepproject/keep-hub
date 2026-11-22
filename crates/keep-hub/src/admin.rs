@@ -1,38 +1,52 @@
 //! The admin address (`http://127.0.0.1:16081`, this computer only), for the apps' desktop
 //! programs and for keep-launcher (which lists the registered apps before it removes the
 //! hub). Every request needs the admin token from the hub's data folder
-//! (`Authorization: Bearer`). Started from the admin listener of ShareKeep's hub
-//! (`server.rs`).
+//! (`Authorization: Bearer`). Requests marked A also need an administrator's live session
+//! in `Keep-Admin-Session`, or answer 401 `administrator_needed`; in an open household
+//! (Revision 2 B) the admin token alone is an administrator. Until the first set-up every
+//! request but the set-up answers 409 `setup_needed`. Started from the admin listener of
+//! ShareKeep's hub (`server.rs`).
 //!
 //! ```text
-//! GET    /admin/v1/status                       hub version, protocol numbers, each app's state
-//! GET    /admin/v1/apps                         the registered apps
-//! POST   /admin/v1/apps                         register an app; answers with the shared secret
-//! DELETE /admin/v1/apps/<id>                    unregister
-//! GET    /admin/v1/members                      list
-//! POST   /admin/v1/members        {name}        add
-//! PUT    /admin/v1/members/<id>   {name}        rename
-//! GET    /admin/v1/grants                       list
-//! POST   /admin/v1/grants         {member, app, pin?}   give (pin for an app that declared money)
-//! DELETE /admin/v1/grants/<member>/<app>        remove
-//! GET    /admin/v1/devices                      list
-//! DELETE /admin/v1/devices/<id>                 revoke
-//! POST   /admin/v1/pairing-codes  {member, app, pin?}   make
-//! DELETE /admin/v1/pairing-codes/<code>         cancel
-//! GET    /admin/v1/invites                      guest invites not used yet
-//! POST   /admin/v1/invites        {app, scope}  make
-//! DELETE /admin/v1/invites/<id>                 cancel
-//! GET    /admin/v1/pin                          whether a household PIN is set
-//! PUT    /admin/v1/pin            {pin, old?}   set, or change with the old one
-//! GET    /admin/v1/names                        the name's state and certificate
-//! POST   /admin/v1/names/on       {registration_code?}  turn on (the code the first time)
-//! POST   /admin/v1/names/off                    turn off (the name and certificate are kept)
-//! POST   /admin/v1/names/renew                  ask for a new certificate now
-//! POST   /admin/v1/names/address                send the address to the name service again
-//! GET    /admin/v1/addresses                    this computer's home addresses and adapters
-//! PUT    /admin/v1/address        {adapter}     which adapter's address to use ("automatic")
-//! POST   /admin/v1/problems                     Find the problem: run the checks
-//! GET    /admin/v1/problems                     the last results
+//!    POST   /admin/v1/setup          {name, password, pin}  first set-up; answers with a session
+//!    POST   /admin/v1/setup          {name, sign_in_is_enough: true}  … of an open household
+//!    POST   /admin/v1/secure         {name, password, pin}  secure an open household: a session
+//!    POST   /admin/v1/session        {name, password}       sign in: a session (409 sign_in_not_used
+//!                                                           in an open household)
+//!    DELETE /admin/v1/session                               sign out
+//!    GET    /admin/v1/status                       hub version, protocol numbers, each app's state
+//!    GET    /admin/v1/apps                         the registered apps
+//! (A)POST   /admin/v1/apps                         register an app (A the first time, and to
+//!                                                  change its `pairing`)
+//! A  DELETE /admin/v1/apps/<id>                    unregister
+//!    GET    /admin/v1/members                      list, with each member's class
+//! A  POST   /admin/v1/members        {name, class?}         add (a standard member by default)
+//! A  PUT    /admin/v1/members/<id>   {name}                 rename
+//! A  PUT    /admin/v1/members/<id>/class    {class}         administrator or standard
+//! A  PUT    /admin/v1/members/<id>/password {password}      an administrator's password
+//! A  DELETE /admin/v1/members/<id>                          remove: phones revoked, grants gone
+//!    GET    /admin/v1/grants                       list
+//! A  POST   /admin/v1/grants         {member, app}  give (no PIN, money or not)
+//! A  DELETE /admin/v1/grants/<member>/<app>        remove
+//!    GET    /admin/v1/devices                      list
+//! A  DELETE /admin/v1/devices/<id>                 revoke
+//! A  POST   /admin/v1/pairing-codes  {member, app}  make
+//! A  DELETE /admin/v1/pairing-codes/<code>         cancel
+//!    GET    /admin/v1/invites                      guest invites not used yet
+//! A  POST   /admin/v1/invites        {app, scope}  make
+//! A  DELETE /admin/v1/invites/<id>                 cancel
+//!    GET    /admin/v1/pin                          whether a household PIN is set
+//! A  PUT    /admin/v1/pin            {pin}         set or change (the old PIN is not needed)
+//!    GET    /admin/v1/names                        the name's state and certificate
+//! A  POST   /admin/v1/names/on       {registration_code?}  turn on (the code the first time)
+//! A  POST   /admin/v1/names/off                    turn off (the name and certificate are kept)
+//! A  POST   /admin/v1/names/renew                  ask for a new certificate now
+//! A  PUT    /admin/v1/names/code-page {code_page}  where a person asks for a registration code
+//!    POST   /admin/v1/names/address                send the address to the name service again
+//!    GET    /admin/v1/addresses                    this computer's home addresses and adapters
+//! A  PUT    /admin/v1/address        {adapter}     which adapter's address to use ("automatic")
+//!    POST   /admin/v1/problems                     Find the problem: run the checks
+//!    GET    /admin/v1/problems                     the last results
 //! ```
 
 use std::io::Read;
@@ -42,9 +56,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Header, Request, Response};
 
-use crate::hub::{clean_name, Hub, Refusal, Registration};
+use crate::hub::household::{SecureRequest, SetupRequest, SignInRequest};
+use crate::hub::{Hub, Refusal, Registration};
 use crate::registry::PIN_KEY;
 use crate::util;
+
+/// The header that carries an administrator's session.
+pub const SESSION_HEADER: &str = "Keep-Admin-Session";
 
 const MAX_BODY: u64 = 64 * 1024;
 
@@ -138,11 +156,28 @@ struct NameRequest {
 }
 
 #[derive(Deserialize)]
+struct MemberRequest {
+    name: String,
+    #[serde(default)]
+    class: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClassRequest {
+    class: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordRequest {
+    password: String,
+}
+
+/// A grant or a pairing code. (A `pin` sent by an older program is ignored: every grant
+/// is an administrator's act and asks for no PIN.)
+#[derive(Deserialize)]
 struct GrantRequest {
     member: u32,
     app: String,
-    #[serde(default)]
-    pin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -158,15 +193,26 @@ struct NamesOnRequest {
 }
 
 #[derive(Deserialize)]
+struct CodePageRequest {
+    code_page: String,
+}
+
+#[derive(Deserialize)]
 struct AdapterRequest {
     adapter: String,
 }
 
+/// (An `old` PIN sent by an older program is ignored: the old PIN is not needed.)
 #[derive(Deserialize)]
 struct PinRequest {
     pin: String,
-    #[serde(default)]
-    old: Option<String>,
+}
+
+fn session(req: &Request) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(SESSION_HEADER))
+        .map(|h| h.value.as_str().to_string())
 }
 
 pub(crate) fn handle(hub: &Arc<Hub>, mut req: Request) {
@@ -209,7 +255,34 @@ fn found(was: bool, code: &'static str, message: &str) -> Result<Value, Refusal>
 
 fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Result<Value, Refusal> {
     let now = hub.now();
+    if let ("POST", ["setup"]) = (method, parts) {
+        let b: SetupRequest = read_json(req)?;
+        return hub.first_setup(&b);
+    }
+    // Until the first set-up the hub accepts nothing else.
+    hub.needs_setup()?;
+    let session = session(req);
+    // Any request that carries a live session restarts its minutes (owner decision
+    // 2026-11-19: the app is open and in use). One that isn't live is ignored here.
+    if session.is_some() {
+        let _ = hub.administrator(session.as_deref());
+    }
+    // A request marked A: an administrator's live session, or an open household.
+    let need = || hub.acting_administrator(session.as_deref());
     match (method, parts) {
+        ("POST", ["session"]) => {
+            let b: SignInRequest = read_json(req)?;
+            hub.sign_in(&b)
+        }
+        ("POST", ["secure"]) => {
+            let b: SecureRequest = read_json(req)?;
+            hub.secure(&b)
+        }
+        ("DELETE", ["session"]) => {
+            hub.sign_out(session.as_deref());
+            Ok(json!({ "ok": true }))
+        }
+
         ("GET", ["status"]) => hub.status(),
 
         ("GET", ["apps"]) => {
@@ -218,38 +291,47 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
         }
         ("POST", ["apps"]) => {
             let r: Registration = read_json(req)?;
-            hub.register(&r)
+            // (asked only when the app is new or changes its `pairing`: an update needs the
+            // token alone)
+            let administrator = need().is_ok();
+            hub.register(&r, administrator)
         }
-        ("DELETE", ["apps", id]) => hub.unregister(id).map(|()| json!({ "ok": true })),
+        ("DELETE", ["apps", id]) => {
+            need()?;
+            hub.unregister(id).map(|()| json!({ "ok": true }))
+        }
 
         ("GET", ["members"]) => {
             let members = hub.lock().registry.members().map_err(Refusal::inner)?;
             Ok(json!({ "members": members }))
         }
         ("POST", ["members"]) => {
-            let b: NameRequest = read_json(req)?;
-            let name = clean_name(&b.name, "this person")?;
-            let id = hub
-                .lock()
-                .registry
-                .add_member(&name, now)
-                .map_err(Refusal::inner)?;
-            Ok(json!({ "id": id, "name": name }))
+            need()?;
+            let b: MemberRequest = read_json(req)?;
+            hub.add_member(&b.name, b.class.as_deref())
         }
         ("PUT", ["members", id]) => {
+            need()?;
             let id = number(id)?;
             let b: NameRequest = read_json(req)?;
-            let name = clean_name(&b.name, "this person")?;
-            let was = hub
-                .lock()
-                .registry
-                .rename_member(id, &name)
-                .map_err(Refusal::inner)?;
-            found(
-                was,
-                "no_such_member",
-                "That person isn't in the household's list.",
-            )
+            hub.rename_member(id, &b.name)
+        }
+        ("PUT", ["members", id, "class"]) => {
+            need()?;
+            let id = number(id)?;
+            let b: ClassRequest = read_json(req)?;
+            hub.set_class(id, &b.class)
+        }
+        ("PUT", ["members", id, "password"]) => {
+            need()?;
+            let id = number(id)?;
+            let b: PasswordRequest = read_json(req)?;
+            hub.set_password(id, &b.password, session.as_deref())
+        }
+        ("DELETE", ["members", id]) => {
+            need()?;
+            let id = number(id)?;
+            hub.remove_member(id)
         }
 
         ("GET", ["grants"]) => {
@@ -257,11 +339,13 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             Ok(json!({ "grants": grants }))
         }
         ("POST", ["grants"]) => {
+            need()?;
             let b: GrantRequest = read_json(req)?;
-            hub.give_grant(b.member, &b.app, b.pin.as_deref())?;
+            hub.give_grant(b.member, &b.app)?;
             Ok(json!({ "ok": true }))
         }
         ("DELETE", ["grants", member, app]) => {
+            need()?;
             let member = number(member)?;
             let was = hub
                 .lock()
@@ -280,6 +364,7 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             Ok(json!({ "devices": devices }))
         }
         ("DELETE", ["devices", id]) => {
+            need()?;
             let id = number(id)?;
             let was = hub
                 .lock()
@@ -294,24 +379,30 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
         }
 
         ("POST", ["pairing-codes"]) => {
+            need()?;
             let b: GrantRequest = read_json(req)?;
-            hub.make_code(b.member, &b.app, b.pin.as_deref())
+            hub.make_code(b.member, &b.app)
         }
-        ("DELETE", ["pairing-codes", code]) => found(
-            hub.cancel_code(code),
-            "no_such_code",
-            "That pairing code isn't in use.",
-        ),
+        ("DELETE", ["pairing-codes", code]) => {
+            need()?;
+            found(
+                hub.cancel_code(code),
+                "no_such_code",
+                "That pairing code isn't in use.",
+            )
+        }
 
         ("GET", ["invites"]) => {
             let invites = hub.lock().registry.invites().map_err(Refusal::inner)?;
             Ok(json!({ "invites": invites }))
         }
         ("POST", ["invites"]) => {
+            need()?;
             let b: InviteRequest = read_json(req)?;
             hub.make_invite(&b.app, &b.scope)
         }
         ("DELETE", ["invites", id]) => {
+            need()?;
             let id = number(id)?;
             let was = hub
                 .lock()
@@ -331,8 +422,9 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             Ok(json!({ "set": set }))
         }
         ("PUT", ["pin"]) => {
+            need()?;
             let b: PinRequest = read_json(req)?;
-            hub.set_pin(&b.pin, b.old.as_deref())?;
+            hub.set_pin(&b.pin)?;
             Ok(json!({ "ok": true }))
         }
 
@@ -350,6 +442,7 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             }))
         }
         ("PUT", ["address"]) => {
+            need()?;
             let b: AdapterRequest = read_json(req)?;
             hub.choose_adapter(&b.adapter)
                 .map_err(|m| Refusal::new(400, "bad_adapter", m))?;
@@ -366,6 +459,7 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             .clone()
             .unwrap_or_else(|| json!({ "checks": [], "stopped_at": null, "at": null }))),
         ("POST", ["names", "on"]) => {
+            need()?;
             let b: NamesOnRequest = read_json_or_empty(req)?;
             hub.names
                 .turn_on(b.registration_code.as_deref())
@@ -373,10 +467,20 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             Ok(hub.names.status())
         }
         ("POST", ["names", "off"]) => {
+            need()?;
             hub.names.turn_off().map_err(Refusal::inner)?;
             Ok(hub.names.status())
         }
+        ("PUT", ["names", "code-page"]) => {
+            need()?;
+            let b: CodePageRequest = read_json(req)?;
+            hub.names
+                .set_code_page(&b.code_page)
+                .map_err(|m| Refusal::new(400, "bad_code_page", m))?;
+            Ok(hub.names.status())
+        }
         ("POST", ["names", "renew"]) => {
+            need()?;
             hub.names
                 .renew_now()
                 .map_err(|m| Refusal::new(409, "names_off", m))?;

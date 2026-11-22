@@ -31,10 +31,36 @@ pub struct Registration {
     pub public_port: u16,
     /// Where the app's backend listens on 127.0.0.1.
     pub loopback_port: u16,
-    /// The app holds financial records: granting it needs the household PIN.
+    /// The app holds financial records (it can't accept guests).
     pub money: bool,
     /// The app accepts guests (never with `money`).
     pub guests: bool,
+    /// How its phones pair (Revision 2 A): [`CODE_AND_PIN`] (a pairing code and the
+    /// household PIN) or [`CODE`] (the code alone). A record saved before has none: it
+    /// paired with the PIN.
+    #[serde(default = "code_and_pin")]
+    pub pairing: String,
+}
+
+/// Phones pair with a pairing code and the household PIN (the default).
+pub const CODE_AND_PIN: &str = "code_and_pin";
+/// Phones pair with the pairing code alone, no PIN.
+pub const CODE: &str = "code";
+
+fn code_and_pin() -> String {
+    CODE_AND_PIN.into()
+}
+
+/// The ports the apps are given (the spec's port table). The hub doesn't hold an app to
+/// them: it takes any port no other app holds, that isn't its own and isn't below 1024.
+pub mod ports {
+    pub const MONEYKEEP: u16 = 14443;
+    /// Revision 2 C.
+    pub const MONEYKEEP_EZ: u16 = 14444;
+    pub const SHAREKEEP: u16 = 15443;
+    pub const VACAPICK: u16 = 16443;
+    /// The first port of the later Pick apps, one each upward.
+    pub const LATER_PICK_APPS: u16 = 16444;
 }
 
 impl Registration {
@@ -54,7 +80,14 @@ impl Registration {
             loopback_port,
             money: false,
             guests: false,
+            pairing: code_and_pin(),
         }
+    }
+
+    /// The app's phones pair with the pairing code alone, no PIN (Revision 2 A).
+    pub fn by_code_alone(mut self) -> Registration {
+        self.pairing = CODE.into();
+        self
     }
 
     /// The app holds financial records.
@@ -79,6 +112,19 @@ impl Registration {
             && a.loopback_port == self.loopback_port
             && a.money == self.money
             && a.guests == self.guests
+            && a.pairing.as_deref() == Some(self.pairing.as_str())
+    }
+
+    /// A hub that doesn't say how an app pairs is older than Revision 2: it pairs every
+    /// phone with the PIN.
+    fn needs_newer_hub(&self, version: &str) -> HubError {
+        HubError::here(
+            "hub_too_old",
+            format!(
+                "Keep Hub on this computer (version {version}) is older than {} needs to pair phones without a PIN. Update it in keep-launcher.",
+                self.title
+            ),
+        )
     }
 }
 
@@ -127,8 +173,17 @@ pub fn ensure_registered(
             });
         }
     }
-    let secret = hub.register_raw(r)?;
+    if r.pairing == CODE && lists_apps_without_pairing(&status) {
+        return Err(r.needs_newer_hub(&status.version));
+    }
+    let (secret, pairing) = hub.register_raw(r)?;
     write_secret(app_data, &secret)?;
+    // An app that asked for `code` and got an answer without `pairing` is talking to an
+    // older hub: it must not offer pairing (Revision 2 A). The secret is kept all the same,
+    // so the backend still checks what the hub forwards.
+    if r.pairing == CODE && pairing.is_none() {
+        return Err(r.needs_newer_hub(&status.version));
+    }
     let record =
         serde_json::to_vec_pretty(r).map_err(|e| HubError::here("not_saved", e.to_string()))?;
     write_private(&app_data.join(RECORD_FILE), &record)?;
@@ -136,6 +191,12 @@ pub fn ensure_registered(
         auth: HubAuth::new(&secret),
         now: true,
     })
+}
+
+/// Whether the hub lists apps without their `pairing`: one older than Revision 2. (A hub
+/// with no app registered can't tell; the registration's answer then does.)
+fn lists_apps_without_pairing(status: &crate::HubStatus) -> bool {
+    status.apps.iter().any(|a| a.app.pairing.is_none())
 }
 
 /// The shared secret kept in `app_data`.
@@ -240,6 +301,20 @@ mod tests {
             (false, false, crate::PROTOCOL)
         );
         assert!(r.clone().money().money);
-        assert!(r.guests().guests);
+        assert!(r.clone().guests().guests);
+        assert_eq!(r.pairing, CODE_AND_PIN);
+        assert_eq!(r.by_code_alone().pairing, CODE);
+    }
+
+    /// A record saved before Revision 2 reads as `code_and_pin`.
+    #[test]
+    fn an_older_record_pairs_with_the_pin() {
+        let r: Registration = serde_json::from_str(
+            r#"{"id":"vacapick","title":"VacaPick","version":"1.0.0","protocol":1,
+                "public_port":16443,"loopback_port":26443,"money":false,"guests":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.pairing, CODE_AND_PIN);
+        assert_eq!(ports::MONEYKEEP_EZ, 14444);
     }
 }

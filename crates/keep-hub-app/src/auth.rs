@@ -20,6 +20,7 @@ pub const MEMBER_NAME: &str = "Keep-Member-Name";
 pub const DEVICE: &str = "Keep-Device";
 pub const DEVICE_NAME: &str = "Keep-Device-Name";
 pub const GUEST_SCOPE: &str = "Keep-Guest-Scope";
+pub const MEMBER_CLASS: &str = "Keep-Member-Class";
 pub const REQUEST_ID: &str = "Keep-Request-Id";
 
 /// Who sent an `/api/` request: a member of the household (or a guest) and one of their
@@ -29,6 +30,10 @@ pub struct Caller {
     /// The member's id in the hub. An app links its own records to this.
     pub member: u32,
     pub member_name: String,
+    /// `administrator`, `standard` or `guest` (`Keep-Member-Class`). The app may use it for
+    /// its own rules; the hub doesn't decide what a class may do inside an app. `None` from
+    /// an older hub, which didn't send it.
+    pub class: Option<String>,
     /// The device's id: this app on one phone.
     pub device: u32,
     pub device_name: String,
@@ -42,6 +47,11 @@ pub struct Caller {
 impl Caller {
     pub fn is_guest(&self) -> bool {
         self.guest_scope.is_some()
+    }
+
+    /// Whether the member is one of the household's administrators.
+    pub fn is_administrator(&self) -> bool {
+        self.class.as_deref() == Some("administrator")
     }
 }
 
@@ -138,7 +148,7 @@ impl HubAuth {
         }
         let Some(member) = h.one(MEMBER)? else {
             // from the hub, without a phone: none of the other identity headers either
-            for k in [MEMBER_NAME, DEVICE, DEVICE_NAME, GUEST_SCOPE] {
+            for k in [MEMBER_NAME, MEMBER_CLASS, DEVICE, DEVICE_NAME, GUEST_SCOPE] {
                 if h.all(k).next().is_some() {
                     return Err(BAD_IDENTITY);
                 }
@@ -153,9 +163,15 @@ impl HubAuth {
             .map_err(|_| BAD_IDENTITY)?;
         let name =
             |k| -> Result<String, Refused> { Ok(percent_decode(h.one(k)?.ok_or(BAD_IDENTITY)?)) };
+        let class = match h.one(MEMBER_CLASS)? {
+            None => None,
+            Some(c @ ("administrator" | "standard" | "guest")) => Some(c.to_string()),
+            Some(_) => return Err(BAD_IDENTITY),
+        };
         Ok(Some(Caller {
             member,
             member_name: name(MEMBER_NAME)?,
+            class,
             device,
             device_name: name(DEVICE_NAME)?,
             guest_scope: h.one(GUEST_SCOPE)?.map(str::to_string),
@@ -318,6 +334,7 @@ mod tests {
             ("Host", "192.168.1.20:16443"),
             ("Keep-Hub-Auth", SECRET),
             ("Keep-Member", "7"),
+            ("Keep-Member-Class", "standard"),
             ("Keep-Member-Name", "Zo%C3%AB"),
             ("Keep-Device", "3"),
             ("Keep-Device-Name", "Zo%C3%AB%27s%20phone"),
@@ -329,13 +346,14 @@ mod tests {
             Caller {
                 member: 7,
                 member_name: "Zoë".into(),
+                class: Some("standard".into()),
                 device: 3,
                 device_name: "Zoë's phone".into(),
                 guest_scope: None,
                 request_id: Some("req-42".into()),
             }
         );
-        assert!(!c.is_guest());
+        assert!(!c.is_guest() && !c.is_administrator());
         let guest = a
             .caller(
                 headers
@@ -371,6 +389,12 @@ mod tests {
                 ("Keep-Member", "1"),
                 ("Keep-Member", "2"),
                 ("Keep-Device", "1"),
+            ],
+            // a class the hub never sends
+            vec![
+                ("Keep-Member", "1"),
+                ("Keep-Device", "1"),
+                ("Keep-Member-Class", "owner"),
             ],
         ] {
             let all: Vec<(&str, &str)> = base.iter().copied().chain(bad.clone()).collect();

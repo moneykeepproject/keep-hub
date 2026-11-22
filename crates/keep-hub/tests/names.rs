@@ -645,10 +645,12 @@ fn the_hubs_https_client_reads_answers_and_refuses_a_server_it_doesnt_trust() {
             Some(br#"{"code":"AAAA-AAAA","pin":"000000","device":"x"}"#),
         )
         .unwrap();
+    // (a code that was never made; stage 8: a household always has a PIN, so this
+    // used to be `pin_not_set`)
     assert_eq!(
         r.status,
-        409,
-        "no PIN set yet: {}",
+        403,
+        "a wrong code: {}",
         String::from_utf8_lossy(&r.body)
     );
     // another hub's authority: refused before any request is sent

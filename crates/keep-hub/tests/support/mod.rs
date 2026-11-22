@@ -25,6 +25,9 @@ use serde_json::{json, Value};
 use world::{World, ACME_DIR, CODE, SERVICE};
 
 pub const PIN: &str = "246810";
+/// The first administrator every test hub is set up with (not a real password).
+pub const ADMIN_NAME: &str = "Avery";
+pub const ADMIN_PASSWORD: &str = "test-password-1";
 
 /// A port for an app's public side: from a range the system doesn't hand out by itself, and
 /// never the same one twice in a test run.
@@ -347,6 +350,9 @@ pub const PLAIN_CSP: &str = "default-src 'self'; script-src 'self'; object-src '
 /// - `/plain/index.html`, `/plain/app.js`: a plain client, with a security policy;
 /// - `/stall`: announces 1000 bytes, sends 10, then nothing;
 /// - `/trickle?n=<bytes>&ms=<pause>`: one byte, a pause, the next;
+/// - `/slow?ms=<wait>`: nothing for `ms`, then a short answer carrying its own
+///   `X-Content-Type-Options`, `Referrer-Policy` and `Strict-Transport-Security` (which
+///   the hub replaces);
 /// - anything else: one line naming the app and the path.
 pub struct TestApp {
     pub id: String,
@@ -568,6 +574,24 @@ fn answer(
                 }
                 Ok(())
             }
+            "/slow" => {
+                let ms = query_number(&target, "ms").unwrap_or(100);
+                let until = std::time::Instant::now() + Duration::from_millis(ms);
+                while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                small(
+                    &mut tcp,
+                    "200 OK",
+                    "text/plain",
+                    b"worked it out",
+                    &[
+                        ("X-Content-Type-Options", "sniff".to_string()),
+                        ("Referrer-Policy", "unsafe-url".to_string()),
+                        ("Strict-Transport-Security", "max-age=31536000".to_string()),
+                    ],
+                )
+            }
             _ => small(
                 &mut tcp,
                 "200 OK",
@@ -680,35 +704,46 @@ pub struct Fixture {
     pub machine: Arc<machine::FakeMachine>,
     /// How often the hub looks for a new address (short in tests).
     pub address_poll: Duration,
+    /// How long a backend may take to start its answer.
+    pub first_byte: Duration,
+    /// The test administrator's session, once the hub is set up.
+    session: Mutex<Option<String>>,
     hub: Option<Running>,
 }
 
 impl Fixture {
+    /// A hub set up with the test administrator ([`ADMIN_NAME`]) and the household PIN
+    /// ([`PIN`]), signed in.
     pub fn new() -> Fixture {
         Self::with(|_| {})
     }
 
+    /// A hub as installed: no first set-up yet.
+    pub fn not_set_up() -> Fixture {
+        Self::build(|_| {}, keep_hub::relay::IDLE, false)
+    }
+
     /// A hub whose settings the test changes first.
     pub fn with(settings: impl FnOnce(&mut HubConfig)) -> Fixture {
-        Self::build(settings, keep_hub::relay::IDLE)
+        Self::build(settings, keep_hub::relay::IDLE, true)
     }
 
     /// A hub that closes a transfer after `idle` with no bytes moving (instead of 30
     /// seconds), so a test of the rule doesn't wait minutes.
     pub fn with_idle(idle: Duration) -> Fixture {
-        Self::build(|_| {}, idle)
+        Self::build(|_| {}, idle, true)
     }
 
     /// A hub whose outside world is a fake (`world::World`), sharing the hub's clock.
     pub fn with_world(settings: impl FnOnce(&mut HubConfig)) -> (Fixture, Arc<world::World>) {
-        let mut f = Self::build(settings, keep_hub::relay::IDLE);
+        let mut f = Self::build(settings, keep_hub::relay::IDLE, true);
         let w = world::World::new(f.clock.clone());
         f.outside = w.outside();
         f.restart();
         (f, w)
     }
 
-    fn build(settings: impl FnOnce(&mut HubConfig), idle: Duration) -> Fixture {
+    fn build(settings: impl FnOnce(&mut HubConfig), idle: Duration, set_up: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let keys = KeyStore::memory();
         // (the real time: the phone in these tests checks the certificate's dates by its own clock)
@@ -736,9 +771,21 @@ impl Fixture {
             outside: keep_hub::names::Outside::unavailable("the tests have no network"),
             machine: Arc::new(machine::FakeMachine::at(Ipv4Addr::LOCALHOST)),
             address_poll: Duration::from_millis(100),
+            first_byte: keep_hub::relay::FIRST_BYTE,
+            session: Mutex::new(None),
             hub: None,
         };
         f.start();
+        if set_up {
+            let v = f.admin_with(
+                None,
+                "POST",
+                "/admin/v1/setup",
+                Some(json!({ "name": ADMIN_NAME, "password": ADMIN_PASSWORD, "pin": PIN })),
+            );
+            assert_eq!(v.status, 200, "first set-up: {}", v.text());
+            *f.session.lock().unwrap() = Some(v.json()["session"].as_str().unwrap().to_string());
+        }
         f
     }
 
@@ -754,9 +801,19 @@ impl Fixture {
             outside: Some(self.outside.clone()),
             machine: Some(self.machine.clone()),
             address_poll: self.address_poll,
+            first_byte: self.first_byte,
         })
         .unwrap();
         self.hub = Some(hub);
+    }
+
+    /// The same hub, letting a backend take `first_byte` to start its answer (instead of
+    /// 120 seconds), so a test of the rule doesn't wait minutes.
+    pub fn with_first_byte(first_byte: Duration) -> Fixture {
+        let mut f = Self::new();
+        f.first_byte = first_byte;
+        f.restart();
+        f
     }
 
     /// Stop the hub and start it again on the same folder and keys.
@@ -779,16 +836,53 @@ impl Fixture {
 
     // ----- as an app's desktop program, on the admin address ------------------------------------
 
+    /// A request with the admin token and the test administrator's session. A session the
+    /// hub no longer knows (a restart, the clock moved on) is replaced by signing in again.
     pub fn admin(&self, method: &str, path: &str, body: Option<Value>) -> Reply {
+        let session = self.session.lock().unwrap().clone();
+        let r = self.admin_with(session.as_deref(), method, path, body.clone());
+        if r.status == 401 && r.error() == "administrator_needed" && session.is_some() {
+            let s = self.sign_in(ADMIN_NAME, ADMIN_PASSWORD);
+            assert_eq!(s.status, 200, "signing in again: {}", s.text());
+            let s = s.json()["session"].as_str().unwrap().to_string();
+            *self.session.lock().unwrap() = Some(s.clone());
+            return self.admin_with(Some(&s), method, path, body);
+        }
+        r
+    }
+
+    /// A request with the admin token, and `session` in `Keep-Admin-Session` when given.
+    pub fn admin_with(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Reply {
         let bytes = body.map(|b| serde_json::to_vec(&b).unwrap());
         let auth = format!("Bearer {}", self.admin_token);
-        http(
-            self.hub().admin,
-            method,
-            path,
-            &[("Authorization", &auth)],
-            bytes.as_deref(),
+        let mut headers = vec![("Authorization", auth.as_str())];
+        if let Some(s) = session {
+            headers.push(("Keep-Admin-Session", s));
+        }
+        http(self.hub().admin, method, path, &headers, bytes.as_deref())
+    }
+
+    /// Sign in on the admin address (the answer, whatever it is).
+    pub fn sign_in(&self, name: &str, password: &str) -> Reply {
+        self.admin_with(
+            None,
+            "POST",
+            "/admin/v1/session",
+            Some(json!({ "name": name, "password": password })),
         )
+    }
+
+    /// Sign in, which must work: the session.
+    pub fn session_of(&self, name: &str, password: &str) -> String {
+        let r = self.sign_in(name, password);
+        assert_eq!(r.status, 200, "signing in as {name}: {}", r.text());
+        r.json()["session"].as_str().unwrap().to_string()
     }
 
     /// Like [`Fixture::admin`], for a request that must work: its JSON.
@@ -827,18 +921,36 @@ impl Fixture {
         self.admin_ok("PUT", "/admin/v1/pin", Some(json!({ "pin": PIN })));
     }
 
+    /// Add a standard member.
     pub fn add_member(&self, name: &str) -> u32 {
         self.admin_ok("POST", "/admin/v1/members", Some(json!({ "name": name })))["id"]
             .as_u64()
             .unwrap() as u32
     }
 
-    /// A pairing code for a member and an app (making the grant; `PIN` is sent for it).
+    /// Add an administrator with a password.
+    pub fn add_administrator(&self, name: &str, password: &str) -> u32 {
+        let id = self.admin_ok(
+            "POST",
+            "/admin/v1/members",
+            Some(json!({ "name": name, "class": "administrator" })),
+        )["id"]
+            .as_u64()
+            .unwrap() as u32;
+        self.admin_ok(
+            "PUT",
+            &format!("/admin/v1/members/{id}/password"),
+            Some(json!({ "password": password })),
+        );
+        id
+    }
+
+    /// A pairing code for a member and an app (making the grant if needed).
     pub fn code(&self, member: u32, app: &str) -> String {
         self.admin_ok(
             "POST",
             "/admin/v1/pairing-codes",
-            Some(json!({ "member": member, "app": app, "pin": PIN })),
+            Some(json!({ "member": member, "app": app })),
         )["code"]
             .as_str()
             .unwrap()

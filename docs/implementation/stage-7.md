@@ -137,7 +137,7 @@ pieces. It is the last stage.
 | 21 | `registry.rs`: `a_later_hub_opens_this_registry_and_a_newer_registry_is_refused` (since stage 1) |
 | 22 | `tests/browser.rs`: `at22_end_to_end_in_a_headless_browser` (ignored: needs the staging name service, a home network and Playwright), with `tests/e2e/browser.py` and the clients in `tests/e2e/client/` |
 | 23 | `tests/library.rs`: `at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start` (a fake launcher) |
-| 24 | `tests/hub.rs` and `tests/fallback.rs` (since stages 1 and 4), and `windows-install.ps1 -Scenario install`: a running service that listens on 16080 and 16081 only |
+| 24 | `tests/hub.rs` and `tests/fallback.rs` (since stages 1 and 4), and `windows-install.ps1 -Scenario install`: a running service that other computers reach on 16080 only, with the admin address on 127.0.0.1 |
 | 25 | `windows-install.ps1 -Scenario remove-refused`, `remove`, `reinstall`; `tests/service.rs` (registered-apps names both while the hub runs) |
 | 26 | `windows-install.ps1 -Scenario older` |
 

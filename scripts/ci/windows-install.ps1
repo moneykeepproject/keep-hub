@@ -4,8 +4,9 @@
   from ShareKeep's scripts/ci/windows-install.ps1.
 
   -Scenario install         Setup /S with no app registered (acceptance test 24): the service
-                            runs as its own account and listens on the admin address and the
-                            certificate page only; the data folder belongs to the
+                            runs as its own account; other computers reach only the
+                            certificate page (16080), and the admin address (16081) is on
+                            127.0.0.1; the data folder belongs to the
                             administrators, the computer's users may read admin.token and
                             nothing in keys\; the firewall rule "Keep Hub" is for the hub
                             program; Installed apps lists it with its version order and silent
@@ -129,8 +130,14 @@ function Assert-FirewallRule([bool]$present) {
 
 function Get-Token { (Get-Content -Raw -Path (Join-Path $Data 'admin.token')).Trim() }
 
-function Invoke-Admin([string]$Method, [string]$Path, $Body = $null) {
+# The household's first administrator in these runs (test values, not secrets).
+$AdminName = 'Test Administrator'
+$AdminPassword = 'ci-test-password-1'
+$Pin = '246810'
+
+function Invoke-Admin([string]$Method, [string]$Path, $Body = $null, [string]$Session = '') {
     $headers = @{ Authorization = "Bearer $(Get-Token)" }
+    if ($Session) { $headers['Keep-Admin-Session'] = $Session }
     $uri = "http://127.0.0.1:16081/admin/v1/$Path"
     if ($null -ne $Body) {
         return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Compress)
@@ -138,10 +145,39 @@ function Invoke-Admin([string]$Method, [string]$Path, $Body = $null) {
     return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
 }
 
+# An administrator's session: the first set-up the first time, signing in afterwards.
+function Get-Session {
+    try {
+        $r = Invoke-Admin 'POST' 'setup' @{ name = $AdminName; password = $AdminPassword; pin = $Pin }
+        Note "  first set-up: $AdminName is the first administrator"
+        return $r.session
+    }
+    catch {
+        if (-not $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 409) { throw }
+    }
+    return (Invoke-Admin 'POST' 'session' @{ name = $AdminName; password = $AdminPassword }).session
+}
+
 function Get-Listening {
     $hubPid = (Get-Hub).ProcessId
     @(Get-NetTCPConnection -State Listen -OwningProcess $hubPid -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty LocalPort | Sort-Object -Unique)
+}
+
+# The ports other computers can reach: the hub's listeners on any address but loopback. (The
+# certificate page's front on 16080 passes each request to a small server on 127.0.0.1 at a
+# port of its own, as ShareKeep's: that one only this computer reaches.)
+function Get-Reachable {
+    $hubPid = (Get-Hub).ProcessId
+    @(Get-NetTCPConnection -State Listen -OwningProcess $hubPid -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -ne '127.0.0.1' -and $_.LocalAddress -ne '::1' } |
+        Select-Object -ExpandProperty LocalPort | Sort-Object -Unique)
+}
+
+function Get-LoopbackOnly([int]$port) {
+    $hubPid = (Get-Hub).ProcessId
+    $on = @(Get-NetTCPConnection -State Listen -OwningProcess $hubPid -LocalPort $port -ErrorAction SilentlyContinue)
+    return ($on.Count -gt 0) -and -not ($on | Where-Object { $_.LocalAddress -ne '127.0.0.1' })
 }
 
 function Save-Logs {
@@ -160,9 +196,11 @@ try {
             if (-not (Test-Path (Join-Path $Data 'hub.json'))) { Fail "the hub's data folder has no hub.json" }
             # acceptance test 24: the admin address and the certificate page only
             Start-Sleep -Seconds 2
-            $ports = Get-Listening
-            Note "  listening on $($ports -join ', ')"
-            if (($ports -join ',') -ne '16080,16081') { Fail "the hub listens on $($ports -join ', '), not 16080 and 16081 only" }
+            Note "  listening on $((Get-Listening) -join ', ')"
+            $reachable = Get-Reachable
+            Note "  reachable from the network: $($reachable -join ', ')"
+            if (($reachable -join ',') -ne '16080') { Fail "other computers reach the hub on $($reachable -join ', '), not the certificate page (16080) only" }
+            if (-not (Get-LoopbackOnly 16081)) { Fail "the admin address isn't on 127.0.0.1 only" }
             # the data folder: the administrators' own; the users read the admin token only
             $owner = (Get-Acl -Path $Data).Owner
             if ($owner -ne 'BUILTIN\Administrators') { Fail "the data folder belongs to $owner" }
@@ -204,11 +242,24 @@ try {
             Note "  version $OlderVersion refused; Keep Hub $($k.DisplayVersion) still installed and running"
         }
         'apps' {
+            # acceptance test 34: a new app needs an administrator's session
+            $body = @{ id = 'vacapick'; title = 'VacaPick'; version = '1.0.0'; protocol = 1; public_port = 16443; loopback_port = 26443; money = $false; guests = $false }
+            $refused = $false
+            try { $null = Invoke-Admin 'POST' 'apps' $body }
+            catch {
+                $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+                # 409: setup_needed before the first set-up; 401: administrator_needed after
+                if ($code -ne 401 -and $code -ne 409) { throw }
+                $refused = $true
+            }
+            if (-not $refused) { Fail "a new app was registered without an administrator's session" }
+            Note "  a new app without a session: refused"
+            $session = Get-Session
             foreach ($a in @(
                     @{ id = 'vacapick'; title = 'VacaPick'; public_port = 16443; loopback_port = 26443 },
                     @{ id = 'carpick'; title = 'CarPick'; public_port = 16444; loopback_port = 26444 })) {
                 $body = @{ id = $a.id; title = $a.title; version = '1.0.0'; protocol = 1; public_port = $a.public_port; loopback_port = $a.loopback_port; money = $false; guests = $false }
-                $r = Invoke-Admin 'POST' 'apps' $body
+                $r = Invoke-Admin 'POST' 'apps' $body -Session $session
                 if (-not $r.secret) { Fail "registering $($a.id) gave no secret" }
                 Note "  $($a.title) registered"
             }
@@ -218,6 +269,16 @@ try {
             foreach ($p in @(16443, 16444)) { if ($ports -notcontains $p) { Fail "port $p isn't open" } }
             $apps = (Invoke-Admin 'GET' 'apps').apps
             if (@($apps).Count -ne 2) { Fail "the hub has $(@($apps).Count) apps" }
+            # acceptance test 32, on the installed hub while the service runs: an
+            # administrator of this computer sets a new password from the command line
+            'ci-reset-password-2' | & $Hub reset-administrator --name $AdminName --data $Data | Out-Null
+            if ($LASTEXITCODE -ne 0) { Fail "keep-hub reset-administrator failed" }
+            $null = Invoke-Admin 'POST' 'session' @{ name = $AdminName; password = 'ci-reset-password-2' }
+            $AdminPassword | & $Hub reset-administrator --name $AdminName --data $Data | Out-Null
+            if ($LASTEXITCODE -ne 0) { Fail "keep-hub reset-administrator failed the second time" }
+            $null = Get-Session
+            if (@((Invoke-Admin 'GET' 'apps').apps).Count -ne 2) { Fail "resetting the password changed the apps" }
+            Note "  reset-administrator: a new password, the apps unchanged"
         }
         'remove-refused' {
             # acceptance test 25: the uninstaller names the apps and asks again; silently, it

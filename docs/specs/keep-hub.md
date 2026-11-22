@@ -3,7 +3,7 @@
 - **Area / module:** shared hub; new program `keep-hub` used by every Keep and Pick app
 - **Spec writer:** Claude session 2026-11-18 (spec-writer role; no target or prior-art source read)
 - **Date:** 2026-11-18
-- **Status:** draft
+- **Status:** draft; revision 4 (2026-11-22)
 
 ## Sources
 
@@ -21,6 +21,10 @@
 | 10 | Owner decision | 2026-11-18: the hub is its own release package, installed and updated by keep-launcher; an app offers it and hands over to the launcher; one shared hub per computer; one name and certificate per computer; a port per app; one household PIN; access granted per app; a new shared hub with VacaPick as its first app; MoneyKeep and ShareKeep move later; WASM and plain web clients both supported; wrong pairing tries pause the address they came from, and everyone only after a hundred; removing a grant does not revoke devices; a phone's request id is passed on in `Keep-Request-Id`; the request and answer details the implementer chose in stage 1 are adopted as written here; every member is an administrator or a standard member; every phone, a second one included, needs an administrator's approval; administrators approve at the hub computer only, not from a phone; HSTS is sent for one day; the hub has its own ACME client; the hub's outgoing requests trust what the operating system trusts; the public resolver is Cloudflare's, then Google's; the implementer's readings in stages 2 to 4 are adopted as written here | |
 | 11 | Spec | keep-launcher `README.md`, `docs/known-limits.md` | The launcher installs each app from its official release package, checked against the release's SHA-256 checksums; on a Mac it cannot install or update yet (no Developer ID) |
 | 12 | Standard | RFC 6797 (HTTP Strict Transport Security) | `max-age` in seconds; `includeSubDomains` is optional |
+| 13 | Owner decision | 2026-11-19, for MoneyKeep EZ (`docs/specs/moneykeep-ez.md` in the `moneykeep-ez` repository): an app may pair by code alone, with no PIN; a household may choose that the computer's sign-in is enough, with no administrator password and no PIN; MoneyKeep EZ has port 14444; turning hub names on still takes a registration code | Revision 2 |
+| 14 | Owner decision | 2026-11-19: during the alpha, registration codes are given out by hand from one page on getmoneykeep.org, and every app's Phones screen links to it; a code is asked for only when a person sets up phone access | Revision 3 |
+| 15 | Owner decision | 2026-11-22: a new program, ServicesKeep (`docs/specs/serviceskeep.md` and `cloudflare-tunnel.md` in the `serviceskeep` repository), manages the Cloudflare tunnel, the home network fixes and later backups for the hub computer; the hub keeps only what it must own as the origin: a probe path, the tunnel hostname, Fix as an admin request, and a Linux service; Ubuntu and Windows first, macOS maybe later | Revision 4 |
+| 16 | Vendor doc | systemd: `systemd.service`, `systemd.exec` (`DynamicUser`, `StateDirectory`), `systemd-sysusers`; Debian Policy Manual chapter 7 | The Linux service and its package |
 
 No target product was observed.
 
@@ -60,6 +64,7 @@ not hold any app's books or rules.
 |---|---|
 | MoneyKeep | 14443 (today's) |
 | ShareKeep | 15443 (today's) |
+| MoneyKeep EZ | 14444 (revision 2) |
 | VacaPick | 16443 |
 | Later Pick apps | 16444 upward, one each |
 | Certificate page (fallback) | 16080, plain HTTP |
@@ -725,8 +730,9 @@ built, the address is given at `keep-hub setup`, as in ShareKeep.
 - When MoneyKeep and ShareKeep move onto the shared hub, and how their paired phones are
   carried over. Their ports stay the same, so a phone paired by address could keep its
   storage if the certificate authority is carried over too.
-- Reaching the hub from outside the home through Cloudflare is a separate spec. The
-  request path, grants and headers here are meant to serve it unchanged.
+- Reaching the hub from outside the home through Cloudflare is `cloudflare-tunnel.md`
+  in the `serviceskeep` repository (revision 4 gives the hub's part). The request path,
+  grants and headers here serve it unchanged.
 - IPv6 home addresses.
 - How phones with private DNS or relay features behave with a name that points to a home
   address. This needs testing on real iPhones and Android phones.
@@ -736,3 +742,308 @@ built, the address is given at `keep-hub setup`, as in ShareKeep.
 - [x] No code, pseudo-code from source, or internal identifiers from any target or prior-art project
 - [x] No copied UI wording, layouts or screenshots
 - [x] Every claim traceable to a source above
+
+## Revision 2 (2026-11-19) — pairing by code alone; a household where the computer's sign-in is enough (owner decision)
+
+MoneyKeep EZ pairs a phone with one QR code and nothing typed, and its owner rule is that
+the computer's sign-in and the phone's lock are the security (source 13). This revision
+adds the two things that needs. Everything not named here is unchanged, and a household
+that set an administrator password and a PIN behaves exactly as before.
+
+### A. An app chooses how its phones pair
+
+- Registering an app takes one more field, `pairing`: `code_and_pin` or `code`. Left
+  out, it is `code_and_pin`, so today's apps are unchanged. The protocol number stays 1.
+- The hub's answer to a registration, and each app in the status and the apps list, now
+  includes `pairing`. An app that asked for `code` and gets an answer without `pairing`
+  is talking to an older hub: it must not offer pairing and says the hub needs updating.
+- For an app registered with `code`:
+  - `POST /hub/pair` on its port takes `{"code", "device"}`. A `pin` in the body is
+    ignored and never checked.
+  - `pin_not_set` is never answered on its port.
+  - A wrong code is a wrong try, counted and paused exactly as today (ten from one
+    address, a hundred from all).
+  - The code is still made at the hub computer, for one member and this app, one use, 10
+    minutes, and the QR code still carries `https://<name>:<app port>/#pair=<code>`.
+- For an app registered with `code_and_pin`, nothing changes: the PIN is asked and five
+  wrong PINs burn the code.
+- `money` and `pairing` are independent: an app that declared `money` may pair by code
+  alone. Guest invites are unchanged.
+- **Changing `pairing`** when an app registers again needs what a first registration
+  needs (an administrator, as part B defines one). An update that keeps the same value
+  needs only the admin token, as today.
+
+### B. A household where the computer's sign-in is enough
+
+- **First set-up has two forms.** While no administrator exists it takes either:
+  - a name, an administrator password and the household PIN (today's form), or
+  - a name and `sign_in_is_enough: true`, with no password and no PIN.
+- After the second form the household is **open**: the first member is an administrator
+  with no password, and there is no household PIN. `hub.sqlite` records it, and the
+  status answers `"household": "open"` (otherwise `"secured"`).
+- **In an open household the admin token alone is an administrator.** Every request
+  marked A is accepted without `Keep-Admin-Session`. Signing in is not used and answers
+  409 `sign_in_not_used`. Members added are administrators or standard members as chosen,
+  none with a password; the class still travels in `Keep-Member-Class`.
+- What this means, said plainly in the app that offers it: anyone who can use this
+  computer under a sign-in that can read the hub's admin token can add phones, members
+  and apps.
+- **Securing the household.** One request, `secure`, takes an administrator's name, a
+  password for that administrator and a household PIN. From then on the household is
+  secured and every rule of "Administrators and standard members" applies. Other
+  administrators have no password until one who has signed in sets it; until then they
+  cannot sign in. Paired phones are not affected.
+- **An app that pairs with `code_and_pin` needs a secured household.** Registering one
+  for the first time in an open household is refused with 409 `household_not_secured`
+  and the plain message to set a password and PIN first. The app then offers `secure`
+  and registers again.
+- **Securing is one way.** A secured household cannot be made open again. Starting over
+  means removing the hub's data folder.
+- **`keep-hub reset-administrator`** in an open household has nothing to reset and says
+  so.
+- In a secured household an app registered with `code` still pairs without a PIN, and
+  making its pairing codes needs an administrator's session like any other.
+
+The admin address table gains:
+
+| Requests | Needs |
+|---|---|
+| First set-up in either form, only while no administrator exists | Admin token |
+| Secure the household (open households only) | Admin token |
+| Every request marked A, in an open household | Admin token |
+
+### C. Ports and names
+
+- MoneyKeep EZ's port is 14444 (added to the port table).
+- Turning hub names on takes a registration code the first time, in an open household
+  too. Nothing about names changes.
+
+### Edge cases
+
+- **An open household adds an app that needs a PIN** (VacaPick after MoneyKeep EZ): the
+  registration is refused until the household is secured; MoneyKeep EZ's phones keep
+  working throughout and still pair by code alone afterwards.
+- **A secured household adds MoneyKeep EZ:** its first registration needs an
+  administrator's session; its phones pair by code alone.
+- **A phone sends a PIN to a `code` app's port:** ignored; the code decides.
+- **A second program on the computer calls `secure` first:** it holds the admin token, so
+  it can. This is the open household's stated trust in the computer's sign-in.
+
+### Acceptance tests
+
+45. An app registered with `pairing: "code"` pairs with `{"code", "device"}` and no PIN,
+    in a household with no PIN set; the answer has a token that works for that app only.
+    The same body on a `code_and_pin` app's port is refused.
+46. A wrong code on a `code` app's port counts as a wrong try: ten from one address pause
+    that address; a used code and one older than 10 minutes are refused.
+47. Registering without `pairing` gives `code_and_pin`; the registration answer, the
+    status and the apps list each show the app's `pairing`.
+48. Registering an app again with a different `pairing` needs an administrator; with the
+    same value the admin token is enough.
+49. First set-up with `sign_in_is_enough` makes an open household: status says `open`;
+    making a member, a grant and a pairing code each succeed with the admin token alone;
+    signing in answers `sign_in_not_used`.
+50. In an open household, the first registration of a `code_and_pin` app is refused with
+    `household_not_secured`; after `secure` it succeeds with a session, and a request
+    marked A with the admin token alone now answers `administrator_needed`.
+51. `secure` in a secured household is refused; nothing makes a secured household open.
+52. Phones paired before `secure` work after it. A `code` app in a secured household
+    still pairs without a PIN, and making its code needs a session.
+53. First set-up with a password and PIN (today's form) behaves as tests 27 to 32 say;
+    those tests are unchanged.
+
+## Revision 3 (2026-11-19) — where a household gets its registration code (owner decision)
+
+Turning hub names on takes a registration code the first time. During the alpha the
+owner gives these out by hand: a person asks on one page of the project's website and is
+sent a code by email (source 14). The hub tells every app where that page is, so all
+apps show the same link.
+
+- **A code is asked for only when a person sets up phone access.** No app asks for one
+  at install, at first start or for any use on the computer itself.
+- A new setting, `names.code_page`, holds the page's address. Default:
+  `https://getmoneykeep.org/phone-access/`. It must be an `https://` address of at most
+  200 characters; anything else is refused when the setting is changed.
+- The names part of the status on the admin address includes `code_page` and
+  `code_needed`: yes while the hub has never registered with its name service, no
+  afterwards (and no after names are turned off and on again, since the registration is
+  kept).
+- **Every app's Phones screen,** where it asks for the registration code, shows one text
+  field (typed or pasted) and a **Get a code** button that opens `code_page` in the
+  person's browser, with one line saying a code is sent by email and that everything
+  else in the app works meanwhile. The field and button are shown only while
+  `code_needed` is yes.
+- The hub never opens the page itself, sends nothing to it, and does not put the hub's
+  id, name or address in the link.
+- The code is used as today: sent as typed, kept in memory until used, never stored or
+  logged. A refused code shows the name service's plain reason and leaves the field for
+  another try.
+- With `names.staging` on, `code_page` is still shown; a test hub's codes come from the
+  staging name service's own administrator.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `names.code_page` | address | `https://getmoneykeep.org/phone-access/` | Where a person asks for a registration code |
+
+Acceptance tests:
+
+54. The status shows `code_page` with the default address and `code_needed` yes on a hub
+    that never registered; after names are turned on, `code_needed` is no, and it stays
+    no after turning names off and on.
+55. Setting `names.code_page` to an `http://` address, or one longer than 200
+    characters, is refused and the old value stays.
+
+Sending codes automatically after confirming an email address is a later change to the
+name service, not part of this revision.
+
+
+## Revision 4 (2026-11-22) — what the hub gives ServicesKeep; the Linux service (owner decision)
+
+A new program, ServicesKeep (source 15), runs on the hub computer and manages the services
+around the hub: the Cloudflare tunnel that makes the hub reachable away from home, the
+home network's settings, and later backups. The hub does not create the tunnel, install
+the connector or change the firewall profile; ServicesKeep does. This revision adds the
+four things the hub must own for that to work, and the Linux service the Ubuntu-first
+decision needs. Nothing here changes the request path, grants or headers: they already
+serve a request that arrives through a tunnel unchanged.
+
+### A. The probe
+
+A phone, or ServicesKeep acting as one, needs a way to prove that a request from outside
+the hub reaches it. The hub answers one path for that and does nothing else with it.
+
+- **`GET /_probe/<nonce>`** on every app port and on the certificate page's port 16080.
+  The nonce is 16 to 64 letters and digits; anything else is 404 with no record made.
+- The handler answers **204** with no body, records the nonce with the time and the
+  source (below), and does nothing else: it reads no header but the request line, needs
+  no device token, is not forwarded to any backend, and never touches the name service
+  or the connector.
+- Only a nonce the hub itself issued is recorded; an unknown nonce still answers 204 (so
+  the path tells an outsider nothing) and is counted, not kept.
+- **Rate limit:** one request a second from one address; above that, 429 with no record.
+  A thousand unknown nonces in an hour is logged once as a line without the nonces.
+- **Source.** The hub records how the request came: `home` when the source address is a
+  private address on this network and the request did not carry Cloudflare's connecting
+  address header; `tunnel` when it did; `this_computer` when the source is a loopback or
+  this computer's own address. Cloudflare's header is trusted only when the request
+  arrived on the loopback listener the tunnel's ingress points at (the tunnel's requests
+  come from the connector on 127.0.0.1), never on the Wi-Fi address.
+- **Admin address:** `POST /admin/v1/probe` (A) answers a fresh nonce, the address a phone
+  should open (`https://<name>:<first app port>/_probe/<nonce>` when names are on,
+  otherwise the address form on port 16080), and the nonce's life, 10 minutes.
+  `GET /admin/v1/probe/<nonce>` (admin token) answers `seen: no`, or `seen: yes` with
+  `when` and `source`. A nonce is kept for its life only.
+- The probe path is the one path that may be left outside Access on a tunnel, because it
+  gives nothing away. It is listed in `/hub/check`'s answer so an app can show it.
+
+### B. The tunnel hostname
+
+- A new setting, `tunnel.hostname`: empty, or a host name of at most 253 characters with
+  labels of letters, digits and hyphens. Set and cleared through the admin address (A):
+  `PUT /admin/v1/tunnel {hostname}` and `DELETE /admin/v1/tunnel`.
+- The hub does nothing with it but **show it**: in the status on the admin address, so
+  every app's Phones screen can say "away from home, open `https://<hostname>`", and in
+  `/hub/check`. It does not make the name resolve, does not put it in a certificate (the
+  tunnel's edge certificate is Cloudflare's), and does not change which listeners it has.
+- `PUT /admin/v1/tunnel/moneykeep-name` (A) is Path B of `cloudflare-tunnel.md`: the hub
+  asks the name service for a tunnel (`name-service.md` revision 1, `POST /hubs/<id>/tunnel`
+  with the hub's first registered app port), with its hub token, and answers the tunnel
+  token in the response body, keeping no copy and logging nothing of it; a repeat answers
+  the token again, which is how ServicesKeep repairs. It then sets `tunnel.hostname` to the
+  **away name** the service answered (`<id>.away.getmoneykeep.org`; the hub's home name
+  stays an A record and cannot also be the tunnel's CNAME). `DELETE
+  /admin/v1/tunnel/moneykeep-name` (A) asks the name service to delete the tunnel and
+  clears the hostname. Both answer the name service's plain reason on refusal. These
+  routes exist only when `names.enabled` is yes and the hub has set an address.
+
+### C. Fix as an admin request
+
+Finding the problem's **Fix** (check 4: the firewall rule) is today run by an app's
+desktop program as `keep-hub fix-firewall` with the computer's administrator rights.
+This revision adds the same thing as a request, so a program need not know where the
+hub's executable is:
+
+- `POST /admin/v1/problems/fix` (A) with `{check: 4}`. The hub cannot elevate itself, so
+  the service does the work: on Windows the service already runs as `NT SERVICE\KeepHub`,
+  which may edit its own firewall rule; on Linux the service unit is granted the one
+  capability it needs for that (below). The answer is the check's new result.
+- `keep-hub fix-firewall` stays for the apps that call it today.
+- A Fix for any other check answers 400 `no_fix` with the check's one action in words.
+
+### D. The Linux service
+
+Source 10's "a Windows service ... a macOS launch daemon" gains a third form. The hub
+already builds and tests on Linux; this adds how it runs and installs there.
+
+- **A systemd system service, `keep-hub.service`**, running as a dedicated system user
+  `keep-hub` made by `systemd-sysusers`, never root, started at boot, restarted on
+  failure. `StateDirectory=keep-hub` gives it `/var/lib/keep-hub` as the data folder,
+  owned by that user; `hub.json`, `hub.sqlite`, `keys/` and `hub.log` as on Windows.
+  `admin.token` is readable by the computer's users as on Windows (group `keep-hub`,
+  mode 0640, with users added to the group at install, or world-readable: open point).
+- **Sealing keys:** the operating system's user-keyring or, where none, a file readable
+  by the service user only; the spec's "keys sealed by the operating system" is met as
+  well as Linux allows and the implementer says which.
+- **Firewall:** the hub's check 4 looks for an allow rule for every registered port in
+  whichever firewall is active (`ufw`, firewalld, or a plain nftables ruleset) and for
+  nothing blocking it; where no firewall is active, check 4 passes with the words "no
+  firewall is on". Fix adds the rules in the active firewall, and for that the unit has
+  `AmbientCapabilities=CAP_NET_ADMIN` and nothing else beyond a service's defaults.
+  Rules are commented "Keep Hub" so the check finds them.
+- **Network type (check 3)** does not apply on Linux; the check passes with the words
+  "not needed on this system".
+- **The package:** a `.deb` with the program, the unit, the sysusers file, the
+  `install-service` and `remove-service` commands kept for the launcher, and a `postinst`
+  that enables and starts the service. Until keep-launcher runs on Ubuntu, the `.deb` is
+  installed from the release page; the launcher adopts the same package later. Removing
+  with `dpkg -r` keeps `/var/lib/keep-hub`; `dpkg -P` asks nothing and deletes it, as
+  Debian's rules say, so the hub's Remove in ServicesKeep or the launcher does the asking.
+- **The launcher's part**, as for Windows: a catalog entry whose Linux package is the
+  `.deb`.
+
+This is stage 10 of the build order in `AGENTS.md`.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `tunnel.hostname` | text | empty | The public hostname ServicesKeep set up; shown to apps and phones, nothing more |
+| `probe.minutes` | number | 10 | Life of a probe nonce |
+
+Acceptance tests:
+
+56. `GET /_probe/<nonce>` for a nonce the hub issued answers 204 with no body and no
+    backend receives anything; `GET /admin/v1/probe/<nonce>` then shows `seen: yes` with
+    a source of `home` for a private source address without Cloudflare's header, `tunnel`
+    for a loopback source with it, and `this_computer` for a loopback source without it.
+    A nonce with a space, shorter than 16 or longer than 64 characters answers 404 and
+    nothing is recorded. An unknown nonce of the right shape answers 204 and
+    `GET /admin/v1/probe/<it>` answers 404.
+57. A second probe request from one address within a second answers 429; a nonce is not
+    found after `probe.minutes`.
+58. Cloudflare's connecting-address header on a request that arrived on the Wi-Fi address
+    is ignored: the source is `home`.
+59. `PUT /admin/v1/tunnel` with a 300-character name, or a label with a space, is refused
+    and the setting stays; a good name appears in the status and in `/hub/check`;
+    `DELETE` removes it. Both answer `administrator_needed` without a session.
+60. `PUT /admin/v1/tunnel/moneykeep-name` with a fake name service sends the first
+    registered app port, answers the fake's token, the hub's data folder and log contain
+    no part of it, and the status shows the fake's away name as the hostname; with
+    `names.enabled` no it answers 404.
+61. `POST /admin/v1/problems/fix {check: 4}` with a fake firewall recreates the rule with
+    every registered port and answers check 4's new result; `{check: 7}` answers 400
+    `no_fix` with the check's action in words.
+62. On the Linux runner (end-to-end): the `.deb` installs and starts the service as user
+    `keep-hub` with `/var/lib/keep-hub` as its data folder; other computers reach 16080
+    and the registered ports; the admin address is on 127.0.0.1 only; `dpkg -r` stops the
+    service and keeps the data folder.
+63. On Linux, check 3 passes with "not needed on this system"; with no firewall active,
+    check 4 passes with "no firewall is on"; with a fake ufw missing a port, check 4 fails
+    and Fix adds exactly that port's rule commented "Keep Hub".
+
+Open points of this revision:
+
+- Whether `admin.token` on Linux is group-readable (users added to `keep-hub` at install)
+  or world-readable; the Windows rule is "the computer's users may read it".
+- Which Linux sealing the implementer can meet, and the words for the status when keys
+  are file-protected only.
+- Whether a Path B hub gets Cloudflare Access in front of its name, or relies on pairing
+  alone (also open in `cloudflare-tunnel.md`).

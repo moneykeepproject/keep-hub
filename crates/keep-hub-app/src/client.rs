@@ -83,6 +83,11 @@ pub enum Found {
     NoAccess(HubError),
     /// Installed and stopped: offer to start it. The client works once it runs.
     Stopped(HubClient),
+    /// Running, and not set up yet: the first administrator and the household PIN come
+    /// first ([`HubClient::set_up`]), or the first administrator of a household where the
+    /// computer's sign-in is enough ([`HubClient::set_up_open`]). Until then the hub accepts
+    /// nothing else.
+    NotSetUp(HubClient),
     /// Running.
     Running(HubClient, HubStatus),
 }
@@ -93,11 +98,17 @@ pub enum Found {
 /// hub's service: any user can make a folder of that name in `%ProgramData%`, and an app that
 /// believed its token would register with whatever answered.
 pub fn find(data: &Path) -> Found {
+    find_with(data, crate::owner::protected)
+}
+
+/// [`find`], with the owner check given: the unit tests' temporary folders are the person's
+/// own, which Windows' check rightly refuses. Not public: an app always gets the real check.
+fn find_with(data: &Path, protected: fn(&Path) -> Result<(), String>) -> Found {
     if !data.join(HUB_FILE).is_file() && !data.join(TOKEN_FILE).is_file() {
         return Found::NotInstalled;
     }
     for p in [data.to_path_buf(), data.join(TOKEN_FILE)] {
-        if let Err(why) = crate::owner::protected(&p) {
+        if let Err(why) = protected(&p) {
             return Found::NoAccess(HubError::here(
                 "not_the_hubs_folder",
                 format!(
@@ -113,14 +124,30 @@ pub fn find(data: &Path) -> Found {
     };
     match hub.status() {
         Ok(s) => Found::Running(hub, s),
+        Err(e) if e.code == "setup_needed" => Found::NotSetUp(hub),
         Err(_) => Found::Stopped(hub),
     }
 }
 
-/// The hub's admin address, with its token.
+/// An administrator signed in on this computer ([`HubClient::sign_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SignedIn {
+    pub member: Member,
+    /// How long the session lasts after its last use.
+    pub session_minutes: u32,
+}
+
+/// The classes of household member.
+pub const ADMINISTRATOR: &str = "administrator";
+pub const STANDARD: &str = "standard";
+
+/// The hub's admin address, with its token, and an administrator's session once one signs
+/// in. The session is kept in memory only, and goes when the client is dropped (as the
+/// spec asks: "The desktop app drops it when it closes").
 pub struct HubClient {
     addr: SocketAddr,
     token: Zeroizing<String>,
+    session: std::sync::Mutex<Option<Zeroizing<String>>>,
     timeout: Duration,
 }
 
@@ -147,6 +174,10 @@ pub struct HubApp {
     pub guests: bool,
     /// When it was first registered (milliseconds since 1970).
     pub registered: i64,
+    /// How its phones pair: `code_and_pin` or `code` (Revision 2 A). `None` from a hub
+    /// older than that, which pairs every phone with the PIN.
+    #[serde(default)]
+    pub pairing: Option<String>,
 }
 
 /// A registered app and how it is doing.
@@ -168,6 +199,17 @@ pub struct HubStatus {
     pub address: Option<String>,
     /// The name's state: `off`, `registering`, `proving`, `ready`, `blocked`, `waiting`.
     pub names: String,
+    /// Where a person asks for a registration code (Revision 3; `None` from an older hub).
+    #[serde(default)]
+    pub code_page: Option<String>,
+    /// Whether turning names on needs a registration code: show the code field and the
+    /// **Get a code** button only then (Revision 3).
+    #[serde(default)]
+    pub code_needed: Option<bool>,
+    /// `open` (the computer's sign-in is enough) or `secured` (Revision 2 B; `None` from an
+    /// older hub, whose households are all secured).
+    #[serde(default)]
+    pub household: Option<String>,
     pub apps: Vec<AppState>,
 }
 
@@ -181,6 +223,12 @@ impl HubStatus {
     pub fn app(&self, id: &str) -> Option<&AppState> {
         self.apps.iter().find(|a| a.app.id == id)
     }
+
+    /// Whether the household is open: the admin token alone acts as an administrator,
+    /// and nobody signs in (Revision 2 B).
+    pub fn household_is_open(&self) -> bool {
+        self.household.as_deref() == Some("open")
+    }
 }
 
 /// A person in the household, or a guest.
@@ -188,6 +236,12 @@ impl HubStatus {
 pub struct Member {
     pub id: u32,
     pub name: String,
+    /// `administrator`, `standard` or `guest`.
+    #[serde(default)]
+    pub class: String,
+    /// An administrator with a password (who can sign in).
+    #[serde(default)]
+    pub password_set: bool,
     /// For a guest: the app and scope of the invite.
     #[serde(default)]
     pub guest_app: Option<String>,
@@ -356,6 +410,7 @@ impl HubClient {
         HubClient {
             addr,
             token: Zeroizing::new(token.to_string()),
+            session: std::sync::Mutex::new(None),
             timeout: Duration::from_secs(60),
         }
     }
@@ -379,10 +434,17 @@ impl HubClient {
             TcpStream::connect_timeout(&self.addr, Duration::from_secs(3)).map_err(down)?;
         stream.set_read_timeout(Some(self.timeout)).map_err(down)?;
         stream.set_write_timeout(Some(self.timeout)).map_err(down)?;
+        let session = match self.session.lock() {
+            Ok(s) => s
+                .as_ref()
+                .map(|s| Zeroizing::new(format!("Keep-Admin-Session: {}\r\n", s.as_str()))),
+            Err(_) => None,
+        };
         let head = format!(
-            "{method} /admin/v1/{path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} /admin/v1/{path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.addr,
             self.token.as_str(),
+            session.as_ref().map_or("", |s| s.as_str()),
             body.len()
         );
         let mut request = Zeroizing::new(head.into_bytes());
@@ -413,6 +475,71 @@ impl HubClient {
         }
     }
 
+    // ----- administrators -----
+
+    /// The first set-up, while the hub has no administrator: the first administrator (a
+    /// name and a password of at least 8 characters) and the household PIN. This client is
+    /// then signed in as them.
+    pub fn set_up(&self, name: &str, password: &str, pin: &str) -> Result<SignedIn, HubError> {
+        let body = json!({ "name": name, "password": password, "pin": pin });
+        let v = self.call("POST", "setup", Some(&body))?;
+        self.keep_session(v)
+    }
+
+    /// The first set-up of an open household (Revision 2 B): the first administrator, by
+    /// name, with no password and no household PIN. The computer's sign-in is then enough:
+    /// anyone who can use this computer under a sign-in that can read the hub's admin token
+    /// can add phones, members and apps. Say so plainly before offering it.
+    pub fn set_up_open(&self, name: &str) -> Result<Member, HubError> {
+        let body = json!({ "name": name, "sign_in_is_enough": true });
+        field(self.call("POST", "setup", Some(&body))?, "member")
+    }
+
+    /// Secure an open household (Revision 2 B), for good: a password for the named
+    /// administrator and the household PIN. This client is then signed in as them.
+    pub fn secure(&self, name: &str, password: &str, pin: &str) -> Result<SignedIn, HubError> {
+        let body = json!({ "name": name, "password": password, "pin": pin });
+        let v = self.call("POST", "secure", Some(&body))?;
+        self.keep_session(v)
+    }
+
+    /// Sign in as an administrator. Requests that need one carry the session from then on.
+    pub fn sign_in(&self, name: &str, password: &str) -> Result<SignedIn, HubError> {
+        let body = json!({ "name": name, "password": password });
+        let v = self.call("POST", "session", Some(&body))?;
+        self.keep_session(v)
+    }
+
+    fn keep_session(&self, mut v: Value) -> Result<SignedIn, HubError> {
+        let session = v
+            .get_mut("session")
+            .and_then(|s| s.as_str().map(|s| Zeroizing::new(s.to_string())))
+            .ok_or_else(|| unreadable(&"no session"))?;
+        if let Some(s) = v.as_object_mut() {
+            s.remove("session");
+        }
+        let signed: SignedIn = parse(v)?;
+        if let Ok(mut s) = self.session.lock() {
+            *s = Some(session);
+        }
+        Ok(signed)
+    }
+
+    /// Sign out: the hub ends the session.
+    pub fn sign_out(&self) -> Result<(), HubError> {
+        let r = self.call("DELETE", "session", None).map(drop);
+        if let Ok(mut s) = self.session.lock() {
+            *s = None;
+        }
+        r
+    }
+
+    /// Whether this client holds a session. (The hub may have ended it since: a request
+    /// then answers `administrator_needed`, and the person signs in again.)
+    pub fn signed_in(&self) -> bool {
+        self.session.lock().map(|s| s.is_some()).unwrap_or(false)
+    }
+
     // ----- the hub and apps -----
 
     /// The hub's version, protocols, address, name state and each app's state.
@@ -426,16 +553,18 @@ impl HubClient {
 
     /// Register (see [`crate::ensure_registered`], which keeps the secret): the shared
     /// secret, which isn't kept anywhere by this call.
+    /// The answer's `pairing` is `None` from a hub older than Revision 2.
     pub(crate) fn register_raw(
         &self,
         r: &crate::Registration,
-    ) -> Result<Zeroizing<String>, HubError> {
+    ) -> Result<(Zeroizing<String>, Option<String>), HubError> {
         let body = serde_json::to_value(r).map_err(|e| unreadable(&e))?;
         let v = self.call("POST", "apps", Some(&body))?;
-        v["secret"]
+        let secret = v["secret"]
             .as_str()
             .map(|s| Zeroizing::new(s.to_string()))
-            .ok_or_else(|| unreadable(&"no secret"))
+            .ok_or_else(|| unreadable(&"no secret"))?;
+        Ok((secret, v["pairing"].as_str().map(str::to_string)))
     }
 
     /// Unregister an app: its port closes and its phones are removed.
@@ -450,12 +579,38 @@ impl HubClient {
         field(self.call("GET", "members", None)?, "members")
     }
 
-    /// Add a person to the household: their id.
+    /// Add a person to the household as a standard member: their id.
     pub fn add_member(&self, name: &str) -> Result<u32, HubError> {
-        field(
-            self.call("POST", "members", Some(&json!({ "name": name })))?,
-            "id",
-        )
+        self.add_member_as(name, STANDARD)
+    }
+
+    /// Add a person to the household as an [`ADMINISTRATOR`] or a [`STANDARD`] member: their
+    /// id. A new administrator has no password until one is set
+    /// ([`Self::set_password`]).
+    pub fn add_member_as(&self, name: &str, class: &str) -> Result<u32, HubError> {
+        let body = json!({ "name": name, "class": class });
+        field(self.call("POST", "members", Some(&body))?, "id")
+    }
+
+    /// Make a member an administrator or a standard member. The last administrator stays
+    /// one (`last_administrator`).
+    pub fn set_class(&self, member: u32, class: &str) -> Result<(), HubError> {
+        let body = json!({ "class": class });
+        self.call("PUT", &format!("members/{member}/class"), Some(&body))
+            .map(drop)
+    }
+
+    /// Set an administrator's password (at least 8 characters).
+    pub fn set_password(&self, member: u32, password: &str) -> Result<(), HubError> {
+        let body = json!({ "password": password });
+        self.call("PUT", &format!("members/{member}/password"), Some(&body))
+            .map(drop)
+    }
+
+    /// Remove a member from the household: their phones are removed and their grants go.
+    pub fn remove_member(&self, member: u32) -> Result<(), HubError> {
+        self.call("DELETE", &format!("members/{member}"), None)
+            .map(drop)
     }
 
     pub fn rename_member(&self, member: u32, name: &str) -> Result<(), HubError> {
@@ -471,9 +626,9 @@ impl HubClient {
         field(self.call("GET", "grants", None)?, "grants")
     }
 
-    /// Let a member use an app. An app that declared `money` needs the household PIN.
-    pub fn give_grant(&self, member: u32, app: &str, pin: Option<&str>) -> Result<(), HubError> {
-        let body = json!({ "member": member, "app": app, "pin": pin });
+    /// Let a member use an app (an administrator's act; no PIN is asked).
+    pub fn give_grant(&self, member: u32, app: &str) -> Result<(), HubError> {
+        let body = json!({ "member": member, "app": app });
         self.call("POST", "grants", Some(&body)).map(drop)
     }
 
@@ -495,15 +650,9 @@ impl HubClient {
             .map(drop)
     }
 
-    /// A pairing code for a member and an app (making the grant first if needed; an app
-    /// that declared `money` needs the PIN for that).
-    pub fn make_pairing_code(
-        &self,
-        member: u32,
-        app: &str,
-        pin: Option<&str>,
-    ) -> Result<Pairing, HubError> {
-        let body = json!({ "member": member, "app": app, "pin": pin });
+    /// A pairing code for a member and an app (making the grant first if needed).
+    pub fn make_pairing_code(&self, member: u32, app: &str) -> Result<Pairing, HubError> {
+        let body = json!({ "member": member, "app": app });
         parse(self.call("POST", "pairing-codes", Some(&body))?)
     }
 
@@ -534,9 +683,9 @@ impl HubClient {
         field(self.call("GET", "pin", None)?, "set")
     }
 
-    /// Set the household PIN (6 to 12 digits), or change it with the old one.
-    pub fn set_pin(&self, pin: &str, old: Option<&str>) -> Result<(), HubError> {
-        let body = json!({ "pin": pin, "old": old });
+    /// Set a new household PIN (6 to 12 digits). The old one is not needed.
+    pub fn set_pin(&self, pin: &str) -> Result<(), HubError> {
+        let body = json!({ "pin": pin });
         self.call("PUT", "pin", Some(&body)).map(drop)
     }
 
@@ -551,6 +700,13 @@ impl HubClient {
     pub fn names_on(&self, registration_code: Option<&str>) -> Result<Value, HubError> {
         let body = json!({ "registration_code": registration_code });
         self.call("POST", "names/on", Some(&body))
+    }
+
+    /// Change where a person asks for a registration code (`names.code_page`): an
+    /// `https://` address of at most 200 characters (Revision 3).
+    pub fn set_code_page(&self, page: &str) -> Result<Value, HubError> {
+        let body = json!({ "code_page": page });
+        self.call("PUT", "names/code-page", Some(&body))
     }
 
     /// Turn names off (the name and certificate are kept).
@@ -680,12 +836,28 @@ mod tests {
         assert_eq!(part("a/b c"), "a%2Fb%20c");
     }
 
+    /// The owner check passed, for a test's temporary folder (the person's own).
+    fn anyones(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// On Windows a folder the person owns is refused before anything else is read.
+    fn refused_on_windows(dir: &Path) {
+        if cfg!(windows) {
+            match find(dir) {
+                Found::NoAccess(e) => assert_eq!(e.code, "not_the_hubs_folder", "{e}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_missing_folder_is_not_installed_and_an_unreadable_token_says_so() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(find(dir.path()), Found::NotInstalled));
         std::fs::write(dir.path().join(HUB_FILE), r#"{"ports":{"admin":1}}"#).unwrap();
-        match find(dir.path()) {
+        refused_on_windows(dir.path());
+        match find_with(dir.path(), anyones) {
             Found::NoAccess(e) => {
                 assert_eq!(e.code, "no_admin_token");
                 assert!(e.message.contains("installed"));
@@ -707,7 +879,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join(TOKEN_FILE), "the-token\n").unwrap();
-        match find(dir.path()) {
+        refused_on_windows(dir.path());
+        match find_with(dir.path(), anyones) {
             Found::Stopped(h) => {
                 assert_eq!(h.addr().port(), port);
                 let e = h.status().unwrap_err();

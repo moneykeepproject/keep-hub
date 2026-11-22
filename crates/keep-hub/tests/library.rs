@@ -93,6 +93,7 @@ fn answer(mut s: TcpStream, data: &Path) {
                     200,
                     json!({
                         "member": c.member, "member_name": c.member_name,
+                        "class": c.class,
                         "device": c.device, "device_name": c.device_name,
                         "guest_scope": c.guest_scope, "request_id": c.request_id,
                     }),
@@ -132,8 +133,12 @@ fn hub_on_known_port() -> Fixture {
     Fixture::with(|cfg| cfg.ports.admin = port)
 }
 
+/// The library's client on the fixture's hub, signed in as its administrator.
 fn client(f: &Fixture) -> HubClient {
-    HubClient::at(f.hub().admin, &f.admin_token)
+    let hub = HubClient::at(f.hub().admin, &f.admin_token);
+    hub.sign_in(support::ADMIN_NAME, support::ADMIN_PASSWORD)
+        .unwrap();
+    hub
 }
 
 struct App {
@@ -157,21 +162,43 @@ impl App {
 
 // ----- finding the hub ----------------------------------------------------------------------------
 
+/// On Windows an app believes a hub's folder only when the administrators, SYSTEM or a
+/// service own it (stage 7): a test's temporary folder is the person's own, so it is refused
+/// as a folder someone else could have planted. This shows that refusal and gives the client
+/// the rest of the test goes on with. Elsewhere the folder is believed and `found` is the
+/// answer itself.
+fn on_windows_refused_as_planted(data: &Path) {
+    if cfg!(windows) {
+        match find(data) {
+            Found::NoAccess(e) => assert_eq!(e.code, "not_the_hubs_folder", "{e}"),
+            other => panic!("a folder the person owns must be refused on Windows: {other:?}"),
+        }
+        assert!(matches!(offer(data), Offer::CantUse(e) if e.code == "not_the_hubs_folder"));
+    }
+}
+
 #[test]
 fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
     let empty = tempfile::tempdir().unwrap();
     assert!(matches!(find(empty.path()), Found::NotInstalled));
 
     let f = hub_on_known_port();
-    match find(f.dir.path()) {
-        Found::Running(hub, status) => {
-            assert_eq!(hub.addr(), f.hub().admin);
-            assert!(status.accepts(keep_hub_app::PROTOCOL));
-            assert_eq!(status.address.as_deref(), Some("127.0.0.1"));
-            assert!(status.apps.is_empty());
+    on_windows_refused_as_planted(f.dir.path());
+    if !cfg!(windows) {
+        match find(f.dir.path()) {
+            Found::Running(hub, status) => {
+                assert_eq!(hub.addr(), f.hub().admin);
+                assert!(status.accepts(keep_hub_app::PROTOCOL));
+                assert_eq!(status.address.as_deref(), Some("127.0.0.1"));
+                assert!(status.apps.is_empty());
+            }
+            other => panic!("{other:?}"),
         }
-        other => panic!("{other:?}"),
     }
+    // (what `find` does after the owner check, on every system)
+    let hub = HubClient::open(f.dir.path()).unwrap();
+    assert_eq!(hub.addr(), f.hub().admin);
+    assert!(hub.status().unwrap().accepts(keep_hub_app::PROTOCOL));
     // stopped: found, and offered to start
     let admin = f.hub().admin;
     let stopped = tempfile::tempdir().unwrap();
@@ -180,6 +207,13 @@ fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
     }
     drop(f); // the hub stops
     std::thread::sleep(Duration::from_millis(100));
+    on_windows_refused_as_planted(stopped.path());
+    if cfg!(windows) {
+        let hub = HubClient::open(stopped.path()).unwrap();
+        assert_eq!(hub.addr(), admin);
+        assert_eq!(hub.status().unwrap_err().code, "hub_unreachable");
+        return;
+    }
     match find(stopped.path()) {
         Found::Stopped(hub) => {
             assert_eq!(hub.addr(), admin);
@@ -252,7 +286,10 @@ fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start()
 
     // a running hub: on with the phone setup
     let f = hub_on_known_port();
-    assert!(matches!(offer(f.dir.path()), Offer::Ready(_, _)));
+    on_windows_refused_as_planted(f.dir.path());
+    if !cfg!(windows) {
+        assert!(matches!(offer(f.dir.path()), Offer::Ready(_, _)));
+    }
 
     // a stopped hub counts as found: offered a start, the launcher isn't opened and nothing
     // in the hub's folder changes
@@ -267,9 +304,14 @@ fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start()
         installed: true,
         opened: std::cell::Cell::new(0),
     };
-    match offer(stopped.path()) {
-        Offer::StartHub(hub) => assert_eq!(hub.status().unwrap_err().code, "hub_unreachable"),
-        other => panic!("{other:?}"),
+    on_windows_refused_as_planted(stopped.path());
+    if !cfg!(windows) {
+        match offer(stopped.path()) {
+            Offer::StartHub(hub) => {
+                assert_eq!(hub.status().unwrap_err().code, "hub_unreachable")
+            }
+            other => panic!("{other:?}"),
+        }
     }
     assert_eq!(launcher.opened.get(), 0, "the launcher isn't opened");
     assert_eq!(
@@ -426,6 +468,7 @@ fn at05_a_backend_made_with_the_library_refuses_requests_without_the_right_keep_
     assert_eq!(who["device_name"], "Zoë's phone");
     assert_eq!(who["request_id"], "req-7");
     assert_eq!(who["guest_scope"], Value::Null);
+    assert_eq!(who["class"], "standard");
     let devices = hub.devices().unwrap();
     assert_eq!(who["device"], devices[0].id);
 
@@ -459,6 +502,7 @@ fn a_guest_is_seen_with_its_scope() {
     let token = r.json()["token"].as_str().unwrap().to_string();
     let who = f.api("vacapick", &token, "GET", "/api/trip").json();
     assert_eq!(who["guest_scope"], "trip-12");
+    assert_eq!(who["class"], "guest");
     assert!(hub.invites().unwrap().is_empty(), "used");
 }
 
@@ -471,25 +515,28 @@ fn the_phones_screen_works_through_the_library() {
     let money = App::new("moneykeep", "MoneyKeep");
     ensure_registered(&hub, &money.reg.clone().money(), &money.data()).unwrap();
 
-    // the PIN
-    assert!(!hub.pin_is_set().unwrap());
-    hub.set_pin(PIN, None).unwrap();
+    // the PIN (set at the first set-up; an administrator sets a new one without the old)
     assert!(hub.pin_is_set().unwrap());
-    let e = hub.set_pin("13579135", Some("000000")).unwrap_err();
-    assert_eq!(e.status.map(|s| s / 100), Some(4));
-    assert!(!e.message.contains("000000") && !e.message.contains("13579135"));
+    hub.set_pin(PIN).unwrap();
+    let e = hub.set_pin("12ab").unwrap_err();
+    assert_eq!(e.status, Some(400));
+    assert!(!e.message.contains("12ab"));
 
     // members and grants
     let ann = hub.add_member("Ann").unwrap();
     hub.rename_member(ann, "Annie").unwrap();
-    assert_eq!(hub.members().unwrap()[0].name, "Annie");
-    let e = hub.give_grant(ann, "moneykeep", None).unwrap_err();
-    assert_eq!(e.status.map(|s| s / 100), Some(4), "money needs the PIN");
-    hub.give_grant(ann, "moneykeep", Some(PIN)).unwrap();
+    let members = hub.members().unwrap();
+    assert_eq!(
+        (members[1].name.as_str(), members[1].class.as_str()),
+        ("Annie", "standard")
+    );
+    assert_eq!(members[0].class, keep_hub_app::ADMINISTRATOR);
+    assert!(members[0].password_set);
+    hub.give_grant(ann, "moneykeep").unwrap();
     assert_eq!(hub.grants().unwrap().len(), 1);
 
     // a pairing code: shown and opened, never printed
-    let p = hub.make_pairing_code(ann, "moneykeep", Some(PIN)).unwrap();
+    let p = hub.make_pairing_code(ann, "moneykeep").unwrap();
     assert_eq!(p.code.len(), 9);
     assert!(p.url.contains(&format!(":{}", money.reg.public_port)));
     assert!(p.certificate_page.starts_with("http://"));
@@ -501,10 +548,7 @@ fn the_phones_screen_works_through_the_library() {
     );
 
     // a phone, then removed
-    let code = hub
-        .make_pairing_code(ann, "moneykeep", Some(PIN))
-        .unwrap()
-        .code;
+    let code = hub.make_pairing_code(ann, "moneykeep").unwrap().code;
     let r = f.phone_json(
         "moneykeep",
         "POST",
@@ -552,4 +596,121 @@ fn a_stopped_backend_shows_in_the_status_and_in_find_the_problem() {
     let failed = p.failure().unwrap();
     assert_eq!((failed.number, failed.code.as_str()), (9, "app_stopped"));
     assert_eq!(failed.action.as_ref().unwrap()["app"], "vacapick");
+}
+
+// ----- stage 9: Revisions 2 and 3 through the library ---------------------------------------------
+
+/// An open household, a `code` app, then `secure` and a `code_and_pin` app (tests 45, 47,
+/// 49, 50 and 54 as an app's desktop program meets them).
+#[test]
+fn an_open_household_and_a_code_app_through_the_library() {
+    let f = Fixture::not_set_up();
+    let hub = HubClient::at(f.hub().admin, &f.admin_token);
+    let first = hub.set_up_open(support::ADMIN_NAME).unwrap();
+    assert_eq!(first.class, keep_hub_app::ADMINISTRATOR);
+    assert!(!hub.signed_in(), "no session in an open household");
+    let status = hub.status().unwrap();
+    assert!(status.household_is_open());
+    assert_eq!(
+        status.code_page.as_deref(),
+        Some("https://getmoneykeep.org/phone-access/")
+    );
+    assert_eq!(status.code_needed, Some(true));
+
+    let ez = App::new("ez", "Test EZ");
+    let ez_reg = ez.reg.clone().by_code_alone();
+    ensure_registered(&hub, &ez_reg, &ez.data()).unwrap();
+    let status = hub.status().unwrap();
+    assert_eq!(
+        status.app("ez").unwrap().app.pairing.as_deref(),
+        Some(keep_hub_app::CODE)
+    );
+    // nothing changed: not registered again
+    assert!(!ensure_registered(&hub, &ez_reg, &ez.data()).unwrap().now);
+    let sam = hub.add_member("Sam").unwrap();
+    let code = hub.make_pairing_code(sam, "ez").unwrap().code;
+    let r = f.phone_json(
+        "ez",
+        "POST",
+        "/hub/pair",
+        &[],
+        &json!({ "code": code, "device": "phone" }),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+
+    // a code_and_pin app waits for a secured household
+    let trips = App::new("trips", "Test Trips");
+    let e = ensure_registered(&hub, &trips.reg, &trips.data()).unwrap_err();
+    assert_eq!(e.code, "household_not_secured");
+    hub.secure(support::ADMIN_NAME, support::ADMIN_PASSWORD, PIN)
+        .unwrap();
+    assert!(hub.signed_in());
+    assert!(!hub.status().unwrap().household_is_open());
+    ensure_registered(&hub, &trips.reg, &trips.data()).unwrap();
+}
+
+/// A hub older than Revision 2, faked: its answers carry no `pairing`.
+fn older_hub() -> (std::net::SocketAddr, Arc<AtomicBool>) {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let registered = Arc::new(AtomicBool::new(false));
+    let seen = registered.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { break };
+            let mut buf = [0u8; 8192];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if head.starts_with("GET /admin/v1/status") {
+                json!({ "hub": "keep-hub", "version": "0.1.0", "protocols": [1],
+                        "address": "127.0.0.1", "names": "off", "apps": [] })
+            } else if head.starts_with("POST /admin/v1/apps") {
+                seen.store(true, Ordering::SeqCst);
+                json!({ "id": "ez", "secret": "ab".repeat(32), "protocol": 1,
+                        "hub_version": "0.1.0" })
+            } else {
+                json!({ "error": "not_found", "message": "no" })
+            };
+            let body = body.to_string();
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (addr, registered)
+}
+
+/// Revision 2 A: an app that asked for `code` and gets an answer without `pairing` is
+/// talking to an older hub, and must not offer pairing.
+#[test]
+fn a_code_app_on_an_older_hub_is_told_to_update_it() {
+    let (addr, registered) = older_hub();
+    let hub = HubClient::at(addr, "token");
+    let data = tempfile::tempdir().unwrap();
+    let r = Registration::new("ez", "Test EZ", "1.0.0", 14444, 24444).by_code_alone();
+    let e = ensure_registered(&hub, &r, data.path()).unwrap_err();
+    assert_eq!(e.code, "hub_too_old");
+    assert!(e.message.contains("Update it"), "{e}");
+    assert!(registered.load(Ordering::SeqCst));
+    // the secret is kept, so the backend still checks what the hub forwards
+    assert!(data.path().join(SECRET_FILE).is_file());
+    // a code_and_pin app is fine with that hub
+    let r = Registration::new("trips", "Test Trips", "1.0.0", 16443, 26443);
+    ensure_registered(&hub, &r, data.path()).unwrap();
+}
+
+/// Revision 3, through the library: the code page can be changed, and a bad one isn't.
+#[test]
+fn the_code_page_through_the_library() {
+    let f = hub_on_known_port();
+    let hub = client(&f);
+    let e = hub.set_code_page("http://example.org/").unwrap_err();
+    assert_eq!(e.code, "bad_code_page");
+    hub.set_code_page("https://example.org/codes").unwrap();
+    assert_eq!(
+        hub.status().unwrap().code_page.as_deref(),
+        Some("https://example.org/codes")
+    );
 }

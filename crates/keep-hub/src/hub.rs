@@ -25,9 +25,12 @@ use zeroize::Zeroizing;
 use crate::config::HubConfig;
 use crate::keys::KeyStore;
 use crate::machine::{self, Machine};
-use crate::registry::{App, Device, Member, Registry, PIN_KEY};
+use crate::registry::{App, Device, Member, Registry, CODE, CODE_AND_PIN, PIN_KEY};
 use crate::util::{self, StoreResult};
 use crate::{admin, ca, names, page, pin, relay};
+
+pub(crate) mod household;
+pub use household::reset_administrator;
 
 /// The hub protocols this hub accepts from an app. A newer hub keeps every older number.
 pub const PROTOCOLS: &[u32] = &[1];
@@ -65,6 +68,9 @@ pub struct HubOptions {
     /// A transfer with no bytes moving for this long is closed ([`relay::IDLE`]; shorter
     /// in tests).
     pub idle: Duration,
+    /// How long a backend may take to start its answer ([`relay::FIRST_BYTE`]; shorter in
+    /// tests).
+    pub first_byte: Duration,
     /// The internet, for the hub name (`None`: the real one, trusting what this computer
     /// trusts; tests give fakes).
     pub outside: Option<names::Outside>,
@@ -89,6 +95,7 @@ impl HubOptions {
             log: Arc::new(|l: &str| eprintln!("{l}")),
             pin_cost: pin::COST,
             idle: relay::IDLE,
+            first_byte: relay::FIRST_BYTE,
             outside: None,
             machine: None,
             address_poll: ADDRESS_POLL,
@@ -219,6 +226,10 @@ pub(crate) struct State {
     page: Option<Listener>,
     /// The last "Find the problem" results.
     pub(crate) problems: Option<Value>,
+    /// Signed-in administrators, by the SHA-256 of their session.
+    sessions: HashMap<[u8; 32], household::Session>,
+    /// Wrong passwords and pauses, by administrator.
+    sign_ins: HashMap<u32, household::SignIn>,
 }
 
 pub(crate) struct Hub {
@@ -232,6 +243,7 @@ pub(crate) struct Hub {
     log: Log,
     pub(crate) pin_cost: pin::Cost,
     pub(crate) idle: Duration,
+    pub(crate) first_byte: Duration,
     pub(crate) admin_token: String,
     /// Where the admin address and the certificate page really listen.
     admin_port: u16,
@@ -292,6 +304,17 @@ pub(crate) fn clean_name(name: &str, what: &str) -> Result<String, Refusal> {
     Ok(n.to_string())
 }
 
+/// Pairing a phone for an app that asks for the household PIN, while there is none. Since
+/// stage 8 every secured household has a PIN; this is met when an open household (Revision
+/// 2 B) still has an app that asks for one, as a hub upgraded from stage 7 may.
+fn pin_not_set() -> Refusal {
+    Refusal::new(
+        409,
+        "pin_not_set",
+        "This app's phones pair with the household PIN, and there is none yet. Set a password and PIN for the household on the hub computer first.",
+    )
+}
+
 fn wrong() -> Refusal {
     Refusal::new(
         403,
@@ -327,6 +350,9 @@ pub(crate) struct Registration {
     pub money: bool,
     #[serde(default)]
     pub guests: bool,
+    /// How the app's phones pair (Revision 2 A): `code_and_pin` (left out) or `code`.
+    #[serde(default)]
+    pub pairing: Option<String>,
 }
 
 impl Hub {
@@ -374,6 +400,25 @@ impl Hub {
             let _ = st.registry.touch(device.id, now);
         }
         Ok(Identity { member, device })
+    }
+
+    /// `/hub/unpair`: the calling device revokes itself (the person removed the app from
+    /// this phone). It works without a grant; another device is never touched.
+    pub(crate) fn unpair(&self, app: &str, token: &str) -> Result<(), Refusal> {
+        let now = self.now();
+        let st = self.lock();
+        let Some(device) = st.registry.device_by_token(token).map_err(Refusal::inner)? else {
+            return Err(Refusal::not_paired());
+        };
+        if device.app != app {
+            return Err(Refusal::not_paired());
+        }
+        st.registry
+            .revoke_device(device.id, now)
+            .map_err(Refusal::inner)?;
+        drop(st);
+        self.log(&format!("device {} unpaired itself", device.id));
+        Ok(())
     }
 
     /// Where an app's backend listens and the secret it shares with the hub. `None` when
@@ -465,15 +510,23 @@ impl Hub {
         let device_name = clean_name(p.device.as_deref().unwrap_or(""), "this phone")?;
         let code = normalise_code(p.code.as_deref().unwrap_or(""));
         let now = self.now();
+        // `None`: this app's phones pair with the code alone (Revision 2 A). A `pin` in the
+        // body is then ignored and never checked.
         let pin_hash = {
             let mut st = self.lock();
             Self::throttle(&mut st, now, ip)?;
-            let Some(pin_hash) = st.registry.get(PIN_KEY).map_err(Refusal::inner)? else {
-                return Err(Refusal::new(
-                    409,
-                    "pin_not_set",
-                    "Set the household PIN on the hub computer before pairing.",
-                ));
+            let by_code = st
+                .registry
+                .app(app)
+                .map_err(Refusal::inner)?
+                .is_some_and(|a| a.pairs_by_code_alone());
+            let pin_hash = if by_code {
+                None
+            } else {
+                let Some(h) = st.registry.get(PIN_KEY).map_err(Refusal::inner)? else {
+                    return Err(pin_not_set());
+                };
+                Some(h)
             };
             // the code must be for this app's port
             let valid = st
@@ -487,7 +540,9 @@ impl Hub {
             pin_hash
         };
         // Slow on purpose (Argon2id); the hub stays responsive meanwhile.
-        let pin_ok = pin::verify(p.pin.as_deref().unwrap_or("").trim(), &pin_hash);
+        let pin_ok = pin_hash
+            .as_deref()
+            .is_none_or(|h| pin::verify(p.pin.as_deref().unwrap_or("").trim(), h));
         let mut st = self.lock();
         if !pin_ok {
             st.failures.push_back((now, ip));
@@ -525,7 +580,7 @@ impl Hub {
         Ok(json!({
             "token": token.as_str(),
             "device_id": device_id,
-            "member": { "id": member.id, "name": member.name },
+            "member": household::shown(&member),
             "app": app,
         }))
     }
@@ -565,62 +620,21 @@ impl Hub {
         Ok(json!({
             "token": token.as_str(),
             "device_id": device_id,
-            "member": { "id": member, "name": name },
+            "member": { "id": member, "name": name, "class": crate::registry::GUEST },
             "app": app,
             "guest_scope": invite.scope,
         }))
     }
 
-    /// Whether `pin` is the household PIN. `Err` when none is set.
-    fn check_pin(&self, pin: Option<&str>) -> Result<(), Refusal> {
-        let hash = self.lock().registry.get(PIN_KEY).map_err(Refusal::inner)?;
-        let Some(hash) = hash else {
-            return Err(Refusal::new(
-                409,
-                "pin_not_set",
-                "Set the household PIN first.",
-            ));
-        };
-        let Some(pin) = pin else {
-            return Err(Refusal::new(
-                403,
-                "pin_needed",
-                "This app holds financial records: enter the household PIN.",
-            ));
-        };
-        if pin::verify(pin.trim(), &hash) {
-            Ok(())
-        } else {
-            Err(Refusal::new(
-                403,
-                "pin_wrong",
-                "That isn't the household PIN.",
-            ))
+    /// Set or change the household PIN (an administrator's act: the old PIN is not
+    /// needed).
+    pub(crate) fn set_pin(&self, new: &str) -> Result<(), Refusal> {
+        // (an open household gets its PIN with `secure`, with an administrator's password)
+        if self.is_open()? {
+            return Err(household::household_not_secured());
         }
-    }
-
-    /// Set the household PIN. Changing one needs the old one.
-    pub(crate) fn set_pin(&self, new: &str, old: Option<&str>) -> Result<(), Refusal> {
         let new = new.trim();
         pin::check(new).map_err(|e| Refusal::new(400, "bad_pin", e))?;
-        let has = self
-            .lock()
-            .registry
-            .get(PIN_KEY)
-            .map_err(Refusal::inner)?
-            .is_some();
-        if has {
-            match old {
-                Some(old) => self.check_pin(Some(old))?,
-                None => {
-                    return Err(Refusal::new(
-                        403,
-                        "pin_needed",
-                        "Enter the household PIN you have now to change it.",
-                    ))
-                }
-            }
-        }
         let hash = pin::hash_with(new, self.pin_cost).map_err(Refusal::inner)?;
         self.lock()
             .registry
@@ -649,17 +663,9 @@ impl Hub {
         Ok((a, m))
     }
 
-    /// Let a member use an app. An app that declared `money` needs the household PIN.
-    pub(crate) fn give_grant(
-        &self,
-        member: u32,
-        app: &str,
-        pin: Option<&str>,
-    ) -> Result<(), Refusal> {
-        let (a, _) = self.app_and_member(app, member)?;
-        if a.money {
-            self.check_pin(pin)?;
-        }
+    /// Let a member use an app (an administrator's act; no PIN is asked, money or not).
+    pub(crate) fn give_grant(&self, member: u32, app: &str) -> Result<(), Refusal> {
+        self.app_and_member(app, member)?;
         let now = self.now();
         self.lock()
             .registry
@@ -667,14 +673,8 @@ impl Hub {
             .map_err(Refusal::inner)
     }
 
-    /// A pairing code for a member and an app. Without a grant one is made first (for an
-    /// app that declared `money`, only with the household PIN).
-    pub(crate) fn make_code(
-        &self,
-        member: u32,
-        app: &str,
-        pin: Option<&str>,
-    ) -> Result<Value, Refusal> {
+    /// A pairing code for a member and an app. Without a grant one is made first.
+    pub(crate) fn make_code(&self, member: u32, app: &str) -> Result<Value, Refusal> {
         let (a, _) = self.app_and_member(app, member)?;
         let (has_pin, granted) = {
             let st = self.lock();
@@ -683,15 +683,12 @@ impl Hub {
                 st.registry.has_grant(member, app).map_err(Refusal::inner)?,
             )
         };
-        if !has_pin {
-            return Err(Refusal::new(
-                409,
-                "pin_not_set",
-                "Set the household PIN before pairing a phone.",
-            ));
+        // (an app that pairs by code alone needs no PIN: Revision 2 A)
+        if !has_pin && !a.pairs_by_code_alone() {
+            return Err(pin_not_set());
         }
         if !granted {
-            self.give_grant(member, app, pin)?;
+            self.give_grant(member, app)?;
         }
         let code = new_code().map_err(Refusal::inner)?;
         let now = self.now();
@@ -801,7 +798,14 @@ impl Hub {
     /// Register an app: its desktop program does so the first time phones are turned on in
     /// it, and again whenever its version changes. Its port is opened at once and a new
     /// shared secret is made, which the answer carries.
-    pub(crate) fn register(self: &Arc<Self>, r: &Registration) -> Result<Value, Refusal> {
+    ///
+    /// `administrator`: whether the request carried an administrator's live session. The
+    /// first registration of an app needs one; registering it again (an update) doesn't.
+    pub(crate) fn register(
+        self: &Arc<Self>,
+        r: &Registration,
+        administrator: bool,
+    ) -> Result<Value, Refusal> {
         let bad = |m: String| Refusal::new(400, "bad_registration", m);
         let id_ok = r.id.len() <= 32
             && r.id.starts_with(|c: char| c.is_ascii_lowercase())
@@ -852,6 +856,16 @@ impl Hub {
                 )));
             }
         }
+        let pairing = match r.pairing.as_deref().map(str::trim) {
+            None => CODE_AND_PIN,
+            Some(CODE_AND_PIN) => CODE_AND_PIN,
+            Some(CODE) => CODE,
+            Some(_) => {
+                return Err(bad(format!(
+                    "{title} asked to pair its phones in a way this Keep Hub doesn't know: use \"{CODE_AND_PIN}\" or \"{CODE}\"."
+                )))
+            }
+        };
         if r.public_port == r.loopback_port {
             return Err(bad(format!(
                 "{title} needs two different ports: one for phones and one for its own backend."
@@ -876,6 +890,16 @@ impl Hub {
             }
             apps.into_iter().find(|a| a.id == r.id)
         };
+        // A new app, or a change of how its phones pair, needs what a first registration
+        // needs (Revision 2 A); an update that keeps its pairing needs the token alone.
+        let first_time = existing.as_ref().is_none_or(|a| a.pairing != pairing);
+        if first_time && !administrator {
+            return Err(household::administrator_needed());
+        }
+        // An app that pairs with the PIN needs a household that has one (Revision 2 B).
+        if first_time && pairing == CODE_AND_PIN && self.is_open()? {
+            return Err(household::household_not_secured());
+        }
         // the port: kept when it's already this app's, opened otherwise (before the old one
         // closes, so a failure leaves the app as it was). Away from a home network nothing
         // is open: the port opens when an address comes.
@@ -898,6 +922,7 @@ impl Hub {
             money: r.money,
             guests: r.guests,
             registered: existing.as_ref().map_or(now, |a| a.registered),
+            pairing: pairing.to_string(),
         };
         let stored = (|| -> StoreResult<Zeroizing<String>> {
             let secret = Zeroizing::new(util::hex(&util::random::<32>()?));
@@ -931,6 +956,7 @@ impl Hub {
             "secret": secret.as_str(),
             "protocol": r.protocol,
             "hub_version": VERSION,
+            "pairing": pairing,
         }))
     }
 
@@ -992,12 +1018,16 @@ impl Hub {
                 json!({ "app": a, "state": state })
             })
             .collect();
+        let names = self.names.status();
         Ok(json!({
             "hub": "keep-hub",
             "version": VERSION,
             "protocols": PROTOCOLS,
             "address": self.address(),
-            "names": self.names.status()["state"],
+            "names": names["state"],
+            "code_page": names["code_page"],
+            "code_needed": names["code_needed"],
+            "household": if self.is_open()? { "open" } else { "secured" },
             "apps": apps,
         }))
     }
@@ -1328,6 +1358,8 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
             listeners: HashMap::new(),
             page: None,
             problems: None,
+            sessions: HashMap::new(),
+            sign_ins: HashMap::new(),
         }),
         changing_apps: Mutex::new(()),
         data: opts.data.clone(),
@@ -1338,6 +1370,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         log: opts.log,
         pin_cost: opts.pin_cost,
         idle: opts.idle,
+        first_byte: opts.first_byte,
         admin_token,
         admin_port: admin_addr.port(),
         page_backend,
