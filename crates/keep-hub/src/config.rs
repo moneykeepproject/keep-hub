@@ -341,6 +341,17 @@ impl HubConfig {
         serde_json::from_slice(&b).map_err(|e| format!("{CONFIG_FILE} is damaged ({e})"))
     }
 
+    /// Change `hub.json` in `dir`: read, `change`, write, one change at a time in this
+    /// program, so two changes at once (an admin request and an address change, say) can't
+    /// lose one another.
+    pub fn update(dir: &Path, change: impl FnOnce(&mut HubConfig)) -> StoreResult<()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+        let mut cfg = HubConfig::load(dir)?;
+        change(&mut cfg);
+        cfg.save(dir)
+    }
+
     pub fn save(&self, dir: &Path) -> StoreResult<()> {
         let b = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         write_private(&dir.join(CONFIG_FILE), &b)

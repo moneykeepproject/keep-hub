@@ -993,13 +993,33 @@ impl Hub {
             l.close();
         }
         self.log(&format!("app {} registered", r.id));
-        Ok(json!({
+        let mut answer = json!({
             "id": r.id,
             "secret": secret.as_str(),
             "protocol": r.protocol,
             "hub_version": VERSION,
             "pairing": pairing,
-        }))
+        });
+        if let Some(words) = self.port_closed_on_linux(r.public_port) {
+            answer["firewall"] = json!({ "open": false, "words": words });
+        }
+        Ok(answer)
+    }
+
+    /// On Linux the hub can't open a port in the firewall (owner decision 2026-11-22): when
+    /// the firewall that is on doesn't let `port` in, the words for the app to show.
+    fn port_closed_on_linux(&self, port: u16) -> Option<String> {
+        if self.machine.os() != machine::Os::Linux {
+            return None;
+        }
+        let fw = self.machine.firewall_scan().ok()??.linux?;
+        let active = fw.active?;
+        (!fw.is_open(port)).then(|| {
+            format!(
+                "The firewall ({}) doesn't let phones reach port {port} yet. Open it with Fix in ServicesKeep.",
+                active.name()
+            )
+        })
     }
 
     /// Unregister an app: its port closes and its devices are revoked.
@@ -1081,10 +1101,13 @@ impl Hub {
 
 impl Hub {
     /// A probe request on one of the hub's ports: its status (204, 404 or 429).
+    /// `peer` decides the source; `visitor` is what the rate limit counts by (the same,
+    /// except through the tunnel).
     pub(crate) fn probe_request(
         &self,
         nonce: &str,
         peer: IpAddr,
+        visitor: IpAddr,
         arrived: Arrived,
         cloudflare: bool,
     ) -> u16 {
@@ -1093,7 +1116,7 @@ impl Hub {
             .probes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .request(nonce, peer, source, self.now());
+            .request(nonce, visitor, source, self.now());
         if outcome == (probe::Outcome::Unknown { log: true }) {
             self.log(&format!(
                 "probe: {} unknown probe nonces in the last hour",
@@ -1174,9 +1197,8 @@ impl Hub {
     pub(crate) fn set_tunnel_hostname(&self, name: &str) -> Result<Option<String>, Refusal> {
         let name = crate::config::check_hostname(name)
             .map_err(|m| Refusal::new(400, "bad_hostname", m))?;
-        let mut cfg = HubConfig::load(&self.data).map_err(Refusal::inner)?;
-        cfg.tunnel.hostname = name.clone();
-        cfg.save(&self.data).map_err(Refusal::inner)?;
+        HubConfig::update(&self.data, |c| c.tunnel.hostname = name.clone())
+            .map_err(Refusal::inner)?;
         *self
             .tunnel_hostname
             .lock()
@@ -1357,11 +1379,8 @@ impl Hub {
                 self.log("address lost: not on a home network");
             }
         }
-        if let Ok(mut cfg) = HubConfig::load(&self.data) {
-            cfg.address.current = new;
-            if let Err(e) = cfg.save(&self.data) {
-                self.log(&e);
-            }
+        if let Err(e) = HubConfig::update(&self.data, |c| c.address.current = new) {
+            self.log(&e);
         }
         self.names.set_address(new);
     }
@@ -1373,9 +1392,7 @@ impl Hub {
         if a.is_empty() || a.len() > 64 || a.chars().any(char::is_control) {
             return Err("Give an adapter's name, or \"automatic\".".into());
         }
-        let mut cfg = HubConfig::load(&self.data)?;
-        cfg.address.adapter = a.to_string();
-        cfg.save(&self.data)?;
+        HubConfig::update(&self.data, |c| c.address.adapter = a.to_string())?;
         let found = self.find_address(true);
         self.move_to(found);
         Ok(())

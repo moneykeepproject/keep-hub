@@ -184,17 +184,26 @@ pub(crate) fn accept_loop(
                     drop(tcp);
                     continue;
                 }
-                let Some(slot) = Slot::take(&per, peer.ip()) else {
-                    drop(tcp);
-                    continue;
+                // On the tunnel's loopback listener every connection comes from the
+                // connector: its place is counted by the visitor's address, once the head
+                // says it (owner decision 2026-11-22).
+                let slot = match arrived {
+                    Arrived::Home => match Slot::take(&per, peer.ip()) {
+                        Some(s) => Some(s),
+                        None => {
+                            drop(tcp);
+                            continue;
+                        }
+                    },
+                    Arrived::Loopback => None,
                 };
                 active.fetch_add(1, Ordering::SeqCst);
-                let (hub, app, act) = (hub.clone(), app.clone(), active.clone());
+                let (hub, app, act, per) = (hub.clone(), app.clone(), active.clone(), per.clone());
                 let spawned = std::thread::Builder::new()
                     .name("hub-tls".into())
                     .spawn(move || {
                         let _slot = slot;
-                        let _ = serve(tcp, peer, &hub, &app, arrived);
+                        let _ = serve(tcp, peer, &hub, &app, arrived, &per);
                         act.fetch_sub(1, Ordering::SeqCst);
                     });
                 if spawned.is_err() {
@@ -348,12 +357,27 @@ fn forward_head(head: &Head, secret: &str, who: Option<&Identity>) -> Vec<u8> {
 }
 
 /// One phone connection: the TLS handshake, one request, its answer.
+/// The address a request's limits are counted by: the phone's own, or, on the tunnel's
+/// loopback listener, the visitor's address Cloudflare's connector sends (owner decision
+/// 2026-11-22: phones away from home don't share one address's limits). The header is
+/// believed only there, never on the home address.
+pub(crate) fn visitor(peer: IpAddr, arrived: Arrived, head: &Head) -> IpAddr {
+    match arrived {
+        Arrived::Home => peer,
+        Arrived::Loopback => head
+            .header(probe::CLOUDFLARE_HEADER)
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+            .unwrap_or(peer),
+    }
+}
+
 fn serve(
     tcp: TcpStream,
     peer: SocketAddr,
     hub: &Arc<Hub>,
     app: &str,
     arrived: Arrived,
+    per: &Arc<Mutex<HashMap<IpAddr, usize>>>,
 ) -> std::io::Result<()> {
     tcp.set_nonblocking(false)?;
     tcp.set_write_timeout(Some(hub.idle))?;
@@ -396,6 +420,17 @@ fn serve(
     };
     let path = head.path().to_string();
     let method = head.method.as_str();
+    let visitor = visitor(peer.ip(), arrived, &head);
+    let _slot = match arrived {
+        Arrived::Home => None,
+        Arrived::Loopback => match Slot::take(per, visitor) {
+            Some(s) => Some(s),
+            None => {
+                let a = Answer::error(503, "busy", "The hub is busy: try again in a moment.");
+                return finish(hub, &mut tls, method, &path, &a);
+            }
+        },
+    };
 
     // the probe (Revision 4 A): answered here, never forwarded. Nothing but the request
     // line is read, except on the tunnel's loopback listener, where only whether
@@ -404,7 +439,7 @@ fn serve(
         let status = if method == "GET" {
             let cloudflare =
                 arrived == Arrived::Loopback && head.header(probe::CLOUDFLARE_HEADER).is_some();
-            hub.probe_request(nonce, peer.ip(), arrived, cloudflare)
+            hub.probe_request(nonce, peer.ip(), visitor, arrived, cloudflare)
         } else {
             404
         };
@@ -450,7 +485,7 @@ fn serve(
                     Err(r) => refuse(hub, &mut tls, &head, &r),
                 }
             }
-            ("POST", "/hub/pair") => pair(hub, &mut tls, &head, rest, peer.ip(), app),
+            ("POST", "/hub/pair") => pair(hub, &mut tls, &head, rest, visitor, app),
             // The person removes the app from this phone: its own device is revoked.
             ("POST", "/hub/unpair") => {
                 let done = head

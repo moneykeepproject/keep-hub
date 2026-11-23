@@ -255,16 +255,13 @@ fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "keep-hub".into());
-    // (Revision 4 C: the same Fix as an admin request, so a program needn't know where the
-    // hub's program is; the command stays for the apps that run it today)
+    // (Revision 4 C's admin request can't do this on Windows: the owner decided on
+    // 2026-11-22 that Windows' permission prompt is needed, so the command is the Fix)
     let fix = json!({
         "kind": "fix",
         "label": "Fix",
         "command": [exe, "fix-firewall"],
         "permission": "Windows will ask for permission, because the firewall is set for all users.",
-        "method": "POST",
-        "path": "/admin/v1/problems/fix",
-        "body": { "check": 4 },
     });
     let (code, words) = if !check.block_rules.is_empty() {
         (
@@ -302,8 +299,12 @@ fn action_words(number: u8) -> Option<&'static str> {
     })
 }
 
-/// `POST /admin/v1/problems/fix {check}` (Revision 4 C): Fix for check 4, done by the
-/// service itself, answering check 4's new result. Any other check has no Fix.
+/// `POST /admin/v1/problems/fix {check}` (Revision 4 C). Only check 4 has a Fix, and the
+/// service can't do it on any system the hub manages a firewall on (owner decisions
+/// 2026-11-22): on Windows it needs Windows' permission prompt, which the app's
+/// `keep-hub fix-firewall` shows; on Linux it is ServicesKeep's. The answer says which, in
+/// words. Where the hub manages no firewall (a Mac) there is nothing to fix and it answers
+/// check 4's result.
 pub(crate) fn fix(hub: &Arc<Hub>, check: u8) -> Result<Value, crate::hub::Refusal> {
     use crate::hub::Refusal;
     let Some(action) = action_words(check) else {
@@ -320,28 +321,25 @@ pub(crate) fn fix(hub: &Arc<Hub>, check: u8) -> Result<Value, crate::hub::Refusa
             format!("Only check 4 (the firewall) has a Fix. Check {check}'s action is: {action}."),
         ));
     }
-    if hub.machine.os() == machine::Os::Linux {
+    match hub.machine.os() {
+        // (owner decision 2026-11-22: the service can't change the Windows firewall, which
+        // asks an administrator's permission: the app runs `keep-hub fix-firewall` with
+        // Windows' prompt, as check 4's action says)
+        machine::Os::Windows => Err(Refusal::new(
+            409,
+            "permission_needed",
+            "Changing the Windows firewall needs an administrator's permission, which Keep Hub's service can't ask for. Use Fix in the app: it runs keep-hub fix-firewall with Windows' permission prompt.",
+        )),
         // (owner decision 2026-11-22: the service has no right to change ufw or firewalld;
-        // the package opens the ports at install, and ServicesKeep fixes them later)
-        return Err(Refusal::new(
+        // the package opens the certificate page's port at install, ServicesKeep the rest)
+        machine::Os::Linux => Err(Refusal::new(
             409,
             "fix_in_serviceskeep",
             "On Linux, Keep Hub can't change the firewall itself. Run Fix from ServicesKeep.",
-        ));
+        )),
+        // a firewall Keep Hub doesn't manage: nothing to do, and check 4 says so
+        machine::Os::Mac => Ok(json!({ "check": firewall(hub).first(), "done": [] })),
     }
-    let exe = std::env::current_exe()
-        .map_err(|e| Refusal::inner(format!("the hub program's path can't be found: {e}")))?;
-    let ports = needed_ports(hub);
-    let done = machine::fix_firewall_for(&*hub.machine, &exe, &ports).map_err(|e| {
-        Refusal::new(
-            500,
-            "fix_failed",
-            format!("The firewall couldn't be fixed: {e}"),
-        )
-    })?;
-    hub.log("firewall: Fix asked of the hub");
-    let result = firewall(hub);
-    Ok(json!({ "check": result.first(), "done": done }))
 }
 
 /// Checks 5 to 8 apply only with names on.

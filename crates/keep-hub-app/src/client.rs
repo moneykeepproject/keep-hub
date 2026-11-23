@@ -607,18 +607,24 @@ impl HubClient {
 
     /// Register (see [`crate::ensure_registered`], which keeps the secret): the shared
     /// secret, which isn't kept anywhere by this call.
-    /// The answer's `pairing` is `None` from a hub older than Revision 2.
+    /// The answer's `pairing` is `None` from a hub older than Revision 2; its firewall words
+    /// come only on Linux, when the port isn't open yet.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn register_raw(
         &self,
         r: &crate::Registration,
-    ) -> Result<(Zeroizing<String>, Option<String>), HubError> {
+    ) -> Result<(Zeroizing<String>, Option<String>, Option<String>), HubError> {
         let body = serde_json::to_value(r).map_err(|e| unreadable(&e))?;
         let v = self.call("POST", "apps", Some(&body))?;
         let secret = v["secret"]
             .as_str()
             .map(|s| Zeroizing::new(s.to_string()))
             .ok_or_else(|| unreadable(&"no secret"))?;
-        Ok((secret, v["pairing"].as_str().map(str::to_string)))
+        Ok((
+            secret,
+            v["pairing"].as_str().map(str::to_string),
+            v["firewall"]["words"].as_str().map(str::to_string),
+        ))
     }
 
     /// Unregister an app: its port closes and its phones are removed.

@@ -1,6 +1,7 @@
 //! Stage 10, parts A to C: what the hub gives ServicesKeep (Revision 4 of
 //! `docs/specs/keep-hub.md`): the probe, the tunnel hostname, and Fix as an admin request.
-//! The test names give the acceptance test they cover (56 to 61).
+//! The test names give the acceptance test they cover (56 to 61), and the owner's decisions
+//! of 2026-11-22 on them.
 //!
 //! Every request in these tests comes from 127.0.0.1. A "home" source (a private address
 //! on the Wi-Fi) can't be sent from a test, so that part of tests 56 and 58 is the unit test
@@ -349,35 +350,30 @@ fn at60_with_names_never_turned_on_the_moneykeep_name_routes_are_404() {
 
 // ----- 61: Fix as an admin request (Revision 4 C) -----------------------------------------------
 
+/// Owner decision 2026-11-22: on Windows the firewall needs an administrator's permission,
+/// which the service can't ask for, so Fix stays the app's `keep-hub fix-firewall` with
+/// Windows' prompt. The request says so and changes nothing.
 #[test]
-fn at61_fix_for_check_4_puts_the_rule_back_from_the_service() {
+fn at61_on_windows_fix_needs_windows_permission_prompt() {
     let f = Fixture::new();
     let a = TestApp::start("vacapick");
-    let b = TestApp::start("trips");
-    let pa = f.register(&a, false, false);
-    let pb = f.register(&b, false, false);
+    f.register(&a, false, false);
     // a Windows firewall without the hub's rule
     *f.machine.firewall.lock().unwrap() = Some(keep_hub::machine::FirewallScan::default());
     let body = json!({ "check": 4 });
     let r = f.admin_with(None, "POST", "/admin/v1/problems/fix", Some(body.clone()));
     assert_eq!(code_of(&r), (401, "administrator_needed".into()));
-    assert!(f.machine.fixes.lock().unwrap().is_empty());
-    let v = f.admin_ok("POST", "/admin/v1/problems/fix", Some(body));
-    // the rule, with every registered port and the certificate page's
-    let fixes = f.machine.fixes.lock().unwrap().clone();
-    assert_eq!(fixes.len(), 1);
-    let mut ports = fixes[0].0.ports.clone();
-    ports.sort_unstable();
-    let helper = f.hub().helper().unwrap().port();
-    let mut want = vec![pa, pb, helper];
-    want.sort_unstable();
-    assert_eq!(ports, want);
-    assert_eq!(fixes[0].0.name, "Keep Hub");
-    // and check 4's new result
-    assert_eq!(v["check"]["number"], 4);
-    assert_eq!(v["check"]["status"], "ok");
-    // Find the problem's check 4 offers it as this request too
-    *f.machine.firewall.lock().unwrap() = Some(keep_hub::machine::FirewallScan::default());
+    let r = f.admin("POST", "/admin/v1/problems/fix", Some(body));
+    assert_eq!(code_of(&r), (409, "permission_needed".into()));
+    assert!(r.json()["message"]
+        .as_str()
+        .unwrap()
+        .contains("fix-firewall"));
+    assert!(
+        f.machine.fixes.lock().unwrap().is_empty(),
+        "the service changed nothing"
+    );
+    // check 4 offers the command, with Windows' prompt
     let run = f.admin_ok("POST", "/admin/v1/problems", None);
     let action = run["checks"]
         .as_array()
@@ -386,12 +382,23 @@ fn at61_fix_for_check_4_puts_the_rule_back_from_the_service() {
         .find(|c| c["number"] == 4)
         .unwrap()["action"]
         .clone();
-    assert_eq!(action["path"], "/admin/v1/problems/fix");
-    assert_eq!(action["body"], json!({ "check": 4 }));
-    assert_eq!(
-        action["command"][1], "fix-firewall",
-        "kept for today's apps"
+    assert_eq!(action["command"][1], "fix-firewall");
+    assert!(action.get("path").is_none(), "not the admin request");
+}
+
+/// Where the hub manages no firewall (a Mac), Fix has nothing to do and answers check 4.
+#[test]
+fn at61_with_no_firewall_to_manage_fix_answers_check_4() {
+    let f = Fixture::new();
+    *f.machine.os.lock().unwrap() = keep_hub::machine::Os::Mac;
+    let v = f.admin_ok(
+        "POST",
+        "/admin/v1/problems/fix",
+        Some(json!({ "check": 4 })),
     );
+    assert_eq!(v["check"]["number"], 4);
+    assert_eq!(v["check"]["status"], "ok");
+    assert!(f.machine.fixes.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -433,4 +440,81 @@ fn at61_on_linux_fix_is_for_serviceskeep() {
         .unwrap()
         .contains("ServicesKeep"));
     assert!(f.machine.fixes.lock().unwrap().is_empty());
+}
+
+// ----- owner decision 2026-11-22: tunnel phones are counted by their own address --------------
+
+/// Through the tunnel every request comes from the connector on 127.0.0.1. Pairing's wrong
+/// tries are counted by the visitor's address that Cloudflare sends, so one visitor's wrong
+/// codes don't pause pairing for every phone away from home.
+#[test]
+fn through_the_tunnel_wrong_pairing_tries_are_counted_per_visitor() {
+    let f = Fixture::new();
+    let app = TestApp::start("vacapick");
+    f.register(&app, false, false);
+    let sam = f.add_member("Sam");
+    let try_from = |visitor: &str, code: &str| {
+        f.phone_json(
+            "vacapick",
+            "POST",
+            "/hub/pair",
+            &[("CF-Connecting-IP", visitor)],
+            &json!({ "code": code, "pin": support::PIN, "device": "phone" }),
+        )
+    };
+    for _ in 0..keep_hub::hub::MAX_FAILURES {
+        assert_eq!(try_from("198.51.100.7", "ZZZZ-ZZZZ").status, 403);
+    }
+    assert_eq!(
+        code_of(&try_from("198.51.100.7", "ZZZZ-ZZZZ")),
+        (429, "pairing_paused".into())
+    );
+    // another visitor through the same tunnel still pairs
+    let code = f.code(sam, "vacapick");
+    let r = try_from("203.0.113.20", &code);
+    assert_eq!(r.status, 200, "{}", r.text());
+    // and so does a phone at home (on this listener with no header: this computer's own)
+    let code = f.code(sam, "vacapick");
+    let r = f.phone_json(
+        "vacapick",
+        "POST",
+        "/hub/pair",
+        &[],
+        &json!({ "code": code, "pin": support::PIN, "device": "phone" }),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+}
+
+/// The header counts only on the tunnel's loopback listener: on the home address a phone
+/// can't choose the address its wrong tries are counted by. (127.0.0.2 stands for the
+/// tunnel's address, so this runs on Windows and Linux.)
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn on_the_home_address_the_header_doesnt_move_the_count() {
+    let mut f = Fixture::new();
+    f.tunnel_listen = std::net::Ipv4Addr::new(127, 0, 0, 2);
+    f.restart();
+    let app = TestApp::start("vacapick");
+    f.register(&app, false, false);
+    let sam = f.add_member("Sam");
+    for i in 0..keep_hub::hub::MAX_FAILURES {
+        let visitor = format!("198.51.100.{i}");
+        let r = f.phone_json(
+            "vacapick",
+            "POST",
+            "/hub/pair",
+            &[("CF-Connecting-IP", visitor.as_str())],
+            &json!({ "code": "ZZZZ-ZZZZ", "pin": support::PIN, "device": "phone" }),
+        );
+        assert_eq!(r.status, 403);
+    }
+    let code = f.code(sam, "vacapick");
+    let r = f.phone_json(
+        "vacapick",
+        "POST",
+        "/hub/pair",
+        &[("CF-Connecting-IP", "203.0.113.20")],
+        &json!({ "code": code, "pin": support::PIN, "device": "phone" }),
+    );
+    assert_eq!(code_of(&r), (429, "pairing_paused".into()));
 }

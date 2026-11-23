@@ -160,11 +160,6 @@ pub struct FirewallRule {
     pub profiles: Vec<String>,
     /// The program the rule is limited to (the installed hub).
     pub program: String,
-    /// The ports to let in: every registered app port and the certificate page's. A
-    /// Windows rule names the program and covers any port; a firewall that can't name a
-    /// program needs the ports.
-    #[serde(default)]
-    pub ports: Vec<u16>,
 }
 
 impl FirewallRule {
@@ -173,7 +168,6 @@ impl FirewallRule {
             name: FIREWALL_RULE.into(),
             profiles: vec!["Private".into(), "Domain".into()],
             program: program.display().to_string(),
-            ports: Vec::new(),
         }
     }
 
@@ -540,16 +534,6 @@ impl Machine for System {
 /// prompt): put the hub's rule back for `program`, and remove Windows' Block rules for it.
 /// What was done, in words.
 pub fn fix_firewall(machine: &dyn Machine, program: &Path) -> Result<Vec<String>, String> {
-    fix_firewall_for(machine, program, &[])
-}
-
-/// [`fix_firewall`] with the ports the rule must let in (the hub's own Fix, which knows
-/// them: `POST /admin/v1/problems/fix`).
-pub fn fix_firewall_for(
-    machine: &dyn Machine,
-    program: &Path,
-    ports: &[u16],
-) -> Result<Vec<String>, String> {
     let check = firewall_check(machine.firewall_scan()?);
     if !check.managed {
         return Ok(vec![
@@ -561,8 +545,7 @@ pub fn fix_firewall_for(
             "The firewall rule \"{FIREWALL_RULE}\" is in place."
         )]);
     }
-    let mut rule = FirewallRule::for_program(program);
-    rule.ports = ports.to_vec();
+    let rule = FirewallRule::for_program(program);
     let ids: Vec<String> = check.block_rules.iter().map(|r| r.id.clone()).collect();
     machine.fix_firewall(&rule, &ids)?;
     let mut done = vec![format!(

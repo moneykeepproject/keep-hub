@@ -354,3 +354,82 @@ Also:
   - `POST problems/fix`.
 - **Codes used:** `no_such_probe`, `bad_hostname`, `no_apps`, `name_service_refused`,
   `no_fix`, `fix_failed`, `fix_in_serviceskeep`, `firewall_ports_closed`.
+
+## Owner answers (2026-11-22)
+
+The questions of this report, answered. Where an answer changed what is described above,
+this section is the one that holds. `cargo xtask ci` on Linux then passed: 253 tests, with 4
+ignored.
+
+1. **A probe from an address that is neither private nor this computer's:** recorded as
+   `outside`, as built. The spec should name it as a fourth source.
+2. **Tunnel phones share one address:** count them by the visitor's address. Changed after
+   the report (`relay.rs`, `relay::visitor`).
+   - On the loopback listener the limits are counted by `CF-Connecting-IP` when it is a
+     valid address, and by the connection's own address otherwise. On the home address the
+     header is never believed.
+   - That covers the 8 connections per address (taken once the head is read, answering 503
+     `busy` above that), the wrong pairing tries, the waiting places for a body, and the
+     probe's one-a-second limit. The probe's source still comes from the connection (loopback
+     with the header is `tunnel`).
+   - The total of 64 connections per port is unchanged.
+   - Tests: `tunnel.rs` `through_the_tunnel_wrong_pairing_tries_are_counted_per_visitor` and
+     `on_the_home_address_the_header_doesnt_move_the_count`.
+   - A program on this computer could send the header to spread its wrong tries over made-up
+     addresses. The hundred-from-everyone limit still holds.
+   - This is a change to the request path: the spec writer should add it to Revision 4.
+3. **Fix inside the Windows service:** Windows' permission prompt is needed. Changed after
+   the report.
+   - `POST /admin/v1/problems/fix {check: 4}` now changes nothing on any system. On Windows it
+     answers 409 `permission_needed`: the app runs `keep-hub fix-firewall` with Windows'
+     prompt, as check 4's action says. On Linux it answers 409 `fix_in_serviceskeep`. Where
+     the hub manages no firewall (a Mac) it answers check 4's result.
+   - Check 4's action no longer offers the admin request: `method`, `path` and `body` are
+     gone.
+   - The firewall rule's `ports` (added above) are gone too, with nothing left to use them.
+   - Tests: `tunnel.rs` `at61_on_windows_fix_needs_windows_permission_prompt`,
+     `at61_with_no_firewall_to_manage_fix_answers_check_4`, `at61_on_linux_...`,
+     `at61_any_other_check_has_no_fix`.
+   - The spec writer should change Revision 4 C to say this.
+4. **PowerShell:** move check 4, Fix and the address list to `netsh` and the Windows API, as
+   a task of its own. Not done in this stage.
+   - Two parts need care. `netsh`'s output is in the computer's language, so it can't be read
+     by its labels. A network's profile (Public or Private, for check 3) isn't in `netsh`:
+     it is in the registry or the Network List Manager.
+   - A first look is in "For the next task" below.
+5. **The `.deb`'s maintainer:** `MoneyKeep Project <maintainer@getmoneykeep.org>`, the default
+   now. `KH_DEB_MAINTAINER` still overrides it.
+6. **`names.json` written by two threads:** one writer. Changed after the report.
+   - The names engine is now the only writer of `names.json`. Turning names on, a new address
+     and "Update the name" leave their change for the engine (`Asks` in `names.rs`), which
+     writes it at the start of its next run (at once: they wake it).
+   - `hub.json` is changed through `HubConfig::update`, one change at a time.
+   - The names and address tests pass as before.
+7. **App ports and the Linux firewall:** registering says so. Changed after the report.
+   - On Linux, when the firewall that is on doesn't let the app's port in, the registration's
+     answer has `"firewall": {"open": false, "words"}`. The words point to Fix in
+     ServicesKeep.
+   - The library gives the words in `Registered::firewall`.
+   - Test: `linux.rs` `on_linux_registering_says_when_the_firewall_keeps_the_port_closed`.
+
+## For the next task: Windows without PowerShell
+
+What uses PowerShell today, all in `machine.rs` (stage 5):
+
+- **The firewall scan:** the rule named "Keep Hub" and the Block rules naming `keep-hub.exe`.
+- **Fix:** putting the rule back and removing those Block rules.
+- **The address list:** adapters, MAC addresses, DHCP, and each network's profile.
+
+A way without it:
+
+- **The firewall:** `netsh advfirewall firewall show rule name="Keep Hub" verbose` and
+  `... add rule` / `delete rule`.
+  - `show rule` labels its fields in the computer's language, so it would be read by position
+    and checked on an English and a German Windows.
+  - The Windows Firewall COM interface (`INetFwPolicy2`) avoids that. windows-sys has no COM,
+    so that would need the `windows` crate, a new dependency to propose.
+- **Addresses:** `GetAdaptersAddresses` from windows-sys gives adapters, addresses, MAC
+  addresses and DHCP.
+- **The profile for check 3:** the Network List Manager (COM again), or the registry's
+  `NetworkList\Profiles\{guid}\Category`, matched to the adapter through its network's
+  signature, which takes more care.

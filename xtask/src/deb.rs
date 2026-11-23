@@ -50,10 +50,10 @@ pub fn deb_name(version: &str, arch: &str) -> String {
 }
 
 /// Who the package names as its maintainer: `KH_DEB_MAINTAINER` ("Name <address>"), or
-/// the publisher with a placeholder address (`.invalid`: none is decided yet).
+/// the publisher's (owner decision 2026-11-22).
 pub fn maintainer(var: Option<String>) -> String {
     var.filter(|m| m.contains('<') && m.ends_with('>'))
-        .unwrap_or_else(|| "MoneyKeep Project <maintainer@example.invalid>".into())
+        .unwrap_or_else(|| "MoneyKeep Project <maintainer@getmoneykeep.org>".into())
 }
 
 /// The package's `control` file.

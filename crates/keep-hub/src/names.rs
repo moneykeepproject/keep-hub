@@ -183,6 +183,20 @@ struct Live {
     code: Option<Zeroizing<String>>,
     force: bool,
     poked: bool,
+    /// What an admin request asked of `names.json`, for the engine to write: it is the
+    /// file's only writer, so a change can't be lost to another write at the same moment.
+    asks: Asks,
+}
+
+/// Changes to `names.json` asked by the admin address, applied by the engine.
+#[derive(Default)]
+struct Asks {
+    /// Try at once, whatever an earlier failure said (turning names on).
+    retry_now: bool,
+    /// Send the address again at once (a new address).
+    address_now: bool,
+    /// Send the address again even if the service has it ("Update the name").
+    resend: bool,
 }
 
 pub struct Names {
@@ -282,6 +296,7 @@ impl Names {
                 code: None,
                 force: false,
                 poked: true,
+                asks: Asks::default(),
             }),
             wake: Condvar::new(),
             running: Mutex::new(()),
@@ -310,9 +325,7 @@ impl Names {
 
     /// Write `names.enabled` to `hub.json`, keeping everything else in it.
     fn save_enabled(&self, enabled: bool) -> StoreResult<()> {
-        let mut cfg = HubConfig::load(&self.data)?;
-        cfg.names.enabled = enabled;
-        cfg.save(&self.data)
+        HubConfig::update(&self.data, |c| c.names.enabled = enabled)
     }
 
     fn set(&self, state: NameState, message: Option<String>) {
@@ -367,7 +380,7 @@ impl Names {
             return Err(p);
         }
         let code = code.map(str::trim).filter(|c| !c.is_empty());
-        let mut saved = self.load();
+        let saved = self.load();
         if self.registration(&saved, &settings).is_none() && code.is_none() {
             return Err(
                 "Enter the registration code for the name service: it's needed the first time."
@@ -375,12 +388,9 @@ impl Names {
             );
         }
         self.save_enabled(true)?;
-        // try at once, whatever an earlier failure said (the 7-day limit still holds)
-        saved.retry_at = 0;
-        saved.next_check = 0;
-        saved.address_retry_at = 0;
-        self.save(&saved)?;
         let mut l = self.live();
+        // try at once, whatever an earlier failure said (the 7-day limit still holds)
+        l.asks.retry_now = true;
         l.settings.enabled = true;
         if let Some(c) = code {
             l.code = Some(Zeroizing::new(c.to_string()));
@@ -467,9 +477,7 @@ impl Names {
     pub fn set_code_page(&self, page: &str) -> Result<(), String> {
         let page = page.trim();
         crate::config::check_code_page(page)?;
-        let mut cfg = HubConfig::load(&self.data)?;
-        cfg.names.code_page = page.to_string();
-        cfg.save(&self.data)?;
+        HubConfig::update(&self.data, |c| c.names.code_page = page.to_string())?;
         self.live().settings.code_page = page.to_string();
         Ok(())
     }
@@ -494,12 +502,8 @@ impl Names {
 
     /// The home address changed (or was lost): send it at once, and test the name again.
     pub fn set_address(&self, address: Option<Ipv4Addr>) {
-        let mut saved = self.load();
-        if saved.address_retry_at != 0 {
-            saved.address_retry_at = 0;
-            let _ = self.save(&saved);
-        }
         let mut l = self.live();
+        l.asks.address_now = true;
         l.address = address;
         l.tested = false;
         l.poked = true;
@@ -509,11 +513,27 @@ impl Names {
 
     /// Send the address to the name service again ("Update the name").
     pub fn resend_address(&self) {
-        let mut saved = self.load();
-        saved.address_sent = None;
-        saved.address_retry_at = 0;
-        let _ = self.save(&saved);
+        self.live().asks.resend = true;
         self.poke();
+    }
+
+    /// Apply what the admin address asked to `saved`, and write it. The engine only.
+    fn apply_asks(&self, saved: &mut Saved) {
+        let asks = std::mem::take(&mut self.live().asks);
+        if !(asks.retry_now || asks.address_now || asks.resend) {
+            return;
+        }
+        if asks.retry_now {
+            saved.retry_at = 0;
+            saved.next_check = 0;
+        }
+        saved.address_retry_at = 0;
+        if asks.resend {
+            saved.address_sent = None;
+        }
+        if let Err(e) = self.save(saved) {
+            (self.log)(&format!("names: {e}"));
+        }
     }
 
     /// The `names.*` settings in use, and the warning days.
@@ -605,6 +625,7 @@ impl Names {
             return;
         };
         let mut saved = self.load();
+        self.apply_asks(&mut saved);
 
         // 1. the registration
         let (id, name) = match self.registration(&saved, &settings) {

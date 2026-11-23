@@ -507,7 +507,7 @@ fn visit(
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     if let Some(nonce) = crate::probe::nonce_of(target) {
         let status = if method == "GET" {
-            hub.probe_request(nonce, peer.ip(), Arrived::Home, false)
+            hub.probe_request(nonce, peer.ip(), peer.ip(), Arrived::Home, false)
         } else {
             404
         };

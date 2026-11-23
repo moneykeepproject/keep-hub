@@ -136,6 +136,10 @@ pub struct Registered {
     /// The app was registered (again) just now, so the secret is new: a backend that is
     /// already running loads it again ([`HubAuth::load`]).
     pub now: bool,
+    /// On Linux, when the firewall doesn't let phones reach the app's port yet: words to
+    /// show, which point to ServicesKeep's Fix. (Only from a registration just now; Find the
+    /// problem's check 4 says it any time.)
+    pub firewall: Option<String>,
 }
 
 /// Register the app unless the hub already has it as described, with the secret this
@@ -170,13 +174,14 @@ pub fn ensure_registered(
             return Ok(Registered {
                 auth: HubAuth::new(&secret),
                 now: false,
+                firewall: None,
             });
         }
     }
     if r.pairing == CODE && lists_apps_without_pairing(&status) {
         return Err(r.needs_newer_hub(&status.version));
     }
-    let (secret, pairing) = hub.register_raw(r)?;
+    let (secret, pairing, firewall) = hub.register_raw(r)?;
     write_secret(app_data, &secret)?;
     // An app that asked for `code` and got an answer without `pairing` is talking to an
     // older hub: it must not offer pairing (Revision 2 A). The secret is kept all the same,
@@ -190,6 +195,7 @@ pub fn ensure_registered(
     Ok(Registered {
         auth: HubAuth::new(&secret),
         now: true,
+        firewall,
     })
 }
 

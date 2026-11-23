@@ -759,7 +759,12 @@ fn the_probe_the_tunnel_hostname_and_fix_through_the_library() {
     hub.clear_tunnel_hostname().unwrap();
     assert_eq!(hub.status().unwrap().tunnel.unwrap().hostname, None);
 
+    // on Windows Fix needs Windows' prompt (owner decision 2026-11-22)
     *f.machine.firewall.lock().unwrap() = Some(keep_hub::machine::FirewallScan::default());
+    assert_eq!(hub.fix(4).unwrap_err().code, "permission_needed");
+    // a Mac: no firewall the hub manages, nothing to fix
+    *f.machine.os.lock().unwrap() = keep_hub::machine::Os::Mac;
+    *f.machine.firewall.lock().unwrap() = None;
     let c = hub.fix(4).unwrap();
     assert_eq!((c.number, c.status.as_str()), (4, "ok"));
     assert_eq!(hub.fix(9).unwrap_err().code, "no_fix");

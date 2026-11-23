@@ -174,3 +174,55 @@ fn at62_the_deb_installs_a_service_as_keep_hub_and_dpkg_r_keeps_the_data() {
     assert_ne!(show("ActiveState").trim(), "active");
     assert!(std::path::Path::new("/var/lib/keep-hub/hub.json").is_file());
 }
+
+/// Owner decision 2026-11-22: on Linux the hub can't open an app's port, so registering
+/// says when the firewall doesn't let it in yet, for the app to show.
+#[test]
+fn on_linux_registering_says_when_the_firewall_keeps_the_port_closed() {
+    let f = Fixture::new();
+    *f.machine.os.lock().unwrap() = Os::Linux;
+    let helper = f.hub().helper().unwrap().port();
+    linux_firewall(&f, Some(Active::Ufw), &[helper]);
+    let app = TestApp::start("vacapick");
+    let port = support::free_port();
+    let v = f.admin_ok(
+        "POST",
+        "/admin/v1/apps",
+        Some(Fixture::registration(&app, port, false, false)),
+    );
+    assert_eq!(v["firewall"]["open"], false);
+    let words = v["firewall"]["words"].as_str().unwrap();
+    assert!(
+        words.contains(&port.to_string()) && words.contains("ServicesKeep"),
+        "{words}"
+    );
+    // with the port open, or no firewall on, nothing is said
+    linux_firewall(&f, Some(Active::Ufw), &[helper, port]);
+    let v = f.admin_ok(
+        "POST",
+        "/admin/v1/apps",
+        Some(Fixture::registration(&app, port, false, false)),
+    );
+    assert!(v.get("firewall").is_none());
+    linux_firewall(&f, None, &[]);
+    let other = TestApp::start("trips");
+    let v = f.admin_ok(
+        "POST",
+        "/admin/v1/apps",
+        Some(Fixture::registration(
+            &other,
+            support::free_port(),
+            false,
+            false,
+        )),
+    );
+    assert!(v.get("firewall").is_none());
+    // and not on Windows
+    *f.machine.os.lock().unwrap() = Os::Windows;
+    let v = f.admin_ok(
+        "POST",
+        "/admin/v1/apps",
+        Some(Fixture::registration(&app, port, false, false)),
+    );
+    assert!(v.get("firewall").is_none());
+}
