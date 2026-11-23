@@ -7,6 +7,10 @@ case "$1" in
         rm -rf /var/lib/keep-hub
         rm -f /etc/credstore.encrypted/keep-hub-master
         rm -rf /etc/systemd/system/keep-hub.service.d
+        # the certificate page's port, as postinst opened it (ServicesKeep removes its own)
+        if command -v ufw >/dev/null 2>&1; then
+            ufw delete allow 16080/tcp >/dev/null 2>&1 || true
+        fi
         systemctl daemon-reload || true
         ;;
 esac

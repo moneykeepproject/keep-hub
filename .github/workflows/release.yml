@@ -1,0 +1,89 @@
+# A draft release for a version tag (v0.1.0): the Windows setup, the Linux .deb and the Mac
+# disk image, each with its .sha256, and SHA256SUMS.txt. keep-launcher installs from these.
+# The Mac image is built on the project's own Mac (self-hosted): this workflow never runs on
+# pull requests, so no one else's code reaches that machine.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (stable)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: NSIS
+        run: choco install nsis --no-progress -y
+      # (unsigned: signing needs the certificate on the machine that builds, so a signed
+      # setup is built on the project's own computer until a signing service is chosen)
+      - name: The setup
+        run: cargo xtask installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/keep-hub-*-windows-x64-setup.exe
+            dist/keep-hub-*-windows-x64-setup.exe.sha256
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (stable)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - name: The package
+        run: cargo xtask deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/keep-hub_*.deb
+            dist/keep-hub_*.deb.sha256
+
+  mac:
+    runs-on: [self-hosted, macOS]
+    steps:
+      - uses: actions/checkout@v4
+      - name: The program
+        run: cargo build --release --locked -p keep-hub
+      - name: The disk image
+        run: |
+          version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          installer/macos/make-dmg.sh "$version" target/release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: |
+            dist/keep-hub-*-macos-*.dmg
+            dist/keep-hub-*-macos-*.dmg.sha256
+
+  draft:
+    needs: [windows, linux, mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - name: SHA256SUMS.txt
+        working-directory: files
+        run: sha256sum $(ls | grep -v '\.sha256$') > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: The draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" files/* --repo "$GITHUB_REPOSITORY" --draft \
+            --title "Keep Hub $TAG" --notes "Keep Hub $TAG: Windows setup, Linux package and Mac disk image."

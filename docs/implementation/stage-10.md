@@ -433,3 +433,89 @@ A way without it:
 - **The profile for check 3:** the Network List Manager (COM again), or the registry's
   `NetworkList\Profiles\{guid}\Category`, matched to the adapter through its network's
   signature, which takes more care.
+
+## The workflows (2026-11-22, after the report)
+
+The working tree had no `.github` folder, although stage 7 describes three workflows. They
+are written again (owner's request), and `cargo xtask workflows` passes:
+
+- **`ci.yml`:** `cargo xtask ci` on `ubuntu-latest`, `windows-latest` and `macos-latest`, for
+  pushes to `main`, pull requests, and by hand. Only GitHub's own actions are used
+  (`checkout`, `cache`); Rust comes from the runner's `rustup`.
+- **`windows.yml`:** `cargo xtask installer`, then the 0.0.1 setup, then each scenario of
+  `scripts/ci/windows-install.ps1` in order. The scenarios' notes are kept as an artifact.
+  NSIS comes from Chocolatey.
+- **`linux.yml`** (new):
+  1. `cargo xtask deb`, then ufw turned on.
+  2. **Test 62 as root**, built as the runner's user so `target/` stays theirs.
+  3. The ruleset captured with `nft -j list ruleset`, and **`at63_a_real_ufw_ruleset_...`**
+     run against it. It checks that check 4 reads ufw as on, with 16080 open and an app port
+     closed.
+  4. The hub's log, the unit's journal and the ruleset kept as an artifact, then `dpkg -P`,
+     checking that the data folder and the sealing key are gone.
+- **`release.yml`:** for a `v*` tag only (never pull requests, as `xtask workflows` requires
+  of the one workflow that uses the project's own Mac). It builds:
+  - the Windows setup (unsigned: signing needs the certificate on the building machine);
+  - the `.deb` on `ubuntu-latest`;
+  - the Mac disk image on `[self-hosted, macOS]`.
+
+  It then makes a draft release with every file, its `.sha256` and `SHA256SUMS.txt`.
+
+**Not checked here:** none of the workflows has run. They run on the first push to GitHub.
+Things that may need a change then:
+
+- the Mac runner's labels;
+- whether `choco install nsis` is quick on the runner;
+- whether the Ubuntu runner's address counts as a home address. It must be private: Azure
+  runners' `10.x` addresses are.
+
+**Checked here:** the parser of check 4 against a ruleset made with the real `nft` here:
+- a drop policy on input;
+- `tcp dport 16080 accept`, with a comment;
+- a set with a range, accepted;
+- a dropped port.
+
+`nft -j` puts a rule's comment beside `expr`, and the parser read 16080, 14443 and
+16443–16445 as open and 15443 as closed. There is no ufw here, so it read the firewall as
+plain nftables, which is right without ufw.
+
+- **`postrm`** on purge now also removes the ufw rule for 16080 that `postinst` added.
+
+## Windows without PowerShell (2026-11-22, after the report)
+
+The owner chose the suggestion: the `windows` crate (0.62, Microsoft's bindings, MIT OR
+Apache-2.0, Windows only) for COM, and `GetAdaptersAddresses` for the adapters. The rule
+"no PowerShell in Keep Hub" now holds everywhere.
+
+- **`winfw.rs`**, new:
+  - **The scan** goes through Windows Firewall's COM interface (`INetFwPolicy2`): the rules
+    named "Keep Hub", and the rules naming `keep-hub.exe`, read as their own values. Nothing
+    depends on the computer's language.
+  - **Fix** removes any rule named "Keep Hub", adds the rule again (the program, TCP,
+    inbound, allow, Private and Domain), and turns off Windows' Block rules for the hub.
+  - **The adapters** come from `GetAdaptersAddresses`: name, address, MAC address and DHCP.
+  - **Each network's profile** comes from the Network List Manager, matched to its adapter by
+    the adapter's id. It is named as PowerShell named it (`Public`, `Private`,
+    `DomainAuthenticated`), so check 3 is unchanged.
+- **Block rules are turned off, not deleted.** COM removes rules by name only, and an Allow
+  rule may share the name of a Block one (Windows makes both). Check 4 therefore counts only
+  Block rules that are on. Its words now say Fix "turns that rule off".
+- **`machine.rs`:**
+  - removed: the PowerShell scripts, their JSON readers, how PowerShell was started, and
+    "PowerShell is blocked";
+  - removed with them: three unit tests of the scripts;
+  - added: one test of the parts that need no Windows (the profile mask, category names,
+    MAC addresses, adapter ids);
+  - the Block-rule test now has a rule that is off.
+- **Not compiled here.** The Rust Windows target can't be downloaded in this sandbox, and
+  building it another way was refused. The calls were written against the `windows` 0.62.2
+  sources (every signature, type and constant checked there), but they first compile on
+  Windows.
+  - `cargo xtask ci` on Windows compiles them.
+  - `windows-install.ps1` (`windows.yml`) runs Fix for real: its `install` scenario checks
+    the rule the setup makes, and Fix runs through `keep-hub fix-firewall`.
+  - Worth one look by hand on your PC: delete the "Keep Hub" rule in Windows Defender
+    Firewall, run Find the problem, then Fix from an app.
+
+`cargo xtask ci` on Linux passed: 251 tests, with 5 ignored. That is three script tests
+fewer and one new.

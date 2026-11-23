@@ -3,7 +3,8 @@
 - **Area / module:** shared hub; new program `keep-hub` used by every Keep and Pick app
 - **Spec writer:** Claude session 2026-11-18 (spec-writer role; no target or prior-art source read)
 - **Date:** 2026-11-18
-- **Status:** draft; revision 4 (2026-11-22)
+- **Status:** draft; revision 4 (2026-11-22), amended the same day after stage 10's owner
+  answers (source 17)
 
 ## Sources
 
@@ -25,6 +26,8 @@
 | 14 | Owner decision | 2026-11-19: during the alpha, registration codes are given out by hand from one page on getmoneykeep.org, and every app's Phones screen links to it; a code is asked for only when a person sets up phone access | Revision 3 |
 | 15 | Owner decision | 2026-11-22: a new program, ServicesKeep (`docs/specs/serviceskeep.md` and `cloudflare-tunnel.md` in the `serviceskeep` repository), manages the Cloudflare tunnel, the home network fixes and later backups for the hub computer; the hub keeps only what it must own as the origin: a probe path, the tunnel hostname, Fix as an admin request, and a Linux service; Ubuntu and Windows first, macOS maybe later | Revision 4 |
 | 16 | Vendor doc | systemd: `systemd.service`, `systemd.exec` (`DynamicUser`, `StateDirectory`), `systemd-sysusers`; Debian Policy Manual chapter 7 | The Linux service and its package |
+| 17 | Owner decision | 2026-11-22, stage 10 (`docs/implementation/stage-10.md`, "Owner decisions" and "Owner answers"): `admin.token` on Linux is group `keep-hub`, mode 0640, with the installing person added to the group; Linux keys are sealed with systemd credentials, file permissions only as the fallback; the `.deb` opens the certificate page's port at install and ServicesKeep does Fix on Linux; a probe from an unexpected address is recorded as a fourth source, `outside`; through the tunnel, the limits counted per address are counted per visitor; Fix on Windows goes through Windows' permission prompt, so the admin request changes nothing; the `.deb`'s maintainer is `MoneyKeep Project <maintainer@getmoneykeep.org>`; the names state has one writer; registering an app on Linux says when its port is closed; moving the Windows code off PowerShell is a task of its own | Revision 4, amended |
+| 18 | Vendor doc | systemd: `systemd-creds`, `LoadCredentialEncrypted=` | Sealing keys on Linux |
 
 No target product was observed.
 
@@ -326,7 +329,9 @@ the admin address using the admin token from the hub's data folder:
   it keeps the app's phones and grants and gives a new secret.
 - A port already taken by another app, a `money` app with `guests`, or a protocol the hub
   does not know is refused with a plain message.
-- The hub opens the app's public port at once and adds it to the firewall rule.
+- The hub opens the app's public port at once. On Windows the firewall rule names the
+  hub's program, so it already covers the new port. On Linux the hub cannot change the
+  firewall, and the answer says when the port is closed (revision 4 D).
 - When an app's backend is not running, the hub answers 503 (`app_stopped`) on its port.
 - Unregistering closes the port, revokes the app's devices and removes its grants and
   unused invites. It needs an administrator's session. Removing the last app
@@ -731,8 +736,9 @@ built, the address is given at `keep-hub setup`, as in ShareKeep.
   carried over. Their ports stay the same, so a phone paired by address could keep its
   storage if the certificate authority is carried over too.
 - Reaching the hub from outside the home through Cloudflare is `cloudflare-tunnel.md`
-  in the `serviceskeep` repository (revision 4 gives the hub's part). The request path,
-  grants and headers here serve it unchanged.
+  in the `serviceskeep` repository (revision 4 gives the hub's part). Grants and headers
+  here serve it unchanged; the limits counted per address are counted per visitor through
+  the tunnel (revision 4 A).
 - IPv6 home addresses.
 - How phones with private DNS or relay features behave with a name that points to a home
   address. This needs testing on real iPhones and Android phones.
@@ -902,10 +908,17 @@ name service, not part of this revision.
 A new program, ServicesKeep (source 15), runs on the hub computer and manages the services
 around the hub: the Cloudflare tunnel that makes the hub reachable away from home, the
 home network's settings, and later backups. The hub does not create the tunnel, install
-the connector or change the firewall profile; ServicesKeep does. This revision adds the
-four things the hub must own for that to work, and the Linux service the Ubuntu-first
-decision needs. Nothing here changes the request path, grants or headers: they already
-serve a request that arrives through a tunnel unchanged.
+the connector or change the firewall; ServicesKeep, or the person with the computer's
+administrator rights, does. This revision adds the four things the hub must own for that
+to work, and the Linux service the Ubuntu-first decision needs.
+
+Grants and headers are unchanged: they already serve a request that arrives through a
+tunnel. The request path changes in one way: on the tunnel's loopback listener, the limits
+counted per address are counted per visitor (A).
+
+This revision was amended on 2026-11-22 after stage 10, with the owner's answers to that
+stage's questions (source 17). Where the amended text differs from the first form, the
+amended text holds.
 
 ### A. The probe
 
@@ -914,20 +927,30 @@ the hub reaches it. The hub answers one path for that and does nothing else with
 
 - **`GET /_probe/<nonce>`** on every app port and on the certificate page's port 16080.
   The nonce is 16 to 64 letters and digits; anything else is 404 with no record made.
-- The handler answers **204** with no body, records the nonce with the time and the
-  source (below), and does nothing else: it reads no header but the request line, needs
-  no device token, is not forwarded to any backend, and never touches the name service
-  or the connector.
-- Only a nonce the hub itself issued is recorded; an unknown nonce still answers 204 (so
-  the path tells an outsider nothing) and is counted, not kept.
-- **Rate limit:** one request a second from one address; above that, 429 with no record.
-  A thousand unknown nonces in an hour is logged once as a line without the nonces.
-- **Source.** The hub records how the request came: `home` when the source address is a
-  private address on this network and the request did not carry Cloudflare's connecting
-  address header; `tunnel` when it did; `this_computer` when the source is a loopback or
-  this computer's own address. Cloudflare's header is trusted only when the request
-  arrived on the loopback listener the tunnel's ingress points at (the tunnel's requests
-  come from the connector on 127.0.0.1), never on the Wi-Fi address.
+- The handler answers **204** with no body, records the nonce with
+  the time and the source (below), and does nothing else. It needs no device token, is
+  not forwarded to any backend, and never touches the name service or the connector. It
+  reads nothing but the request line, except on the loopback listener, where it also
+  reads whether Cloudflare's `CF-Connecting-IP` header is there and what it holds.
+- Only a nonce the hub itself issued is recorded; an unknown nonce of the right shape
+  still answers 204 (so the path tells an outsider nothing) and is counted, not kept.
+- **Rate limit:** one request a second from one visitor (below); above that, 429 with no
+  record. A thousand unknown nonces in an hour is logged once as a line without the
+  nonces.
+- **The loopback listener.** The tunnel's ingress points at `https://127.0.0.1:<app port>`
+  (`cloudflare-tunnel.md`, step 4), so every app port also listens on 127.0.0.1, beside
+  the home address. Cloudflare's header is believed only on that listener, never on the
+  Wi-Fi address. When the home address is itself a loopback address, as in tests, the two
+  are one listener, the loopback one.
+- **Source.** The hub records how the request came, from the connection itself:
+
+| Source | When |
+|---|---|
+| `tunnel` | It arrived on the loopback listener and carried `CF-Connecting-IP` |
+| `this_computer` | The source is a loopback address or this computer's own home address, without that header |
+| `home` | The source is a private or link-local address |
+| `outside` | Anything else: a public address reaching the Wi-Fi address, as through a port forwarded on the router |
+
 - **Admin address:** `POST /admin/v1/probe` (A) answers a fresh nonce, the address a phone
   should open (`https://<name>:<first app port>/_probe/<nonce>` when names are on,
   otherwise the address form on port 16080), and the nonce's life, 10 minutes.
@@ -935,6 +958,27 @@ the hub reaches it. The hub answers one path for that and does nothing else with
   `when` and `source`. A nonce is kept for its life only.
 - The probe path is the one path that may be left outside Access on a tunnel, because it
   gives nothing away. It is listed in `/hub/check`'s answer so an app can show it.
+
+#### Counting visitors through the tunnel
+
+Every request through the tunnel comes from the connector on 127.0.0.1. Counted by that
+address, one guest's wrong codes would pause pairing for every phone away from home. So,
+on the loopback listener only:
+
+- A request's **visitor** is the address in `CF-Connecting-IP` when it holds a valid IP
+  address, and the connection's own address otherwise.
+- These limits are counted per visitor instead of per address:
+  - the 8 connections from one address on an app port, counted once the request head is
+    read (above that, 503 `busy`);
+  - wrong pairing tries: ten from one visitor in 10 minutes pause pairing for that visitor
+    only;
+  - the waiting places for requests without a token that send a body;
+  - the probe's one request a second.
+- Unchanged: the 64 connections per app port, and the hundred wrong tries from everyone
+  together that pause pairing for everyone.
+- On the Wi-Fi address the header is never believed and moves no count.
+- A program on this computer could send the header with made-up addresses to spread its
+  wrong tries. The hundred-from-everyone limit still holds for it.
 
 ### B. The tunnel hostname
 
@@ -944,7 +988,8 @@ the hub reaches it. The hub answers one path for that and does nothing else with
 - The hub does nothing with it but **show it**: in the status on the admin address, so
   every app's Phones screen can say "away from home, open `https://<hostname>`", and in
   `/hub/check`. It does not make the name resolve, does not put it in a certificate (the
-  tunnel's edge certificate is Cloudflare's), and does not change which listeners it has.
+  tunnel's edge certificate is Cloudflare's), and setting it does not change which
+  listeners the hub has (the loopback listener of A is there either way).
 - `PUT /admin/v1/tunnel/moneykeep-name` (A) is Path B of `cloudflare-tunnel.md`: the hub
   asks the name service for a tunnel (`name-service.md` revision 1, `POST /hubs/<id>/tunnel`
   with the hub's first registered app port), with its hub token, and answers the tunnel
@@ -958,17 +1003,27 @@ the hub reaches it. The hub answers one path for that and does nothing else with
 
 ### C. Fix as an admin request
 
-Finding the problem's **Fix** (check 4: the firewall rule) is today run by an app's
-desktop program as `keep-hub fix-firewall` with the computer's administrator rights.
-This revision adds the same thing as a request, so a program need not know where the
-hub's executable is:
+Finding the problem's **Fix** for check 4 (the firewall) needs the computer's
+administrator rights, and the hub's service does not have them: on Windows,
+`NT SERVICE\KeepHub` may not change firewall rules, and on Linux ufw and firewalld refuse
+the service user. So the service never changes the firewall. The request tells a program
+what to do instead:
 
-- `POST /admin/v1/problems/fix` (A) with `{check: 4}`. The hub cannot elevate itself, so
-  the service does the work: on Windows the service already runs as `NT SERVICE\KeepHub`,
-  which may edit its own firewall rule; on Linux the service unit is granted the one
-  capability it needs for that (below). The answer is the check's new result.
-- `keep-hub fix-firewall` stays for the apps that call it today.
-- A Fix for any other check answers 400 `no_fix` with the check's one action in words.
+- `POST /admin/v1/problems/fix` (A) with `{check: 4}` **changes nothing on any system**.
+  It answers:
+
+| System | Answer |
+|---|---|
+| Windows | 409 `permission_needed`: the program runs `keep-hub fix-firewall` with Windows' permission prompt, as check 4's action says |
+| Linux | 409 `fix_in_serviceskeep`: Fix is ServicesKeep's (D) |
+| A system where the hub manages no firewall (a Mac) | Check 4's result: there is nothing to fix |
+
+- `keep-hub fix-firewall` stays, run with the computer's administrator rights. It is
+  Windows' Fix. Check 4's action names that command and does not offer this request.
+- The Windows rule names the hub's program, so it covers every app port without listing
+  them.
+- A Fix for any other check answers 400 `no_fix` with that check's one action in words. A
+  check number outside 1 to 10 answers 400 `bad_request`.
 
 ### D. The Linux service
 
@@ -979,27 +1034,67 @@ already builds and tests on Linux; this adds how it runs and installs there.
   `keep-hub` made by `systemd-sysusers`, never root, started at boot, restarted on
   failure. `StateDirectory=keep-hub` gives it `/var/lib/keep-hub` as the data folder,
   owned by that user; `hub.json`, `hub.sqlite`, `keys/` and `hub.log` as on Windows.
-  `admin.token` is readable by the computer's users as on Windows (group `keep-hub`,
-  mode 0640, with users added to the group at install, or world-readable: open point).
-- **Sealing keys:** the operating system's user-keyring or, where none, a file readable
-  by the service user only; the spec's "keys sealed by the operating system" is met as
-  well as Linux allows and the implementer says which.
-- **Firewall:** the hub's check 4 looks for an allow rule for every registered port in
-  whichever firewall is active (`ufw`, firewalld, or a plain nftables ruleset) and for
-  nothing blocking it; where no firewall is active, check 4 passes with the words "no
-  firewall is on". Fix adds the rules in the active firewall, and for that the unit has
-  `AmbientCapabilities=CAP_NET_ADMIN` and nothing else beyond a service's defaults.
-  Rules are commented "Keep Hub" so the check finds them.
+- **`admin.token`** is group `keep-hub`, mode 0640, so the computer's users may read it
+  as on Windows. The person who installs the package (the user behind `sudo` or
+  `pkexec`, never root) is added to the group.
+- **Sealing keys:** systemd credentials. At install, a random master key is sealed with
+  `systemd-creds` (with the computer's TPM where there is one, otherwise systemd's own key
+  for this computer) and given to the service with `LoadCredentialEncrypted=`; every key
+  file is sealed with it. Where `systemd-creds` is missing, the service still starts, and
+  keys are readable by the service user only. The status says which, in `keys`: `sealed`
+  and the words "Keys are sealed by systemd for this computer." or "Keys are protected by
+  file permissions only."
+- **Firewall:** the hub's check 4 looks for an allow rule for every registered port and
+  the certificate page's port in whichever firewall is on (`ufw`, firewalld, or a plain
+  nftables ruleset), and for nothing blocking it; where no firewall is on, check 4 passes
+  with the words "no firewall is on". It reads the rules from the nftables ruleset, and
+  for that the unit has `AmbientCapabilities=CAP_NET_ADMIN` and nothing else beyond a
+  service's defaults. A closed port fails check 4 as `firewall_ports_closed`, naming the
+  firewall and the ports, and the action is Fix in ServicesKeep.
+- **The hub changes no firewall rule on Linux.** The package opens the certificate page's
+  port at install, as root (in ufw, commented "Keep Hub", or in firewalld; a plain
+  nftables ruleset is left alone, since a rule added at run time is gone after a reboot).
+  An app's port is opened by ServicesKeep's Fix, with rules commented "Keep Hub" so the
+  check finds them.
+- **Registering an app on Linux** answers, when the firewall that is on does not let the
+  app's port in, `"firewall": {"open": false, "words"}`, with words pointing to Fix in
+  ServicesKeep. The registration itself succeeds. The library gives the words in
+  `Registered::firewall`, so the app can show them.
 - **Network type (check 3)** does not apply on Linux; the check passes with the words
   "not needed on this system".
-- **The package:** a `.deb` with the program, the unit, the sysusers file, the
-  `install-service` and `remove-service` commands kept for the launcher, and a `postinst`
-  that enables and starts the service. Until keep-launcher runs on Ubuntu, the `.deb` is
-  installed from the release page; the launcher adopts the same package later. Removing
-  with `dpkg -r` keeps `/var/lib/keep-hub`; `dpkg -P` asks nothing and deletes it, as
-  Debian's rules say, so the hub's Remove in ServicesKeep or the launcher does the asking.
+- **The package:** a `.deb` built by `cargo xtask deb`, with the program, the unit, the
+  sysusers file, the `install-service` and `remove-service` commands kept for the
+  launcher, and a `postinst` that enables and starts the service. Its maintainer is
+  `MoneyKeep Project <maintainer@getmoneykeep.org>`. Until keep-launcher runs on Ubuntu,
+  the `.deb` is installed from the release page; the launcher adopts the same package
+  later. Removing with `dpkg -r` keeps `/var/lib/keep-hub` and the sealed master key, so a
+  reinstall's keys still open; `dpkg -P` asks nothing and deletes both, as Debian's rules
+  say, so the hub's Remove in ServicesKeep or the launcher does the asking.
 - **The launcher's part**, as for Windows: a catalog entry whose Linux package is the
   `.deb`.
+
+### E. Also decided
+
+- **The names state has one writer.** A change asked for at the admin address (turning
+  names on, a new address, "Update the name") is handed to the names engine, which writes
+  it at once. No change is lost to another write. Changes to `hub.json` are made one at a
+  time.
+- **Windows without PowerShell** is a task of its own, not part of this revision. Check 3,
+  check 4, `keep-hub fix-firewall` and the address list still run PowerShell, from
+  MoneyKeep's code. `docs/implementation/stage-10.md`, "For the next task", has a
+  starting point. Whether that task adds the `windows` crate is decided when it starts.
+
+### The admin address
+
+These requests join the admin address's table:
+
+| Requests | Needs |
+|---|---|
+| Probe: issue a nonce (`POST probe`) | A |
+| Probe: was it seen (`GET probe/<nonce>`) | Admin token |
+| Tunnel hostname: set, clear (`PUT`, `DELETE tunnel`) | A |
+| MoneyKeep's tunnel: make, remove (`PUT`, `DELETE tunnel/moneykeep-name`) | A |
+| Fix (`POST problems/fix`) | A |
 
 This is stage 10 of the build order in `AGENTS.md`.
 
@@ -1013,11 +1108,12 @@ Acceptance tests:
 56. `GET /_probe/<nonce>` for a nonce the hub issued answers 204 with no body and no
     backend receives anything; `GET /admin/v1/probe/<nonce>` then shows `seen: yes` with
     a source of `home` for a private source address without Cloudflare's header, `tunnel`
-    for a loopback source with it, and `this_computer` for a loopback source without it.
-    A nonce with a space, shorter than 16 or longer than 64 characters answers 404 and
-    nothing is recorded. An unknown nonce of the right shape answers 204 and
-    `GET /admin/v1/probe/<it>` answers 404.
-57. A second probe request from one address within a second answers 429; a nonce is not
+    for a loopback source with it, `this_computer` for a loopback source without it, and
+    `outside` for a public source address on the Wi-Fi address. A nonce with a space,
+    shorter than 16 or longer than 64 characters answers 404 and nothing is recorded. An
+    unknown nonce of the right shape answers 204 and `GET /admin/v1/probe/<it>` answers
+    404.
+57. A second probe request from one visitor within a second answers 429; a nonce is not
     found after `probe.minutes`.
 58. Cloudflare's connecting-address header on a request that arrived on the Wi-Fi address
     is ignored: the source is `home`.
@@ -1028,22 +1124,30 @@ Acceptance tests:
     registered app port, answers the fake's token, the hub's data folder and log contain
     no part of it, and the status shows the fake's away name as the hostname; with
     `names.enabled` no it answers 404.
-61. `POST /admin/v1/problems/fix {check: 4}` with a fake firewall recreates the rule with
-    every registered port and answers check 4's new result; `{check: 7}` answers 400
+61. `POST /admin/v1/problems/fix {check: 4}` changes no firewall rule: with a fake Windows
+    it answers 409 `permission_needed`, with a fake Linux 409 `fix_in_serviceskeep`, and
+    with no firewall to manage it answers check 4's result; `{check: 7}` answers 400
     `no_fix` with the check's action in words.
 62. On the Linux runner (end-to-end): the `.deb` installs and starts the service as user
-    `keep-hub` with `/var/lib/keep-hub` as its data folder; other computers reach 16080
-    and the registered ports; the admin address is on 127.0.0.1 only; `dpkg -r` stops the
-    service and keeps the data folder.
+    `keep-hub` with `/var/lib/keep-hub` as its data folder and `admin.token` mode 0640,
+    group `keep-hub`; other computers reach 16080 and the registered ports; the admin
+    address is on 127.0.0.1 only; `dpkg -r` stops the service and keeps the data folder.
 63. On Linux, check 3 passes with "not needed on this system"; with no firewall active,
-    check 4 passes with "no firewall is on"; with a fake ufw missing a port, check 4 fails
-    and Fix adds exactly that port's rule commented "Keep Hub".
+    check 4 passes with "no firewall is on"; with a fake ufw missing an app's port, check 4
+    fails as `firewall_ports_closed`, naming exactly that port, with Fix in ServicesKeep
+    as its action.
+64. On the loopback listener, ten wrong pairing tries from one `CF-Connecting-IP` visitor
+    pause pairing for that visitor, and a phone with another visitor address still pairs.
+    On the Wi-Fi address, the header does not change how wrong tries are counted.
+65. On Linux, registering an app whose port the firewall that is on does not let in
+    succeeds and answers `firewall` with `open` no and words pointing to ServicesKeep; the
+    library gives the same words in `Registered::firewall`.
 
 Open points of this revision:
 
-- Whether `admin.token` on Linux is group-readable (users added to `keep-hub` at install)
-  or world-readable; the Windows rule is "the computer's users may read it".
-- Which Linux sealing the implementer can meet, and the words for the status when keys
-  are file-protected only.
 - Whether a Path B hub gets Cloudflare Access in front of its name, or relies on pairing
   alone (also open in `cloudflare-tunnel.md`).
+
+Decided in stage 10 (source 17), formerly open here: `admin.token` on Linux is
+group-readable (D), and Linux keys are sealed with systemd credentials, with the status
+words in D.

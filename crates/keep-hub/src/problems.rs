@@ -16,7 +16,7 @@
 //! | 10 | The hub answers `/hub/check` on its own name and each app port | None: the phone questions |
 //!
 //! Checks 5 to 8 are skipped while names are off. A check that couldn't be made (for
-//! example PowerShell is blocked) says so and doesn't stop the run. Some words are from
+//! example Windows Firewall can't be asked) says so and doesn't stop the run. Some words are from
 //! MoneyKeep's Wi-Fi capture checks.
 //!
 //! The firewall rule (owner decision 2026-11-18) is one rule for the hub program, any port:
@@ -266,7 +266,7 @@ fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
     let (code, words) = if !check.block_rules.is_empty() {
         (
             "firewall_blocked",
-            "Windows is blocking the hub. Windows made a rule that blocks keep-hub.exe (this happens when its \"allow access\" pop-up is closed). Fix removes that rule.",
+            "Windows is blocking the hub. Windows made a rule that blocks keep-hub.exe (this happens when its \"allow access\" pop-up is closed). Fix turns that rule off.",
         )
     } else if check.rule == RuleState::Disabled {
         (

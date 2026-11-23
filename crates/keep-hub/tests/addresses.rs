@@ -318,7 +318,7 @@ fn at20_the_checks_run_in_order_and_stop_at_the_first_failure() {
     assert_eq!(f.machine.fixes.lock().unwrap().len(), 2);
 
     // a firewall that can't be read says so and doesn't stop the run
-    *f.machine.firewall_error.lock().unwrap() = Some("PowerShell is blocked".into());
+    *f.machine.firewall_error.lock().unwrap() = Some("Windows Firewall can't be asked".into());
     let r = run(&f);
     assert_eq!(r["stopped_at"], Value::Null);
     assert_eq!(

@@ -2,9 +2,9 @@
 //! how Windows treats the network, and the firewall. Behind [`Machine`], so tests use a
 //! fake.
 //!
-//! Copied from MoneyKeep's capture server (`services.rs`: the firewall scan, Windows' own
-//! Block rules, the network profiles, the firewall script, the address list and its
-//! parsers, and how PowerShell is started), then changed for Keep Hub:
+//! Started from MoneyKeep's capture server (`services.rs`: the firewall check, Windows' own
+//! Block rules, the network profiles, the address list and its parsers), then changed for
+//! Keep Hub:
 //!
 //! - **One rule for the hub program** (owner decision 2026-11-18): inbound TCP to
 //!   `keep-hub.exe` on any port, Private and Domain networks only, never Public. Registering
@@ -14,11 +14,9 @@
 //! - **The home address** is the address of the adapter the default route uses
 //!   ([`default_route_address`]): the address a UDP socket would send from toward a public
 //!   address. Nothing is sent.
-//!
-//! PowerShell is started as MoneyKeep learned: `powershell -NoProfile -NonInteractive`,
-//! no console window, and without the caller's `PSModulePath` (Windows PowerShell started
-//! from PowerShell 7 otherwise can't load its own modules). A blocked PowerShell is named
-//! as such.
+//! - **No PowerShell** (owner decision 2026-11-22): on Windows the firewall, the network
+//!   profiles and the adapters are read through Windows' own interfaces ([`crate::winfw`]).
+//!   Stage 5 ran PowerShell scripts for them, as MoneyKeep does.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
@@ -107,8 +105,8 @@ pub struct FirewallCheck {
     /// This system's firewall is one the hub manages (Windows).
     pub managed: bool,
     pub rule: RuleState,
-    /// Inbound Block rules naming `keep-hub.exe` (Windows makes these when its "allow
-    /// access" pop-up is closed). Allow rules are never listed.
+    /// Inbound Block rules naming `keep-hub.exe`, turned on (Windows makes these when its
+    /// "allow access" pop-up is closed; Fix turns them off). Allow rules are never listed.
     pub block_rules: Vec<FoundRule>,
 }
 
@@ -142,7 +140,7 @@ pub fn firewall_check(scan: Option<FirewallScan>) -> FirewallCheck {
     let block_rules = scan
         .program_rules
         .iter()
-        .filter(|r| r.inbound() && r.is("Block") && r.names_program(HUB_EXE))
+        .filter(|r| r.enabled && r.inbound() && r.is("Block") && r.names_program(HUB_EXE))
         .cloned()
         .collect();
     FirewallCheck {
@@ -180,98 +178,6 @@ impl FirewallRule {
     }
 }
 
-fn ps_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-/// The PowerShell commands (Windows Defender Firewall) that put the rule back: an earlier
-/// rule of the same name and Windows' Block rules for the hub (by id) are removed first.
-pub fn firewall_script(rule: &FirewallRule, remove_ids: &[String]) -> Result<String, String> {
-    let profiles = rule.safe_profiles();
-    if profiles.is_empty() || rule.name.trim().is_empty() || rule.program.trim().is_empty() {
-        return Err(
-            "the firewall rule needs a name, the program and the Private or Domain profile".into(),
-        );
-    }
-    let removes: String = remove_ids
-        .iter()
-        .map(|id| {
-            format!(
-                "Remove-NetFirewallRule -Name {} -ErrorAction SilentlyContinue; ",
-                ps_literal(id)
-            )
-        })
-        .collect();
-    Ok(format!(
-        "{removes}Remove-NetFirewallRule -DisplayName {name} -ErrorAction SilentlyContinue; \
-         New-NetFirewallRule -DisplayName {name} -Description {desc} -Direction Inbound -Action Allow \
-         -Protocol TCP -Profile {profiles} -Program {program} | Out-Null",
-        name = ps_literal(&rule.name),
-        desc = ps_literal("Lets phones on your home or office network reach the Keep and Pick apps on this computer."),
-        profiles = profiles.join(","),
-        program = ps_literal(&rule.program),
-    ))
-}
-
-/// The PowerShell script that lists the rules named `rule_name` and the rules naming
-/// `program` (by file name) as one JSON object; reads only (no administrator rights).
-pub fn firewall_scan_script(rule_name: &str, program: &str) -> String {
-    let row = "ForEach-Object { $f = $_ | Get-NetFirewallApplicationFilter; [pscustomobject]@{ id = [string]$_.Name; display_name = [string]$_.DisplayName; enabled = ([string]$_.Enabled -eq 'True'); action = [string]$_.Action; direction = [string]$_.Direction; program = [string]$f.Program } }";
-    format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; \
-         $named = @(Get-NetFirewallRule -DisplayName {name} | {row}); \
-         $prog = @(Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -and ((Split-Path -Leaf $_.Program) -ieq {program}) }} | Get-NetFirewallRule | {row}); \
-         ConvertTo-Json -Depth 4 -Compress -InputObject ([pscustomobject]@{{ named = $named; program_rules = $prog }})",
-        name = ps_literal(rule_name),
-        program = ps_literal(program),
-    )
-}
-
-/// One object or a list of them (PowerShell's ConvertTo-Json writes a single element
-/// without the list).
-fn one_or_many<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Vec<T> {
-    match v {
-        serde_json::Value::Array(a) => a
-            .into_iter()
-            .filter_map(|x| serde_json::from_value(x).ok())
-            .collect(),
-        serde_json::Value::Null => Vec::new(),
-        other => serde_json::from_value(other).ok().into_iter().collect(),
-    }
-}
-
-/// Read [`firewall_scan_script`]'s output.
-pub fn parse_firewall_scan(json: &str) -> Result<FirewallScan, String> {
-    let text = json.trim();
-    if text.is_empty() {
-        return Ok(FirewallScan::default());
-    }
-    let mut v: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| format!("the firewall list was not understood: {e}"))?;
-    Ok(FirewallScan {
-        named: one_or_many(
-            v.get_mut("named")
-                .map(serde_json::Value::take)
-                .unwrap_or_default(),
-        ),
-        program_rules: one_or_many(
-            v.get_mut("program_rules")
-                .map(serde_json::Value::take)
-                .unwrap_or_default(),
-        ),
-        linux: None,
-    })
-}
-
-/// The PowerShell script listing IPv4 addresses with adapter, MAC address and network
-/// profile as JSON (Windows; `Get-NetIPAddress`, `Get-NetAdapter`,
-/// `Get-NetConnectionProfile`).
-pub const ADDRESSES_SCRIPT: &str = "ConvertTo-Json -Compress -InputObject @(Get-NetIPAddress -AddressFamily IPv4 | \
-     ForEach-Object { $a = Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue; \
-     $p = Get-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue; \
-     [pscustomobject]@{ address = $_.IPAddress; adapter = $_.InterfaceAlias; mac = [string]$a.MacAddress; \
-     profile = [string]$p.NetworkCategory; dhcp = ([string]$_.PrefixOrigin -eq 'Dhcp') } })";
-
 /// A home or office address (RFC 1918): the only kind the hub publishes.
 pub fn is_home(ip: Ipv4Addr) -> bool {
     ip.is_private()
@@ -279,18 +185,6 @@ pub fn is_home(ip: Ipv4Addr) -> bool {
 
 fn usable(ip: &str) -> bool {
     ip.parse::<Ipv4Addr>().is_ok_and(is_home)
-}
-
-/// Parse the Windows script's JSON.
-pub fn parse_windows_addresses(json: &str) -> Vec<LocalAddress> {
-    one_or_many::<LocalAddress>(serde_json::from_str(json.trim()).unwrap_or_default())
-        .into_iter()
-        .filter(|a| usable(&a.address))
-        .map(|mut a| {
-            a.mac = a.mac.replace('-', ":").to_ascii_lowercase();
-            a
-        })
-        .collect()
 }
 
 /// Parse `ip -o -4 addr show` (Linux); `mac` reads an adapter's MAC address.
@@ -425,9 +319,6 @@ pub struct System;
 fn run_hidden(program: &str, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
-    if program.eq_ignore_ascii_case("powershell") {
-        cmd.env_remove("PSModulePath");
-    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -436,44 +327,6 @@ fn run_hidden(program: &str, args: &[&str]) -> Result<std::process::Output, Stri
     }
     cmd.output()
         .map_err(|e| format!("{program} couldn't start: {e}"))
-}
-
-/// The error text of a PowerShell step that was blocked rather than failed.
-pub fn powershell_blocked(error: &str) -> bool {
-    let e = error.to_ascii_lowercase();
-    [
-        "language mode",
-        "constrainedlanguage",
-        "only on core types",
-        "running scripts is disabled",
-        "pssecurityexception",
-        "unauthorizedaccess",
-        "blocked by group policy",
-        "blocked by your system administrator",
-        "applocker",
-        "cannot run powershell",
-    ]
-    .iter()
-    .any(|w| e.contains(w))
-}
-
-/// A PowerShell script's standard output.
-fn powershell(script: &str) -> Result<String, String> {
-    let out = run_hidden(
-        "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", script],
-    )?;
-    if out.status.success() {
-        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-    }
-    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if powershell_blocked(&err) {
-        Err(format!(
-            "Windows blocked a PowerShell step (it may be restricted by your organisation). ({err})"
-        ))
-    } else {
-        Err(format!("powershell failed: {err}"))
-    }
 }
 
 impl Machine for System {
@@ -488,11 +341,13 @@ impl Machine for System {
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         };
-        if cfg!(windows) {
-            powershell(ADDRESSES_SCRIPT)
-                .map(|t| parse_windows_addresses(&t))
-                .unwrap_or_default()
-        } else if cfg!(target_os = "macos") {
+        #[cfg(windows)]
+        {
+            let _ = text;
+            crate::winfw::addresses()
+        }
+        #[cfg(not(windows))]
+        if cfg!(target_os = "macos") {
             text("ifconfig", &[])
                 .map(|t| parse_ifconfig(&t))
                 .unwrap_or_default()
@@ -516,17 +371,24 @@ impl Machine for System {
                 ..FirewallScan::default()
             }));
         }
-        if !cfg!(windows) {
-            return Ok(None);
+        #[cfg(windows)]
+        {
+            crate::winfw::scan(FIREWALL_RULE, HUB_EXE).map(Some)
         }
-        parse_firewall_scan(&powershell(&firewall_scan_script(FIREWALL_RULE, HUB_EXE))?).map(Some)
+        #[cfg(not(windows))]
+        Ok(None)
     }
 
     fn fix_firewall(&self, rule: &FirewallRule, remove_ids: &[String]) -> Result<(), String> {
-        if !cfg!(windows) {
-            return Err("only the Windows firewall is managed by Keep Hub".into());
+        #[cfg(windows)]
+        {
+            crate::winfw::fix(rule, remove_ids)
         }
-        powershell(&firewall_script(rule, remove_ids)?).map(|_| ())
+        #[cfg(not(windows))]
+        {
+            let _ = (rule, remove_ids);
+            Err("only the Windows firewall is managed by Keep Hub".into())
+        }
     }
 }
 
@@ -553,7 +415,7 @@ pub fn fix_firewall(machine: &dyn Machine, program: &Path) -> Result<Vec<String>
     )];
     if !ids.is_empty() {
         done.push(format!(
-            "{} rule(s) Windows made to block the hub were removed.",
+            "{} rule(s) Windows made to block the hub were turned off.",
             ids.len()
         ));
     }
@@ -603,48 +465,19 @@ mod tests {
                     r"C:\Program Files\Keep Hub\keep-hub.exe",
                 ),
                 rule("other", true, "Block", r"C:\x\other.exe"),
+                // one Fix turned off: it blocks nothing
+                rule(
+                    "keep-hub.exe",
+                    false,
+                    "Block",
+                    r"C:\Program Files\Keep Hub\keep-hub.exe",
+                ),
             ],
             linux: None,
         }));
         assert_eq!(c.rule, RuleState::Ok);
         assert_eq!(c.block_rules.len(), 1, "only Block rules naming the hub");
         assert!(!c.ok());
-    }
-
-    #[test]
-    fn the_script_keeps_to_private_and_domain_and_quotes_safely() {
-        let mut r = FirewallRule::for_program(Path::new(r"C:\Program Files\Keep Hub\keep-hub.exe"));
-        r.profiles.push("Public".into());
-        let s = firewall_script(&r, &["{abc'd}".to_string()]).unwrap();
-        assert!(s.contains("-Profile Private,Domain "));
-        assert!(!s.contains("Public"));
-        assert!(s.contains(r"-Program 'C:\Program Files\Keep Hub\keep-hub.exe'"));
-        assert!(s.starts_with("Remove-NetFirewallRule -Name '{abc''d}'"));
-        assert!(!s.contains("-LocalPort"), "any port the hub listens on");
-        r.profiles = vec!["Public".into()];
-        assert!(firewall_script(&r, &[]).is_err());
-    }
-
-    #[test]
-    fn powershells_json_is_read_one_or_many() {
-        let one = r#"{"named":{"id":"a","display_name":"Keep Hub","enabled":true,"action":"Allow","direction":"Inbound","program":"x"},"program_rules":[]}"#;
-        let s = parse_firewall_scan(one).unwrap();
-        assert_eq!(s.named.len(), 1);
-        assert!(s.program_rules.is_empty());
-        assert_eq!(parse_firewall_scan("  ").unwrap(), FirewallScan::default());
-        assert!(parse_firewall_scan("not json").is_err());
-        let addrs = parse_windows_addresses(
-            r#"[{"address":"192.168.1.20","adapter":"Wi-Fi","mac":"AA-BB-CC-DD-EE-FF","profile":"Private","dhcp":true},
-                {"address":"127.0.0.1","adapter":"Loopback","mac":"","profile":"","dhcp":false},
-                {"address":"169.254.3.4","adapter":"Ethernet 2","mac":"","profile":"","dhcp":false}]"#,
-        );
-        assert_eq!(addrs.len(), 1);
-        assert_eq!(addrs[0].mac, "aa:bb:cc:dd:ee:ff");
-        assert_eq!(addrs[0].profile, "Private");
-        let single = parse_windows_addresses(
-            r#"{"address":"10.0.0.5","adapter":"Ethernet","mac":"","profile":"Public","dhcp":false}"#,
-        );
-        assert_eq!(single[0].adapter, "Ethernet");
     }
 
     #[test]
@@ -687,14 +520,6 @@ mod tests {
             Some(Ipv4Addr::new(10, 0, 0, 5))
         );
         assert_eq!(choose("Bluetooth", wifi, list), None);
-    }
-
-    #[test]
-    fn a_blocked_powershell_is_recognised() {
-        assert!(powershell_blocked("Cannot invoke method. Method invocation is supported only on core types in this language mode."));
-        assert!(!powershell_blocked(
-            "Get-NetFirewallRule: No MSFT_NetFirewallRule objects found"
-        ));
     }
 
     struct Fake {

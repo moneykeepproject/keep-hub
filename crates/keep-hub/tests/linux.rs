@@ -226,3 +226,18 @@ fn on_linux_registering_says_when_the_firewall_keeps_the_port_closed() {
     );
     assert!(v.get("firewall").is_none());
 }
+
+/// Acceptance test 63 against a real ruleset: the one the Linux workflow captures with ufw on
+/// after the package opened 16080 (`KH_NFT_RULESET`, the output of `nft -j list ruleset`).
+/// Ignored by default: it needs that file.
+#[test]
+#[ignore = "needs a captured ruleset: KH_NFT_RULESET=<file>"]
+fn at63_a_real_ufw_ruleset_reads_as_ufw_with_16080_open() {
+    let path = std::env::var("KH_NFT_RULESET").expect("KH_NFT_RULESET=<file>");
+    let json = std::fs::read_to_string(&path).unwrap();
+    let conf = std::fs::read_to_string("/etc/ufw/ufw.conf").ok();
+    let fw = keep_hub::linuxfw::read(conf.as_deref(), false, Ok(json)).unwrap();
+    assert_eq!(fw.active, Some(Active::Ufw), "{fw:?}");
+    assert!(fw.is_open(16080), "{fw:?}");
+    assert!(!fw.is_open(16443), "an app port nobody opened: {fw:?}");
+}

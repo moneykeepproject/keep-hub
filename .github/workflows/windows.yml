@@ -1,0 +1,71 @@
+# The Windows setup run for real: scripts/ci/windows-install.ps1, its scenarios in order on
+# one runner (acceptance tests 24, 25 and 26). The script is a CI script: PowerShell runs
+# here, never in Keep Hub or its setup.
+name: Windows setup
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (stable)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-setup-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-setup-
+      - name: NSIS
+        run: choco install nsis --no-progress -y
+      - name: The setup
+        run: cargo xtask installer
+      - name: An older setup (0.0.1), for the scenario that refuses it
+        shell: pwsh
+        run: |
+          $env:KEEP_HUB_VERSION = '0.0.1'
+          cargo xtask installer --skip-build --bin target/release
+      - name: Install with no app registered
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario install
+      - name: Update
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario upgrade
+      - name: An older version refused
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario older
+      - name: Two apps register
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario apps
+      - name: Remove refused while apps are registered
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario remove-refused
+      - name: Remove
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario remove
+      - name: Install again
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario reinstall
+      - name: Remove everything
+        shell: powershell
+        run: .\scripts\ci\windows-install.ps1 -Scenario clean
+      - name: The scenarios' notes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-notes
+          path: ${{ runner.temp }}/kh-artifacts
+          if-no-files-found: ignore

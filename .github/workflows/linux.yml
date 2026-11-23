@@ -1,0 +1,68 @@
+# The Linux package run for real (Revision 4 D): the .deb installed on a runner with systemd,
+# acceptance test 62 (ignored in cargo test, run here as root), with ufw on so the package
+# opens the certificate page's port in it. The runner's ruleset is kept as an artifact, and
+# check 4's reading of it is tested against it.
+name: Linux package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (stable)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-deb-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-deb-
+      - name: The package
+        run: cargo xtask deb
+      - name: ufw on (incoming refused, outgoing allowed)
+        run: sudo ufw --force enable && sudo ufw status verbose
+      # (the tests are built as the runner's user and only run as root, so target/ stays
+      # the user's for the steps after)
+      - name: Acceptance test 62 (install, the service as keep-hub, dpkg -r keeps the data)
+        run: |
+          tests="$(cargo test -p keep-hub --test linux --no-run 2>&1 | sed -n 's/.*(\(target\/debug\/deps\/linux-[0-9a-f]*\)).*/\1/p' | head -n1)"
+          test -x "$tests"
+          sudo "$tests" at62 --ignored --nocapture
+      - name: The ruleset with Keep Hub's port in ufw
+        if: always()
+        run: sudo nft -j list ruleset > "$RUNNER_TEMP/nft-ruleset.json"
+      - name: Check 4 reads that ruleset
+        run: KH_NFT_RULESET="$RUNNER_TEMP/nft-ruleset.json" cargo test -p keep-hub --test linux at63_a_real -- --ignored
+      - name: The hub's log, the unit's journal and the ruleset
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux-notes"
+          sudo cp /var/lib/keep-hub/hub.log "$RUNNER_TEMP/linux-notes/" || true
+          sudo journalctl -u keep-hub.service --no-pager > "$RUNNER_TEMP/linux-notes/journal.txt" || true
+          cp "$RUNNER_TEMP/nft-ruleset.json" "$RUNNER_TEMP/linux-notes/" || true
+          sudo chmod -R a+r "$RUNNER_TEMP/linux-notes"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-notes
+          path: ${{ runner.temp }}/linux-notes
+          if-no-files-found: ignore
+      - name: Purge (the data folder, the sealing key and the drop-in go)
+        if: always()
+        run: |
+          sudo dpkg -P keep-hub || true
+          test ! -e /var/lib/keep-hub
+          test ! -e /etc/credstore.encrypted/keep-hub-master

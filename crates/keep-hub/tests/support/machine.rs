@@ -12,7 +12,7 @@ pub struct FakeMachine {
     pub addresses: Mutex<Vec<LocalAddress>>,
     /// `None`: a firewall the hub doesn't manage; `Some`: Windows' rules.
     pub firewall: Mutex<Option<FirewallScan>>,
-    /// The firewall can't be read (PowerShell blocked).
+    /// The firewall can't be read (Windows Firewall didn't answer).
     pub firewall_error: Mutex<Option<String>>,
     /// Every Fix: the rule and the Block rules removed.
     pub fixes: Mutex<Vec<(FirewallRule, Vec<String>)>>,

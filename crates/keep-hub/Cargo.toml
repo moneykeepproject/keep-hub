@@ -33,6 +33,19 @@ rustls-platform-verifier.workspace = true
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography"] }
 windows-service = "0.8"
+# Windows' firewall and network list (COM) and its adapters, instead of PowerShell (owner
+# decision 2026-11-22). MIT OR Apache-2.0, Microsoft's own bindings; windows-sys has no COM.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_NetworkListManager",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

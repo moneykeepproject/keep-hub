@@ -47,6 +47,7 @@ pub mod relay;
 pub mod seal;
 pub mod service;
 pub mod util;
+pub mod winfw;
 
 pub use config::HubConfig;
 pub use hub::{admin_token, reset_administrator, setup, start, HubOptions, Running};
