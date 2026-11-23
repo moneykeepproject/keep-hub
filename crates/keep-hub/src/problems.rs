@@ -163,11 +163,14 @@ fn network_private(hub: &Arc<Hub>) -> Vec<Check> {
     if hub.machine.os() == machine::Os::Linux {
         return vec![ok(3, "network_private", "Not needed on this system.")];
     }
+    // the address the computer is on now: on a Public network it isn't taken as home, so
+    // the home address kept may not be it (Revision 5 D)
+    let now = hub.computers_address().unwrap_or(ip);
     let here = hub
         .machine
         .addresses()
         .into_iter()
-        .find(|a| a.address == ip.to_string());
+        .find(|a| a.address == now.to_string());
     vec![match here {
         Some(a) if a.profile.eq_ignore_ascii_case("public") => failed(
             3,
@@ -471,13 +474,32 @@ fn apps(hub: &Arc<Hub>) -> Vec<Check> {
     let apps = hub.lock().registry.apps().unwrap_or_default();
     for a in &apps {
         let at = SocketAddr::from((Ipv4Addr::LOCALHOST, a.loopback_port));
-        if TcpStream::connect_timeout(&at, Duration::from_millis(500)).is_err() {
+        let start = || Some(json!({ "kind": "start_app", "label": "Start that app", "app": a.id }));
+        let Ok(mut tcp) = TcpStream::connect_timeout(&at, Duration::from_millis(500)) else {
             return vec![failed(
                 9,
                 "app_stopped",
                 format!("{} isn't running on this computer.", a.title),
-                Some(json!({ "kind": "start_app", "label": "Start that app", "app": a.id })),
+                start(),
             )];
+        };
+        // protocol 2: whatever answers proves it holds the app's secret (Revision 5 A)
+        if a.protocol >= 2 {
+            let Some((_, secret)) = hub.backend(&a.id) else {
+                continue;
+            };
+            if let Err(e) = crate::proof::hello(&mut tcp, &secret) {
+                let r = crate::relay::unverified(&a.title);
+                return vec![match e {
+                    crate::proof::Hello::Stopped => failed(
+                        9,
+                        "app_stopped",
+                        format!("{} isn't running on this computer.", a.title),
+                        start(),
+                    ),
+                    crate::proof::Hello::Unverified => failed(9, r.code, r.message, start()),
+                }];
+            }
         }
     }
     vec![ok(9, "apps", "Every app's own part is running.")]

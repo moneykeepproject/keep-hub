@@ -444,11 +444,12 @@ fn at61_on_linux_fix_is_for_serviceskeep() {
 
 // ----- owner decision 2026-11-22: tunnel phones are counted by their own address --------------
 
-/// Through the tunnel every request comes from the connector on 127.0.0.1. Pairing's wrong
+/// Acceptance test 64 (Revision 4, amended). Through the tunnel every request comes from the
+/// connector on 127.0.0.1. Pairing's wrong
 /// tries are counted by the visitor's address that Cloudflare sends, so one visitor's wrong
 /// codes don't pause pairing for every phone away from home.
 #[test]
-fn through_the_tunnel_wrong_pairing_tries_are_counted_per_visitor() {
+fn at64_through_the_tunnel_wrong_pairing_tries_are_counted_per_visitor() {
     let f = Fixture::new();
     let app = TestApp::start("vacapick");
     f.register(&app, false, false);
@@ -490,7 +491,7 @@ fn through_the_tunnel_wrong_pairing_tries_are_counted_per_visitor() {
 /// tunnel's address, so this runs on Windows and Linux.)
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn on_the_home_address_the_header_doesnt_move_the_count() {
+fn at64_on_the_home_address_the_header_doesnt_move_the_count() {
     let mut f = Fixture::new();
     f.tunnel_listen = std::net::Ipv4Addr::new(127, 0, 0, 2);
     f.restart();

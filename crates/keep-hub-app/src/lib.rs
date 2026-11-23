@@ -31,8 +31,15 @@
 //!
 //! // the backend, at start
 //! let auth = HubAuth::load(app_data)?;
-//! let headers = [("Keep-Hub-Auth", "...")]; // from each request
-//! match auth.check(headers) {
+//! // each request: the connection's address, the path and the headers
+//! let peer: std::net::SocketAddr = "127.0.0.1:50000".parse().unwrap();
+//! let headers = [("Keep-Hub-Auth", "...")];
+//! if let Some(hello) = auth.hello(peer, "/api/trips", &headers) {
+//!     // the hub's hello: answer hello.status with hello.headers (or the refusal) and
+//!     // keep the connection open for the request that follows
+//!     return Ok(());
+//! }
+//! match auth.check_from(peer, &headers) {
 //!     Ok(Some(caller)) => { /* /api/: caller.member, caller.device, ... */ }
 //!     Ok(None) => { /* through the hub, no phone identity: the web client's files */ }
 //!     Err(refused) => { /* answer refused.status with refused.code */ }
@@ -43,17 +50,23 @@
 
 mod auth;
 mod client;
+mod listener;
 mod offer;
 mod owner;
 mod register;
 pub mod seal;
 
-pub use auth::{listen, Caller, Header, HubAuth, Refused};
+pub use auth::{
+    listen, proofs, Caller, Header, Hello, HubAuth, Refused, CHALLENGE, HELLO_PATH, PROOF,
+};
 pub use client::{
     default_data_folder, find, AppState, Device, Found, Grant, HubApp, HubClient, HubError,
     HubStatus, Invite, Member, MoneyKeepTunnel, Pairing, Probe, ProbeSeen, ProblemCheck, Problems,
     SignedIn, TunnelStatus, ADMINISTRATOR, STANDARD,
 };
+#[cfg(debug_assertions)]
+pub use listener::expect_this_account;
+pub use listener::Listener;
 pub use offer::{
     make_this_the_hub, offer, start_command, Launcher, Next, Offer, DOWNLOAD_PAGE, LAUNCHER_ENTRY,
 };
@@ -63,4 +76,6 @@ pub use register::{
 };
 
 /// The hub protocol this library speaks (the hub accepts every older number it supported).
-pub const PROTOCOL: u32 = 1;
+/// Protocol 2 (Revision 5 A): the backend proves it holds the shared secret before the hub
+/// sends it anything ([`HubAuth::hello`]).
+pub const PROTOCOL: u32 = 2;

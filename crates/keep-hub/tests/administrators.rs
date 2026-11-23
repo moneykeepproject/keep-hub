@@ -786,7 +786,7 @@ fn at33_a_forwarded_request_carries_the_members_class_and_never_the_phones() {
         // the phone learns its own class
         let whoami = f.api("trips", &token, "GET", "/hub/whoami").json();
         assert_eq!(whoami["member"]["class"], class);
-        assert_eq!(whoami["hub"]["protocols"], json!([1]));
+        assert_eq!(whoami["hub"]["protocols"], json!([1, 2]));
     }
 }
 

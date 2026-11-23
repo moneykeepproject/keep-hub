@@ -121,11 +121,13 @@ fn the_status_says_how_keys_are_kept() {
 ///
 /// It installs `dist/keep-hub_<version>_<arch>.deb`, checks the service runs as `keep-hub`
 /// with `/var/lib/keep-hub`, that 16080 listens on the home address and the admin address on
-/// 127.0.0.1 only, then `dpkg -r` and checks the folder is still there. Reaching the ports
+/// 127.0.0.1 only, and (acceptance test 78) that only `admin.token` is the group's: the
+/// registry, the log and every key are the service user's alone. Then `dpkg -r`, and the
+/// folder is still there. Reaching the ports
 /// from another computer is checked by hand (or by the runner's second machine).
 #[test]
 #[ignore = "end to end: needs root, systemd, a home network and the built .deb"]
-fn at62_the_deb_installs_a_service_as_keep_hub_and_dpkg_r_keeps_the_data() {
+fn at62_at78_the_deb_installs_a_service_as_keep_hub_and_dpkg_r_keeps_the_data() {
     use std::process::Command;
     let run = |prog: &str, args: &[&str]| {
         let o = Command::new(prog).args(args).output().unwrap();
@@ -170,15 +172,32 @@ fn at62_the_deb_installs_a_service_as_keep_hub_and_dpkg_r_keeps_the_data() {
     // the admin token is the group's, and the keys are sealed when systemd-creds is there
     let mode = run("stat", &["-c", "%a %G", "/var/lib/keep-hub/admin.token"]);
     assert_eq!(mode.trim(), "640 keep-hub");
+    // acceptance test 78: everything else is the service user's alone (UMask 0077)
+    let mut own = vec![
+        "/var/lib/keep-hub/hub.sqlite".to_string(),
+        "/var/lib/keep-hub/hub.log".to_string(),
+    ];
+    for e in std::fs::read_dir("/var/lib/keep-hub/keys")
+        .unwrap()
+        .flatten()
+    {
+        own.push(e.path().display().to_string());
+    }
+    assert!(own.len() > 2, "keys were made");
+    for f in &own {
+        let mode = run("stat", &["-c", "%a %U", f]);
+        assert_eq!(mode.trim(), "600 keep-hub", "{f}");
+    }
     run("dpkg", &["-r", "keep-hub"]);
     assert_ne!(show("ActiveState").trim(), "active");
     assert!(std::path::Path::new("/var/lib/keep-hub/hub.json").is_file());
 }
 
-/// Owner decision 2026-11-22: on Linux the hub can't open an app's port, so registering
-/// says when the firewall doesn't let it in yet, for the app to show.
+/// Acceptance test 65 (owner decision 2026-11-22): on Linux the hub can't open an app's port,
+/// so registering says when the firewall doesn't let it in yet, for the app to show. The
+/// library's `Registered::firewall` is in `library.rs`.
 #[test]
-fn on_linux_registering_says_when_the_firewall_keeps_the_port_closed() {
+fn at65_on_linux_registering_says_when_the_firewall_keeps_the_port_closed() {
     let f = Fixture::new();
     *f.machine.os.lock().unwrap() = Os::Linux;
     let helper = f.hub().helper().unwrap().port();

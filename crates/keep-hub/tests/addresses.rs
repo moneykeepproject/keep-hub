@@ -110,7 +110,10 @@ fn with_no_home_address_the_ports_close_and_names_wait_until_one_comes_back() {
         f.hub().app_port("vacapick").is_none()
     });
     assert!(f.hub().helper().is_none(), "no certificate page either");
-    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    // (the listener ends within its poll's wait of being closed)
+    wait_for("the port refusing", || {
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_err()
+    });
     wait_for("names waiting", || {
         f.admin_ok("GET", "/admin/v1/names", None)["state"] == "waiting"
     });
@@ -166,6 +169,55 @@ fn a_hub_started_away_from_home_opens_its_ports_when_an_address_comes() {
         f.phone("carpick", "GET", "/hub/check", &[], None).status,
         200
     );
+}
+
+/// Acceptance test 73: an app port and the certificate page whose address goes away and
+/// comes back unchanged answer again at the next look, also when a port can't be opened at
+/// first (another program held it while the address came back). That the closing needs no
+/// connection to the port is `relay`'s `a_stopped_loop_ends_without_a_connection`.
+#[test]
+fn at73_ports_and_the_page_come_back_with_the_address() {
+    let f = Fixture::new();
+    let app = TestApp::start("vacapick");
+    let port = f.register(&app, false, false);
+    let page = f.hub().helper().unwrap();
+    f.machine.move_to(None);
+    wait_for("the ports closed", || {
+        f.hub().app_port("vacapick").is_none() && f.hub().helper().is_none()
+    });
+    // another program holds both ports while the address comes back (once the hub has
+    // let them go: closing finishes just after the hub stops showing them)
+    let hold = |addr: std::net::SocketAddr| {
+        for _ in 0..100 {
+            if let Ok(l) = std::net::TcpListener::bind(addr) {
+                return l;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("{addr} never closed");
+    };
+    let held = hold(([127, 0, 0, 1], port).into());
+    let held_page = hold(page);
+    f.machine.move_to(Some(Ipv4Addr::LOCALHOST));
+    wait_for("the address back", || f.hub().address().is_some());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(f.hub().app_port("vacapick").is_none());
+    assert!(f.hub().helper().is_none());
+    // the program goes: the next look opens them
+    drop((held, held_page));
+    wait_for("the ports again", || {
+        f.hub().app_port("vacapick").is_some() && f.hub().helper().is_some()
+    });
+    assert_eq!(
+        f.phone("vacapick", "GET", "/hub/check", &[], None).status,
+        200
+    );
+    let opened = f
+        .log_lines()
+        .iter()
+        .filter(|l| l.contains("can't be opened"))
+        .count();
+    assert_eq!(opened, 1, "logged once, not at every look");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -410,4 +462,105 @@ fn the_results_hold_no_secrets() {
         assert!(!r.contains(secret));
     }
     assert!(!r.contains("PRIVATE KEY"));
+}
+
+// ----- Revision 5 D: one authority per address; on Windows, a Public network isn't home ------
+
+/// Move the fake computer to `ip` and wait for the hub to follow.
+#[cfg(not(target_os = "macos"))]
+fn go(f: &Fixture, ip: Ipv4Addr) {
+    f.machine.move_to(Some(ip));
+    wait_for(&format!("the hub on {ip}"), || {
+        f.hub().address() == Some(ip)
+    });
+}
+
+/// Acceptance test 71: home address A, then B (new), then A again: A's authority is the one
+/// from before. After five different addresses, the first one's authority is gone.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn at71_an_address_used_before_gets_its_authority_back() {
+    let f = Fixture::new();
+    let a = Ipv4Addr::LOCALHOST;
+    let (ca_a, fp_a) = (f.hub().ca_der(), f.hub().info().fingerprint);
+    go(&f, Ipv4Addr::new(127, 0, 0, 2));
+    let fp_b = f.hub().info().fingerprint;
+    assert_ne!(fp_b, fp_a, "a new address, a new authority");
+    go(&f, a);
+    assert_eq!(f.hub().ca_der(), ca_a);
+    assert_eq!(
+        f.hub().info().fingerprint,
+        fp_a,
+        "the same authority as before"
+    );
+    assert_eq!(f.hub().info().address, "127.0.0.1");
+    assert!(f.log_lines().iter().any(|l| l.contains("used before")));
+    // and B's comes back too
+    go(&f, Ipv4Addr::new(127, 0, 0, 2));
+    assert_eq!(f.hub().info().fingerprint, fp_b);
+    // three more addresses: five in all, and A was used longest ago
+    for last in 3..=5 {
+        go(&f, Ipv4Addr::new(127, 0, 0, last));
+    }
+    go(&f, a);
+    assert_ne!(f.hub().info().fingerprint, fp_a, "A's authority is gone");
+    // nothing of A's old one is left in the key store's names
+    let kept = std::fs::read_to_string(f.dir.path().join("authorities/authorities.json")).unwrap();
+    let order: Vec<String> = serde_json::from_str(&kept).unwrap();
+    assert_eq!(order.len(), keep_hub::ca::KEPT_AUTHORITIES);
+    assert_eq!(order[0], "127.0.0.1");
+}
+
+/// Acceptance test 72: on Windows a private address on a Public network isn't taken as home:
+/// the hub keeps its last home address, tells the name service nothing, and check 3 fails.
+/// On Linux every private address counts.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn at72_on_windows_a_public_network_isnt_home() {
+    let (f, world, _app, name) = named_hub(false);
+    let cafe = Ipv4Addr::new(127, 0, 0, 2);
+    let ca = f.hub().ca_der();
+    {
+        let mut list = f.machine.addresses.lock().unwrap();
+        list.insert(
+            0,
+            machine::LocalAddress {
+                address: cafe.to_string(),
+                adapter: "Cafe Wi-Fi".into(),
+                profile: "Public".into(),
+                ..Default::default()
+            },
+        );
+    }
+    *f.machine.default.lock().unwrap() = Some(cafe);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(f.hub().address(), Some(Ipv4Addr::LOCALHOST), "kept");
+    assert_eq!(f.hub().ca_der(), ca);
+    assert_eq!(
+        world.ns.lock().unwrap().a.get(&name).map(String::as_str),
+        Some("127.0.0.1"),
+        "nothing sent to the name service"
+    );
+    let r = run(&f);
+    let three = r["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["number"] == 3)
+        .unwrap()
+        .clone();
+    assert_eq!(three["code"], "network_public", "{three}");
+    assert_eq!(
+        f.log_lines()
+            .iter()
+            .filter(|l| l.contains("calls Public"))
+            .count(),
+        1,
+        "said once"
+    );
+    // on Linux there is no network type: the same address is home
+    *f.machine.os.lock().unwrap() = machine::Os::Linux;
+    wait_for("the hub on the new address", || {
+        f.hub().address() == Some(cafe)
+    });
 }

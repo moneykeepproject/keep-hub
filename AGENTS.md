@@ -100,3 +100,6 @@ Work one stage at a time. Finish a stage's tests before starting the next.
 9. Revisions 2 and 3 (spec tests 45 to 55).
 10. Revision 4: the probe, the tunnel hostname, Fix as an admin request, and the Linux
     service with its `.deb` (spec tests 56 to 63).
+11. Revision 5: other programs on this computer (protocol 2, the admin-port check,
+    re-registering), the home address's authorities, sessions, and the review's
+    fixes (spec tests 66 to 79).

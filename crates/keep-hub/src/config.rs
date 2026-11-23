@@ -114,12 +114,18 @@ pub const SESSION_MINUTES: u32 = 15;
 #[serde(default)]
 pub struct AdminSettings {
     pub session_minutes: u32,
+    /// The longest life of a session from sign-in, however much it is used (Revision 5 E).
+    pub session_max_hours: u32,
 }
+
+/// `admin.session_max_hours`'s default.
+pub const SESSION_MAX_HOURS: u32 = 12;
 
 impl Default for AdminSettings {
     fn default() -> Self {
         AdminSettings {
             session_minutes: SESSION_MINUTES,
+            session_max_hours: SESSION_MAX_HOURS,
         }
     }
 }

@@ -27,11 +27,17 @@ time.workspace = true
 ring.workspace = true
 rustls-platform-verifier.workspace = true
 
+# An accept loop waits on its socket with poll, so closing a port needs no connection to it
+# (Revision 5 H; owner decision 2026-11-23). Already built as a dependency of ring and
+# getrandom.
+[target."cfg(unix)".dependencies]
+libc = "0.2"
+
 # DPAPI, to seal keys before they are written (seal.rs), and a file's owner (owner.rs), as
 # ShareKeep. Running as a Windows service (main.rs service-run), as ShareKeep's hub and
 # MoneyKeep's capture server (owner decision 2026-11-18).
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography"] }
 windows-service = "0.8"
 # Windows' firewall and network list (COM) and its adapters, instead of PowerShell (owner
 # decision 2026-11-22). MIT OR Apache-2.0, Microsoft's own bindings; windows-sys has no COM.

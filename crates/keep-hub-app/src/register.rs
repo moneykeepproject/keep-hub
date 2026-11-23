@@ -152,6 +152,19 @@ pub fn ensure_registered(
     app_data: &Path,
 ) -> Result<Registered, HubError> {
     let status = hub.status()?;
+    // An older hub that doesn't know this library's protocol yet but knows 1: the app
+    // registers with 1 there, as before protocol 2, and again with 2 once the hub is
+    // updated (an upward change needs the token alone: Revision 5 C).
+    let fallback;
+    let r = if !status.accepts(r.protocol) && r.protocol == 2 && status.accepts(1) {
+        fallback = Registration {
+            protocol: 1,
+            ..r.clone()
+        };
+        &fallback
+    } else {
+        r
+    };
     if !status.accepts(r.protocol) {
         return Err(HubError::here(
             "hub_too_old",
@@ -172,7 +185,7 @@ pub fn ensure_registered(
     if on_hub && recorded {
         if let Ok(secret) = read_secret(app_data) {
             return Ok(Registered {
-                auth: HubAuth::new(&secret),
+                auth: HubAuth::with_protocol(&secret, r.protocol),
                 now: false,
                 firewall: None,
             });
@@ -193,7 +206,7 @@ pub fn ensure_registered(
         serde_json::to_vec_pretty(r).map_err(|e| HubError::here("not_saved", e.to_string()))?;
     write_private(&app_data.join(RECORD_FILE), &record)?;
     Ok(Registered {
-        auth: HubAuth::new(&secret),
+        auth: HubAuth::with_protocol(&secret, r.protocol),
         now: true,
         firewall,
     })
@@ -203,6 +216,15 @@ pub fn ensure_registered(
 /// with no app registered can't tell; the registration's answer then does.)
 fn lists_apps_without_pairing(status: &crate::HubStatus) -> bool {
     status.apps.iter().any(|a| a.app.pairing.is_none())
+}
+
+/// The protocol the app was last registered with, from the record in `app_data`: 1 when
+/// there is none (a backend loading a secret kept before records said).
+pub(crate) fn registered_protocol(app_data: &Path) -> u32 {
+    std::fs::read(app_data.join(RECORD_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Registration>(&b).ok())
+        .map_or(1, |r| r.protocol)
 }
 
 /// The shared secret kept in `app_data`.

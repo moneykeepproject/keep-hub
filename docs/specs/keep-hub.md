@@ -3,8 +3,8 @@
 - **Area / module:** shared hub; new program `keep-hub` used by every Keep and Pick app
 - **Spec writer:** Claude session 2026-11-18 (spec-writer role; no target or prior-art source read)
 - **Date:** 2026-11-18
-- **Status:** draft; revision 4 (2026-11-22), amended the same day after stage 10's owner
-  answers (source 17)
+- **Status:** draft; revision 5 (2026-11-23). Revision 4 (2026-11-22) was amended the same
+  day after stage 10's owner answers (source 17)
 
 ## Sources
 
@@ -28,6 +28,8 @@
 | 16 | Vendor doc | systemd: `systemd.service`, `systemd.exec` (`DynamicUser`, `StateDirectory`), `systemd-sysusers`; Debian Policy Manual chapter 7 | The Linux service and its package |
 | 17 | Owner decision | 2026-11-22, stage 10 (`docs/implementation/stage-10.md`, "Owner decisions" and "Owner answers"): `admin.token` on Linux is group `keep-hub`, mode 0640, with the installing person added to the group; Linux keys are sealed with systemd credentials, file permissions only as the fallback; the `.deb` opens the certificate page's port at install and ServicesKeep does Fix on Linux; a probe from an unexpected address is recorded as a fourth source, `outside`; through the tunnel, the limits counted per address are counted per visitor; Fix on Windows goes through Windows' permission prompt, so the admin request changes nothing; the `.deb`'s maintainer is `MoneyKeep Project <maintainer@getmoneykeep.org>`; the names state has one writer; registering an app on Linux says when its port is closed; moving the Windows code off PowerShell is a task of its own | Revision 4, amended |
 | 18 | Vendor doc | systemd: `systemd-creds`, `LoadCredentialEncrypted=` | Sealing keys on Linux |
+| 19 | Owner decision | 2026-11-23, on the code review `claude/keep-hub-code-review-2026-11-23.md` (MoneyKeep project): an app's backend proves it holds the shared secret before the hub sends anything, as protocol 2; an app checks that the hub's service account is listening before it sends the admin token or a password; one certificate authority per address, reused when the address returns, and on Windows only Private and Domain networks count as home; changing an app's ports, `money` or `guests` needs an administrator; `reset-administrator` ends that administrator's sessions and a session lasts at most 12 hours; wrong pairing tries through the tunnel are counted apart from home ones; a code-alone app's code is kept out of the plain-HTTP certificate page's address | Revision 5 |
+| 20 | Vendor doc | Microsoft: IP Helper `GetExtendedTcpTable` (listening sockets with their process), Service Control Manager `QueryServiceStatusEx` and `ChangeServiceConfig2` (`SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`), Network List Manager (network category); Linux `proc(5)` (`/proc/net/tcp`, the `uid` of a socket); RFC 2104 (HMAC) | Revision 5 |
 
 No target product was observed.
 
@@ -326,7 +328,9 @@ the admin address using the admin token from the hub's data folder:
   secret in its key store.
 - **The first registration of an app needs an administrator's session.** Registering an
   app that is already registered, as happens after an update, needs only the admin token:
-  it keeps the app's phones and grants and gives a new secret.
+  it keeps the app's phones and grants and gives a new secret. A registration that
+  changes the app's ports, `money`, `guests`, `pairing` or lowers its protocol needs an
+  administrator (revision 5 C).
 - A port already taken by another app, a `money` app with `guests`, or a protocol the hub
   does not know is refused with a plain message.
 - The hub opens the app's public port at once. On Windows the firewall rule names the
@@ -336,7 +340,9 @@ the admin address using the admin token from the hub's data folder:
 - Unregistering closes the port, revokes the app's devices and removes its grants and
   unused invites. It needs an administrator's session. Removing the last app
   leaves the hub installed: it is removed in keep-launcher, like an app.
-- A newer hub accepts every older protocol number it has ever supported.
+- A newer hub accepts every older protocol number it has ever supported. In protocol 2 the
+  backend proves it holds the secret before the hub sends it anything, and the secret
+  itself never crosses the connection (revision 5 A).
 
 ### The name and the certificate
 
@@ -414,7 +420,8 @@ Building blocks:
 ### Addresses
 
 - The home address is the IPv4 address of the adapter the default route uses, if it is in
-  a private range. The person can choose another adapter.
+  a private range (on Windows, only on a Private or Domain network: revision 5 D). The
+  person can choose another adapter.
 - The hub looks again at start, when the system reports a network change, and every 5
   minutes. A new address is sent to the name service at once.
 - The certificate is for the name, so it stays valid. Paired phones reconnect when the
@@ -445,8 +452,9 @@ declines the name service:
   progress keeps the one it started with.
 - A phone paired by address is a different installed app from one paired by name. Moving
   between them means pairing again.
-- A changed address still means a new authority and re-installing on phones that use the
-  fallback. Phones that use the name are unaffected.
+- An address the hub has not used before means a new authority and re-installing on
+  phones that use the fallback. An address it used before gets its old authority back
+  (revision 5 D). Phones that use the name are unaffected.
 
 ### Finding the problem
 
@@ -477,7 +485,7 @@ administrator's session in `Keep-Admin-Session`.
 | Status: hub version, protocol numbers, each app's state | Admin token |
 | Lists: apps, members, grants, devices | Admin token |
 | Find the problem: run, results | Admin token |
-| Register an app that is already registered (an update) | Admin token |
+| Register an app that is already registered (an update, with the same ports and flags: revision 5 C) | Admin token |
 | First set-up: the first administrator and the household PIN, only while no administrator exists | Admin token |
 | Sign in as an administrator, sign out | Admin token, name and password |
 | Register a new app, unregister an app | A |
@@ -498,7 +506,8 @@ its own.
 ### Installing and running
 
 As today's hub (source 1): a Windows service under its own virtual account, never
-LocalSystem, restarting on failure; a macOS launch daemon; a data folder only the service
+LocalSystem, restarting on failure, a failed start included (revision 5 H); a macOS
+launch daemon; a data folder only the service
 and administrators can use (`%ProgramData%\Keep Hub` on Windows); keys sealed by the
 operating system; logs with method, path and status only.
 
@@ -571,6 +580,7 @@ Non-posting. The hub holds no book and changes none.
 | `ports.helper` | number | 16080 | Certificate page |
 | `ports.admin` | number | 16081 | Admin address |
 | `admin.session_minutes` | number | 15 | Life of an administrator's session after its last use |
+| `admin.session_max_hours` | number | 12 | Longest life of a session, however much it is used (revision 5 E) |
 
 `hub.json` holds these as nested names: `{"address", "ports": {"helper", "admin"},
 "pair": {"code_minutes"}, "guest": {"invite_days"}, ...}`. Until the Addresses part is
@@ -1151,3 +1161,211 @@ Open points of this revision:
 Decided in stage 10 (source 17), formerly open here: `admin.token` on Linux is
 group-readable (D), and Linux keys are sealed with systemd credentials, with the status
 words in D.
+
+
+## Revision 5 (2026-11-23) — other programs on this computer; fixes from the code review (owner decision)
+
+A code review of stages 1 to 10 (source 19) found no way for a phone or a visitor on the
+network to get past pairing, tokens or grants. It found that the hub and the apps trust
+whatever program answers on a loopback port, and a few places where the spec said too
+little. This revision closes those. Parts A to C are about other programs on this
+computer: any program of any user can listen on a loopback port that is free, and can
+read `admin.token`.
+
+### A. An app's backend proves it holds the secret (protocol 2)
+
+While an app's desktop program is closed, the hub keeps the app's public port open. Any
+program could then listen on the app's loopback port and receive the shared secret and
+the phones' requests. In protocol 2 the hub sends nothing to a backend until the backend
+has proved it holds the secret, and the secret itself never crosses the connection.
+
+- **Each forwarded request opens a new connection with a hello.** Before the phone's
+  request, the hub sends `GET /_keep-hub/hello` with `Keep-Hub-Challenge: <challenge>`,
+  32 random bytes in hexadecimal, and nothing else: no path, header or body from the
+  phone.
+- **The backend answers** 204 with `Keep-Hub-Proof: <proof>`, its own
+  `Keep-Hub-Challenge: <challenge>` (32 fresh random bytes), and `Connection: keep-alive`.
+  The proof is the hexadecimal HMAC-SHA256 (source 20), keyed with the shared secret, of
+  the text `keep-hub app proof 2`, a line feed, and the hub's challenge.
+- **The hub checks the proof in constant time.** If it is wrong, missing, or late (5
+  seconds), the hub closes the connection, sends nothing more, logs one line naming the
+  app (never the challenge or the proof), and answers the phone 502 `app_unverified`.
+  Check 9 fails with the same code for that app: "A program that is not <title> answered
+  on its port."
+- **Then, on the same connection,** the hub sends the phone's request as today, with
+  `Connection: close` and with `Keep-Hub-Auth: 2 <proof>`, where the proof is the HMAC of
+  `keep-hub hub proof 2`, a line feed, and the backend's challenge. The backend accepts the
+  request only on the connection that issued that challenge, and only once.
+- **The hello uses the connection for exactly two exchanges.** "One request per
+  connection" still holds for everything a phone sends: the hello is the hub's own.
+- **The small library** answers the hello and checks `Keep-Hub-Auth` for an app, so an
+  app adds no code of its own beyond calling it. HMAC comes from ring, which the family
+  already uses.
+- **Protocol 1 apps keep working as today:** the hub sends the secret in `Keep-Hub-Auth`
+  with no hello. The status shows each app's protocol. Once an app has registered with
+  protocol 2, the hub never forwards to it as protocol 1 again, unless an administrator
+  registers it at 1 (C).
+- The hub's status lists `protocols: [1, 2]`. `/hub/whoami` shows the same.
+
+### B. An app checks that the hub is listening
+
+While the hub is stopped (an update, a failed start), any program could listen on
+127.0.0.1:16081 and collect the admin token and an administrator's password from an app.
+So the small library checks who is listening before it sends anything there:
+
+- **Windows:** the process listening on 127.0.0.1:16081 (`GetExtendedTcpTable`) must be
+  the process the service manager reports for the `KeepHub` service
+  (`QueryServiceStatusEx`). Only an administrator of the computer can make a program that
+  service.
+- **Linux:** the socket listening on 127.0.0.1:16081 must belong to user `keep-hub`
+  (`/proc/net/tcp`'s `uid`).
+- **The check is made before every connection** that carries the admin token, a password
+  or a session, not once per program run, since the hub can restart in between.
+- **If the check fails, or cannot be made,** the library sends nothing and answers a
+  plain error: "Can't confirm that the program on this computer's port 16081 is Keep Hub."
+  An app shows it as check 1 failing: the hub is not running.
+- **Tests and development** run hubs under the developer's own account. The library takes
+  the account to expect as an explicit option for that, never as a default, and an app's
+  release build does not offer it.
+- The hub needs no change for this.
+
+### C. Re-registering an app
+
+Registering an app that is already registered, as after an update, needs only the admin
+token when nothing but its `title`, `version` and protocol (upward) changes. A
+registration that changes the app's `public_port`, `loopback_port`, `money`, `guests` or
+`pairing`, or lowers its protocol, needs what a first registration needs (an
+administrator, as revision 2 B defines one). Without it, it answers 401
+`administrator_needed` and changes nothing.
+Every user of the computer can read `admin.token`, so the token alone must not be able to
+point an app's phones somewhere else.
+
+### D. The home address and its certificate authority
+
+A laptop hub that briefly joins another network, or a VPN that takes the default route
+with a private address, used to replace the home address's authority, so every phone
+paired by address had to install a certificate again back home.
+
+- **On Windows, only a Private or Domain network is home.** An address on a Public network
+  is not a home address, even when it is private: the hub keeps its last home address,
+  does not send the new one to the name service, and check 3 fails as today. On Linux and
+  a Mac every private address counts, as before, since there is no network type.
+- **One authority per address.** The hub keeps the authority and server certificate of the
+  four home addresses it used most recently, sealed in `keys/` as today. When the home
+  address changes to one of them, the hub uses that address's authority again. Only an
+  address it has not used before gets a new authority, and the oldest of five is deleted.
+- The name service is told each new home address, as today.
+
+### E. Administrator sessions
+
+- **`keep-hub reset-administrator` ends every session of that administrator** and clears
+  their sign-in pause, whether or not the hub is running. A running hub sees the reset at
+  that administrator's next request, which answers 401 `administrator_needed`.
+- **Setting an administrator's password** at the admin address ends that administrator's
+  other sessions too.
+- **A session lasts at most `admin.session_max_hours` (12) from sign-in,** however often it
+  is used. The 15 minutes after last use still apply within that.
+
+### F. Wrong pairing tries through the tunnel
+
+Wrong pairing tries that arrive on the loopback listener (through the tunnel, revision 4
+A) are counted apart from those on the home address. A hundred through the tunnel in 10
+minutes pause pairing through the tunnel only; a hundred on the home address pause
+pairing on the home address only. Ten from one visitor still pause that visitor. People on
+the internet cannot stop the household from pairing at home.
+
+### G. A code-alone app on the certificate page
+
+For an app registered with `pairing: code` (revision 2 A), the code is the whole
+credential, and the certificate page is plain HTTP on the Wi-Fi.
+
+- The admin address's `certificate_page` for such an app is `/?app=<id>` with no code.
+- The certificate page ignores `pair=` for such an app: its link opens the app without a
+  code, and the person types the code shown on the computer into the app on
+  the phone.
+- Pairing by name, and the QR code (whose code is after `#`, sent over HTTPS), are
+  unchanged.
+
+### H. What the spec said too little about
+
+- **Member ids are never used twice.** A member's id is never given to another member,
+  even after that member is removed. Apps link their own records to it.
+- **App ports come back.** When the home address goes away and comes back, changed or not,
+  every registered app's port and the certificate page answer again at the next look at
+  the address. A port the hub should hold and could not open is tried again at every look.
+- **A failed start is restarted.** On Windows the service manager restarts the hub after a
+  failed start as after a crash (30 seconds); a start that fails is not left stopped until
+  the next boot. On Linux `Restart=on-failure` already does this.
+- **The Windows data folder is locked before anything is written in it.** The installer
+  makes the folder and sets its permissions first; keys and `admin.token` are written
+  after.
+- **On Linux only `admin.token` is for the group.** `hub.sqlite`, `hub.log`, `hub.json`
+  and `keys/` are readable by user `keep-hub` only (`UMask=0077`). The folder is 0750 so
+  the group can reach the token, which stays 0640.
+- **`CAP_NET_ADMIN` is an accepted cost.** Reading the nftables ruleset for check 4 needs
+  it, and it would also let the service change the firewall and routes. The hub's code
+  never does: revision 4 D.
+- **The hub's outgoing requests try each address** a name resolves to, in order, before
+  giving up, so a name whose first address is IPv6 still works where IPv6 doesn't.
+- **A release** is built only after the tests pass, and only when its tag matches the
+  version the program reports.
+
+The build order in `AGENTS.md` gains this as stage 11. H's first two points are defects in
+today's code (findings 1 and 2 of the review) and can be fixed ahead of the rest.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `admin.session_max_hours` | number | 12 | Longest life of an administrator's session |
+
+| Status | Code | When |
+|---|---|---|
+| 502 | `app_unverified` | A program on the app's loopback port could not prove it holds the app's secret |
+
+Acceptance tests:
+
+66. With a program that lacks the secret listening on a protocol 2 app's loopback port,
+    a phone's request answers 502 `app_unverified`; the program receives the hello and
+    nothing else (no secret, no path, header or body from the phone); check 9 fails for
+    that app. With the real backend the request passes, and no byte sequence of the secret
+    crosses the connection.
+67. A backend refuses a request whose `Keep-Hub-Auth` proof was made for another
+    connection's challenge, and a second request on a connection whose challenge was used.
+68. A protocol 1 app works as before with no hello. Registering a protocol 2 app again
+    at protocol 1 with the admin token alone answers `administrator_needed`.
+69. With the library told to expect another account than the one listening on the admin
+    port, `HubClient` sends nothing (no token, no name, no password) and answers the plain
+    error of B.
+70. Registering an app again with a different `public_port`, `loopback_port`, `money` or
+    `guests` answers `administrator_needed` with the admin token alone and changes nothing;
+    with only a new `version`, it succeeds with the token alone.
+71. Home address A, then B (new), then A again: the authority for A is the one from
+    before, and its fingerprint is unchanged. After five different addresses, the first
+    one's authority is gone.
+72. On Windows, a private address on a Public network is not taken as home: the hub keeps
+    its last home address, sends nothing to the name service, and check 3 fails.
+73. An app port and the certificate page whose address goes away and comes back unchanged
+    answer again at the next look, including when the closing connection cannot reach the
+    address.
+74. Adding a member, removing them, and adding another gives the second a different id.
+75. After `reset-administrator`, that administrator's session answers
+    `administrator_needed` at its next use, with the hub running throughout. A session used
+    every minute ends `admin.session_max_hours` after sign-in.
+76. A hundred wrong tries through the tunnel pause pairing through the tunnel, and a phone
+    on the home address still pairs; a hundred on the home address do not pause the tunnel.
+77. For a `pairing: code` app, `certificate_page` carries no code, and the certificate
+    page given `pair=<code>` for that app does not put the code in its link.
+78. On Linux, `hub.sqlite`, `hub.log` and every file in `keys/` are mode 0600 for user
+    `keep-hub`; `admin.token` is 0640, group `keep-hub`.
+79. On Windows (end-to-end, ignored by default): with port 16081 held by another program,
+    the service fails to start and starts by itself within a minute of the port being
+    freed. A fresh install's data folder has its locked permissions before the first file
+    is written in it.
+
+Open points of this revision:
+
+- B on a Mac: which account the launch daemon runs as, and how the library checks it. A
+  Mac hub is later (source 15).
+- A guest invite is also the whole credential, and also crosses the Wi-Fi in the
+  certificate page's address, for any app with guests. Whether G applies to invites too.
+- Any holder of the admin token can keep an administrator's sign-in paused with five wrong
+  passwords every 10 minutes. Whether to count wrong passwords per program, or accept it.

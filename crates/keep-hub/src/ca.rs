@@ -294,6 +294,98 @@ pub fn ensure(
     ensure_with(dir, secrets, target, computer, now, true)
 }
 
+// ----- one authority per address (Revision 5 D) --------------------------------------------------
+
+/// Where the authorities of the home addresses used before are kept, one folder each.
+pub const AUTHORITIES_DIR: &str = "authorities";
+/// The home addresses with an authority, most recent first.
+const AUTHORITIES_FILE: &str = "authorities.json";
+/// How many home addresses keep their authority, the one in use included.
+pub const KEPT_AUTHORITIES: usize = 4;
+/// The files of one authority (the keys are in the key store).
+const AUTHORITY_FILES: [&str; 3] = [CA_CERT_FILE, INFO_FILE, SERVER_CERT_FILE];
+
+/// The key-store names of an address's two keys while it isn't in use.
+fn kept_keys(ip: &str) -> (String, String) {
+    let tag = ip.replace(['.', ':'], "-");
+    (format!("{CA_KEY}-{tag}"), format!("{TLS_KEY}-{tag}"))
+}
+
+fn kept_order(dir: &Path) -> Vec<String> {
+    std::fs::read(dir.join(AUTHORITIES_DIR).join(AUTHORITIES_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Before the home address becomes `new`: the authority in use is kept for its address, and
+/// `new`'s own authority, if the hub has used that address before, is put back in use. Only
+/// an address the hub hasn't used before then gets a new authority ([`ensure`]); of more
+/// than [`KEPT_AUTHORITIES`] addresses, the oldest's authority is deleted. `true` when an
+/// authority was put back.
+pub fn switch_authority(dir: &Path, secrets: &Secrets, new: Ipv4Addr) -> Result<bool, String> {
+    let new = new.to_string();
+    let kept = dir.join(AUTHORITIES_DIR);
+    let current = read_info(dir).map(|i| i.address);
+    if current.as_deref() == Some(new.as_str()) {
+        return Ok(false);
+    }
+    // keep the one in use
+    if let Some(cur) = &current {
+        let (ca, tls) = kept_keys(cur);
+        if let (Some(k), Some(t)) = (secrets.get(CA_KEY)?, secrets.get(TLS_KEY)?) {
+            let folder = kept.join(cur);
+            std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+            for f in AUTHORITY_FILES {
+                if let Ok(b) = std::fs::read(dir.join(f)) {
+                    store::write_private(&folder.join(f), &b)?;
+                }
+            }
+            secrets.set(&ca, &k)?;
+            secrets.set(&tls, &t)?;
+        }
+    }
+    // put back `new`'s, when it has one whole
+    let folder = kept.join(&new);
+    let (ca, tls) = kept_keys(&new);
+    let mut restored = false;
+    if let (Some(k), Some(t)) = (secrets.get(&ca)?, secrets.get(&tls)?) {
+        let files: Option<Vec<Vec<u8>>> = AUTHORITY_FILES
+            .iter()
+            .map(|f| std::fs::read(folder.join(f)).ok())
+            .collect();
+        if let Some(files) = files {
+            for (f, b) in AUTHORITY_FILES.iter().zip(files) {
+                store::write_private(&dir.join(f), &b)?;
+            }
+            secrets.set(CA_KEY, &k)?;
+            secrets.set(TLS_KEY, &t)?;
+            restored = true;
+        }
+    }
+    // the order, newest first; past the limit the oldest goes
+    let mut order: Vec<String> = kept_order(dir);
+    if let Some(cur) = &current {
+        if !order.contains(cur) {
+            order.insert(0, cur.clone());
+        }
+    }
+    order.retain(|a| *a != new);
+    order.insert(0, new.clone());
+    while order.len() > KEPT_AUTHORITIES {
+        if let Some(gone) = order.pop() {
+            let (ca, tls) = kept_keys(&gone);
+            secrets.delete(&ca)?;
+            secrets.delete(&tls)?;
+            let _ = std::fs::remove_dir_all(kept.join(&gone));
+        }
+    }
+    std::fs::create_dir_all(&kept).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec_pretty(&order).map_err(|e| e.to_string())?;
+    store::write_private(&kept.join(AUTHORITIES_FILE), &json)?;
+    Ok(restored)
+}
+
 /// The hub's damaged certificate files, as its status says it.
 pub const DAMAGED: &str = "Keep Hub can't start: its certificate files are damaged";
 

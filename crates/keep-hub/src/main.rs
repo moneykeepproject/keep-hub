@@ -90,6 +90,12 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     match cmd {
+        // the version the program reports, as its status does (the release workflow checks
+        // the tag against it: Revision 5 H)
+        "version" => {
+            println!("{}", keep_hub::hub::VERSION);
+            return Ok(());
+        }
         "addresses" => {
             let list = machine::Machine::addresses(&machine::System);
             println!(
@@ -132,7 +138,7 @@ fn run() -> Result<(), String> {
         "setup" | "run" | "status" | "registered-apps" | "service-run" => {}
         _ => {
             return Err(
-                "usage: keep-hub <setup|run|status|registered-apps|addresses|fix-firewall|install-service|remove-service|service-run|reset-administrator> [--data <folder>] [--address <home IPv4>|auto] [--name <administrator>]"
+                "usage: keep-hub <version|setup|run|status|registered-apps|addresses|fix-firewall|install-service|remove-service|service-run|reset-administrator> [--data <folder>] [--address <home IPv4>|auto] [--name <administrator>]"
                     .into(),
             )
         }
@@ -239,6 +245,15 @@ fn install_service(args: &[String]) -> Exit {
             eprintln!("{e}");
             return Exit::FolderInTheWay;
         }
+    }
+    // the folder is made and locked before setup writes a key or the token in it (Revision
+    // 5 H): until then any user could read what %ProgramData% passes down
+    if let Err(e) = std::fs::create_dir_all(&data)
+        .map_err(|e| format!("{} can't be made: {e}", data.display()))
+        .and_then(|()| service::run_steps(&service::windows_lock(&data), &echo))
+    {
+        eprintln!("{e}");
+        return Exit::SetupFailed;
     }
     if !data.join(keep_hub::config::CONFIG_FILE).exists() {
         match setup(&data, None) {

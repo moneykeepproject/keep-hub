@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use crate::listener::Listener;
+
 /// The hub's public facts in its data folder.
 const HUB_FILE: &str = "hub.json";
 /// The admin token in the hub's data folder.
@@ -153,6 +155,8 @@ pub struct HubClient {
     token: Zeroizing<String>,
     session: std::sync::Mutex<Option<Zeroizing<String>>>,
     timeout: Duration,
+    /// Who must be listening on the admin address before anything is sent (Revision 5 B).
+    listener: Listener,
 }
 
 impl std::fmt::Debug for HubClient {
@@ -466,7 +470,16 @@ impl HubClient {
             token: Zeroizing::new(token.to_string()),
             session: std::sync::Mutex::new(None),
             timeout: Duration::from_secs(60),
+            listener: crate::listener::default_listener(),
         }
+    }
+
+    /// Development and tests only (not in a release build): expect `listener` on the admin
+    /// address instead of what this client expects now.
+    #[cfg(debug_assertions)]
+    pub fn expecting(mut self, listener: Listener) -> HubClient {
+        self.listener = listener;
+        self
     }
 
     /// Where the admin address is.
@@ -486,6 +499,9 @@ impl HubClient {
         let body = Zeroizing::new(body.map(|b| b.to_string()).unwrap_or_default());
         let mut stream =
             TcpStream::connect_timeout(&self.addr, Duration::from_secs(3)).map_err(down)?;
+        // Every request carries the admin token: before anything is sent, the program that
+        // accepted the connection must be the hub's own (Revision 5 B).
+        crate::listener::confirm(self.listener, self.addr.port())?;
         stream.set_read_timeout(Some(self.timeout)).map_err(down)?;
         stream.set_write_timeout(Some(self.timeout)).map_err(down)?;
         let session = match self.session.lock() {

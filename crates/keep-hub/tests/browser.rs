@@ -60,7 +60,7 @@ impl Backend {
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((s, _)) => serve(s, kind, &data),
+                    Ok((s, peer)) => serve(s, peer, kind, &data),
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
@@ -82,12 +82,15 @@ impl Drop for Backend {
     }
 }
 
-fn serve(mut s: TcpStream, kind: &str, data: &Path) {
-    s.set_nonblocking(false).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+/// One request's head from `s`: its path (without the query) and headers. `None` when the
+/// connection ends.
+fn read_head(s: &mut TcpStream) -> Option<(String, Vec<(String, String)>)> {
     let mut head = Vec::new();
     let mut b = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b).unwrap_or(0) != 1 {
+            return None;
+        }
         head.push(b[0]);
     }
     let text = String::from_utf8_lossy(&head).to_string();
@@ -100,20 +103,45 @@ fn serve(mut s: TcpStream, kind: &str, data: &Path) {
         .next()
         .unwrap_or("/")
         .to_string();
-    let headers: Vec<(String, String)> = lines
+    let headers = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    Some((path, headers))
+}
+
+fn serve(mut s: TcpStream, peer: std::net::SocketAddr, kind: &str, data: &Path) {
+    s.set_nonblocking(false).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let loaded = HubAuth::load(data);
+    let Some((mut path, mut headers)) = read_head(&mut s) else {
+        return;
+    };
+    // the hub's hello (protocol 2), then the request on the same connection
+    if let Ok(auth) = &loaded {
+        if let Some(Ok(h)) = auth.hello(peer, &path, &headers) {
+            let mut out = format!("HTTP/1.1 {} No Content\r\n", h.status);
+            for (k, v) in &h.headers {
+                out.push_str(&format!("{k}: {v}\r\n"));
+            }
+            out.push_str("\r\n");
+            let _ = s.write_all(out.as_bytes());
+            match read_head(&mut s) {
+                Some((p, h)) => (path, headers) = (p, h),
+                None => return,
+            }
+        }
+    }
     let csp = if kind == "wasm" {
         "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
     } else {
         "default-src 'self'"
     };
-    let (status, ctype, body): (u16, &str, Vec<u8>) = match HubAuth::load(data) {
+    let (status, ctype, body): (u16, &str, Vec<u8>) = match loaded {
         Err(_) => (500, "text/plain", b"not registered".to_vec()),
         Ok(auth) => {
             if path.starts_with("/api/") {
-                match auth.caller(&headers) {
+                match auth.caller_from(peer, &headers) {
                     Ok(c) => (
                         200,
                         "application/json",
@@ -123,7 +151,7 @@ fn serve(mut s: TcpStream, kind: &str, data: &Path) {
                     ),
                     Err(r) => (r.status, "application/json", json!({ "error": r.code }).to_string().into_bytes()),
                 }
-            } else if auth.check(&headers).is_err() {
+            } else if auth.check_from(peer, &headers).is_err() {
                 (403, "text/plain", b"not from the hub".to_vec())
             } else {
                 match path.as_str() {
@@ -148,8 +176,15 @@ fn serve(mut s: TcpStream, kind: &str, data: &Path) {
     let _ = s.write_all(&body);
 }
 
+/// The tests' hubs run under this account, not as Keep Hub's service: the library is told
+/// so (Revision 5 B; a release build can't be).
+fn dev() {
+    keep_hub_app::expect_this_account();
+}
+
 #[test]
 fn the_test_clients_wasm_module_is_well_formed() {
+    dev();
     // (the browser test itself is ignored by default; this keeps its pieces honest)
     assert_eq!(&ANSWER_WASM[..4], b"\0asm");
     assert!(CLIENT_HTML.contains("@KIND@"));
@@ -160,6 +195,7 @@ fn the_test_clients_wasm_module_is_well_formed() {
 #[test]
 #[ignore = "end to end: needs the staging name service, a home network and Playwright"]
 fn at22_end_to_end_in_a_headless_browser() {
+    dev();
     let (Ok(service), Ok(code)) = (
         std::env::var("KEEP_HUB_E2E_SERVICE"),
         std::env::var("KEEP_HUB_E2E_CODE"),
@@ -276,6 +312,7 @@ fn run_browser(dir: &Path, job: Value) {
 #[test]
 #[ignore = "needs Playwright and a Chrome or Chromium"]
 fn the_browser_part_against_a_local_hub() {
+    dev();
     let f = support::Fixture::new();
     let hub = HubClient::at(f.hub().admin, &f.admin_token);
     hub.sign_in(support::ADMIN_NAME, support::ADMIN_PASSWORD)

@@ -100,3 +100,59 @@ fn service_run_is_for_the_service_manager_and_run_is_for_everything_else() {
         "nothing set up"
     );
 }
+
+/// Acceptance test 79, end to end on Windows (ignored by default; the Windows setup
+/// workflow runs it as an administrator, right after the setup installed the hub): with
+/// port 16081 held by another program the service fails to start, and it starts by itself
+/// within a minute of the port being freed. The keys the first start wrote are in a folder
+/// locked to SYSTEM, the administrators and the service. (That the folder is locked before
+/// the first file is written is the order of `keep-hub install-service`'s steps:
+/// `service::windows_lock` runs before setup; its unit test checks the steps.)
+#[cfg(windows)]
+#[test]
+#[ignore = "end to end: an installed Keep Hub service, run as an administrator"]
+fn at79_a_failed_start_is_started_again_once_the_port_is_free() {
+    use std::time::{Duration, Instant};
+    let sc = |args: &[&str]| {
+        let o = Command::new("sc.exe").args(args).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let state = || sc(&["query", "KeepHub"]);
+    let wait_for = |what: &str, secs: u64| {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < until {
+            if state().contains(what) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        false
+    };
+    sc(&["stop", "KeepHub"]);
+    assert!(wait_for("STOPPED", 30), "{}", state());
+    let held = std::net::TcpListener::bind("127.0.0.1:16081").expect("the admin port");
+    sc(&["start", "KeepHub"]);
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(
+        !state().contains("RUNNING"),
+        "it can't start while the port is held"
+    );
+    drop(held);
+    assert!(
+        wait_for("RUNNING", 70),
+        "started again by itself: {}",
+        state()
+    );
+
+    let data = std::path::PathBuf::from(std::env::var_os("ProgramData").unwrap()).join("Keep Hub");
+    let acl = |p: &std::path::Path| {
+        let o = Command::new("icacls.exe").arg(p).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let keys = acl(&data.join("keys"));
+    assert!(
+        !keys.contains("S-1-5-32-545") && !keys.contains("Users"),
+        "{keys}"
+    );
+    assert!(keys.contains("KeepHub"), "{keys}");
+}

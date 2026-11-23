@@ -7,7 +7,7 @@
 mod support;
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ impl LibBackend {
         let thread = std::thread::spawn(move || {
             while !flag.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((s, _)) => answer(s, &data),
+                    Ok((s, peer)) => answer(s, peer, &data),
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
@@ -60,12 +60,14 @@ impl Drop for LibBackend {
     }
 }
 
-fn answer(mut s: TcpStream, data: &Path) {
-    s.set_nonblocking(false).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+/// One request's head from `s`: its path and headers. `None` when the connection ends.
+fn read_head(s: &mut TcpStream) -> Option<(String, Vec<(String, String)>)> {
     let mut head = Vec::new();
     let mut b = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") && s.read(&mut b).unwrap_or(0) == 1 {
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut b).unwrap_or(0) != 1 {
+            return None;
+        }
         head.push(b[0]);
     }
     let text = String::from_utf8_lossy(&head).to_string();
@@ -75,18 +77,56 @@ fn answer(mut s: TcpStream, data: &Path) {
         .and_then(|l| l.split(' ').nth(1))
         .unwrap_or("/")
         .to_string();
-    let headers: Vec<(String, String)> = lines
+    let headers = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-    // the secret is loaded for each request, so a new registration takes effect at once
-    let (status, body) = match HubAuth::load(data) {
+    Some((path, headers))
+}
+
+/// One connection, as an app's backend made with the library serves it: the hub's hello
+/// (protocol 2) answered on it, then one request.
+fn answer(mut s: TcpStream, peer: SocketAddr, data: &Path) {
+    s.set_nonblocking(false).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // the secret is loaded for each connection, so a new registration takes effect at once
+    let auth = HubAuth::load(data);
+    let Some((mut path, mut headers)) = read_head(&mut s) else {
+        return;
+    };
+    if let Ok(auth) = &auth {
+        if let Some(hello) = auth.hello(peer, &path, &headers) {
+            match hello {
+                Ok(h) => {
+                    let mut out = format!("HTTP/1.1 {} No Content\r\n", h.status);
+                    for (k, v) in &h.headers {
+                        out.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    out.push_str("\r\n");
+                    let _ = s.write_all(out.as_bytes());
+                }
+                Err(r) => {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 {} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        r.status
+                    );
+                    return;
+                }
+            }
+            match read_head(&mut s) {
+                Some((p, h)) => (path, headers) = (p, h),
+                None => return,
+            }
+        }
+    }
+    let (status, body) = match auth {
         Err(e) => (500, json!({ "error": e.code })),
         Ok(auth) => {
             let checked = if path.starts_with("/api/") {
-                auth.caller(&headers).map(Some)
+                auth.caller_from(peer, &headers).map(Some)
             } else {
-                auth.check(&headers)
+                auth.check_from(peer, &headers)
             };
             match checked {
                 Ok(Some(c)) => (
@@ -96,9 +136,10 @@ fn answer(mut s: TcpStream, data: &Path) {
                         "class": c.class,
                         "device": c.device, "device_name": c.device_name,
                         "guest_scope": c.guest_scope, "request_id": c.request_id,
+                        "protocol": auth.protocol(),
                     }),
                 ),
-                Ok(None) => (200, json!({ "files": path })),
+                Ok(None) => (200, json!({ "files": path, "protocol": auth.protocol() })),
                 Err(r) => (r.status, json!({ "error": r.code })),
             }
         }
@@ -180,8 +221,15 @@ fn believed(data: &Path) -> bool {
     false
 }
 
+/// The tests' hubs run under this account, not as Keep Hub's service: the library is told
+/// so (Revision 5 B; a release build can't be).
+fn dev() {
+    keep_hub_app::expect_this_account();
+}
+
 #[test]
 fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
+    dev();
     let empty = tempfile::tempdir().unwrap();
     assert!(matches!(find(empty.path()), Found::NotInstalled));
 
@@ -261,6 +309,7 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, Vec<u8>)> {
 
 #[test]
 fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start() {
+    dev();
     // no hub on the computer: offered, and yes opens keep-launcher at the hub's entry
     let empty = tempfile::tempdir().unwrap();
     assert!(matches!(offer(empty.path()), Offer::MakeThisTheHub));
@@ -322,6 +371,7 @@ fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start()
 
 #[test]
 fn a_wrong_admin_token_is_refused_and_the_error_holds_no_token() {
+    dev();
     let f = Fixture::new();
     let hub = HubClient::at(f.hub().admin, "not-the-token");
     let e = hub.members().unwrap_err();
@@ -334,6 +384,7 @@ fn a_wrong_admin_token_is_refused_and_the_error_holds_no_token() {
 
 #[test]
 fn registering_happens_once_per_version_and_the_secret_is_kept_sealed() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let mut app = App::new("vacapick", "VacaPick");
@@ -396,6 +447,7 @@ fn registering_happens_once_per_version_and_the_secret_is_kept_sealed() {
 
 #[test]
 fn a_hub_refuses_what_it_cant_take_with_its_own_words() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let a = App::new("vacapick", "VacaPick");
@@ -423,6 +475,7 @@ fn a_hub_refuses_what_it_cant_take_with_its_own_words() {
 
 #[test]
 fn at05_a_backend_made_with_the_library_refuses_requests_without_the_right_keep_hub_auth() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let app = App::new("vacapick", "VacaPick");
@@ -483,6 +536,7 @@ fn at05_a_backend_made_with_the_library_refuses_requests_without_the_right_keep_
 
 #[test]
 fn a_guest_is_seen_with_its_scope() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let app = App::new("vacapick", "VacaPick");
@@ -509,6 +563,7 @@ fn a_guest_is_seen_with_its_scope() {
 
 #[test]
 fn the_phones_screen_works_through_the_library() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let money = App::new("moneykeep", "MoneyKeep");
@@ -583,6 +638,7 @@ fn the_phones_screen_works_through_the_library() {
 
 #[test]
 fn a_stopped_backend_shows_in_the_status_and_in_find_the_problem() {
+    dev();
     let f = Fixture::new();
     let hub = client(&f);
     let app = App::new("vacapick", "VacaPick");
@@ -603,6 +659,7 @@ fn a_stopped_backend_shows_in_the_status_and_in_find_the_problem() {
 /// 49, 50 and 54 as an app's desktop program meets them).
 #[test]
 fn an_open_household_and_a_code_app_through_the_library() {
+    dev();
     let f = Fixture::not_set_up();
     let hub = HubClient::at(f.hub().admin, &f.admin_token);
     let first = hub.set_up_open(support::ADMIN_NAME).unwrap();
@@ -685,6 +742,7 @@ fn older_hub() -> (std::net::SocketAddr, Arc<AtomicBool>) {
 /// talking to an older hub, and must not offer pairing.
 #[test]
 fn a_code_app_on_an_older_hub_is_told_to_update_it() {
+    dev();
     let (addr, registered) = older_hub();
     let hub = HubClient::at(addr, "token");
     let data = tempfile::tempdir().unwrap();
@@ -695,14 +753,18 @@ fn a_code_app_on_an_older_hub_is_told_to_update_it() {
     assert!(registered.load(Ordering::SeqCst));
     // the secret is kept, so the backend still checks what the hub forwards
     assert!(data.path().join(SECRET_FILE).is_file());
-    // a code_and_pin app is fine with that hub
+    // a code_and_pin app is fine with that hub, at the protocol that hub knows (1)
     let r = Registration::new("trips", "Test Trips", "1.0.0", 16443, 26443);
-    ensure_registered(&hub, &r, data.path()).unwrap();
+    assert_eq!(r.protocol, 2);
+    let done = ensure_registered(&hub, &r, data.path()).unwrap();
+    assert_eq!(done.auth.protocol(), 1);
+    assert_eq!(HubAuth::load(data.path()).unwrap().protocol(), 1);
 }
 
 /// Revision 3, through the library: the code page can be changed, and a bad one isn't.
 #[test]
 fn the_code_page_through_the_library() {
+    dev();
     let f = hub_on_known_port();
     let hub = client(&f);
     let e = hub.set_code_page("http://example.org/").unwrap_err();
@@ -719,6 +781,7 @@ fn the_code_page_through_the_library() {
 /// What ServicesKeep calls: a probe and whether it was seen, the tunnel hostname, and Fix.
 #[test]
 fn the_probe_the_tunnel_hostname_and_fix_through_the_library() {
+    dev();
     let f = hub_on_known_port();
     let hub = client(&f);
     let p = hub.probe().unwrap();
@@ -769,4 +832,28 @@ fn the_probe_the_tunnel_hostname_and_fix_through_the_library() {
     assert_eq!(hub.fix(9).unwrap_err().code, "no_fix");
     // names off: no tunnel from the name service
     assert_eq!(hub.make_moneykeep_tunnel().unwrap_err().code, "not_found");
+}
+
+/// Acceptance test 65, the library's part: on Linux, a registration whose port the firewall
+/// that is on doesn't let in gives the hub's words in `Registered::firewall`.
+#[test]
+fn at65_the_library_gives_the_firewall_words() {
+    dev();
+    use keep_hub::linuxfw::{Active, LinuxFirewall};
+    let f = Fixture::new();
+    *f.machine.os.lock().unwrap() = keep_hub::machine::Os::Linux;
+    let helper = f.hub().helper().unwrap().port();
+    *f.machine.firewall.lock().unwrap() = Some(keep_hub::machine::FirewallScan {
+        linux: Some(LinuxFirewall {
+            active: Some(Active::Ufw),
+            open: vec![(helper, helper)],
+        }),
+        ..keep_hub::machine::FirewallScan::default()
+    });
+    let hub = client(&f);
+    let a = App::new("vacapick", "VacaPick");
+    let done = ensure_registered(&hub, &a.reg, &a.data()).unwrap();
+    let words = done.firewall.expect("the firewall's words");
+    assert!(words.contains("ServicesKeep"), "{words}");
+    assert!(words.contains(&a.reg.public_port.to_string()), "{words}");
 }

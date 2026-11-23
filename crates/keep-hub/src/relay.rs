@@ -39,6 +39,7 @@ use serde_json::json;
 use crate::http::{self, Answer, Head, LengthError};
 use crate::hub::{Hub, Identity, Refusal, PROTOCOLS, VERSION};
 use crate::probe::{self, Arrived};
+use crate::proof;
 use crate::util;
 
 /// Phones connected at once to one app port (each connection has a thread).
@@ -170,63 +171,146 @@ pub(crate) fn accept_loop(
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
-    if listener.set_nonblocking(false).is_err() {
-        return;
-    }
-    loop {
-        let accepted = listener.accept();
-        if hub.stopping.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst) {
-            return;
-        }
-        match accepted {
-            Ok((tcp, peer)) => {
-                if active.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+    let stopped = || hub.stopping.load(Ordering::SeqCst) || stop.load(Ordering::SeqCst);
+    while let Some((tcp, peer)) = next_connection(&listener, &stopped) {
+        let Some(counted) = Counted::take(&active, MAX_CONNECTIONS) else {
+            drop(tcp);
+            continue;
+        };
+        // On the tunnel's loopback listener every connection comes from the connector: its
+        // place is counted by the visitor's address, once the head says it (owner decision
+        // 2026-11-22).
+        let slot = match arrived {
+            Arrived::Home => match Slot::take(&per, peer.ip()) {
+                Some(s) => Some(s),
+                None => {
                     drop(tcp);
                     continue;
                 }
-                // On the tunnel's loopback listener every connection comes from the
-                // connector: its place is counted by the visitor's address, once the head
-                // says it (owner decision 2026-11-22).
-                let slot = match arrived {
-                    Arrived::Home => match Slot::take(&per, peer.ip()) {
-                        Some(s) => Some(s),
-                        None => {
-                            drop(tcp);
-                            continue;
-                        }
-                    },
-                    Arrived::Loopback => None,
-                };
-                active.fetch_add(1, Ordering::SeqCst);
-                let (hub, app, act, per) = (hub.clone(), app.clone(), active.clone(), per.clone());
-                let spawned = std::thread::Builder::new()
-                    .name("hub-tls".into())
-                    .spawn(move || {
-                        let _slot = slot;
-                        let _ = serve(tcp, peer, &hub, &app, arrived, &per);
-                        act.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    active.fetch_sub(1, Ordering::SeqCst);
+            },
+            Arrived::Loopback => None,
+        };
+        let (hub, app, per) = (hub.clone(), app.clone(), per.clone());
+        let _ = std::thread::Builder::new()
+            .name("hub-tls".into())
+            .spawn(move || {
+                let (_counted, _slot) = (counted, slot);
+                let _ = serve(tcp, peer, &hub, &app, arrived, &per);
+            });
+    }
+}
+
+/// How long an accept loop waits for a connection before it looks at its stop flag again.
+/// Closing a port takes at most this long and needs no connection to it: an address that
+/// has just gone can't be connected to (Revision 5 H). A connection that comes is taken at
+/// once, not at the end of the wait.
+pub(crate) const ACCEPT_WAIT: Duration = Duration::from_millis(100);
+
+/// The next connection on `listener`, or `None` once `stopped` says so. The loop waits on
+/// the socket with the system's poll, so it ends within [`ACCEPT_WAIT`] of being stopped
+/// whatever happened to its address; the connection itself is handed on in blocking mode.
+pub(crate) fn next_connection(
+    listener: &TcpListener,
+    stopped: &dyn Fn() -> bool,
+) -> Option<(TcpStream, SocketAddr)> {
+    // (non-blocking, so a connection that went between the poll and the accept can't hold
+    // the loop)
+    if listener.set_nonblocking(true).is_err() {
+        return None;
+    }
+    loop {
+        if stopped() {
+            return None;
+        }
+        match ready(listener, ACCEPT_WAIT) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            Err(()) => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        }
+        match listener.accept() {
+            Ok((tcp, peer)) => {
+                if stopped() {
+                    return None;
+                }
+                if tcp.set_nonblocking(false).is_ok() {
+                    return Some((tcp, peer));
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             // (e.g. too many open files: wait a moment rather than spin)
             Err(_) => std::thread::sleep(Duration::from_millis(200)),
         }
     }
 }
 
-/// Wake an accept loop waiting on `addr` so it sees its stop flag: one connection that
-/// sends nothing. `false` when nothing could connect (the loop then ends with the next
-/// connection it accepts).
-pub(crate) fn wake(addr: SocketAddr) -> bool {
-    let to = match addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => {
-            SocketAddr::from((Ipv4Addr::LOCALHOST, addr.port()))
-        }
-        _ => addr,
+/// Whether a connection waits on `listener`, waiting up to `wait` for one.
+#[cfg(unix)]
+fn ready(listener: &TcpListener, wait: Duration) -> Result<bool, ()> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
     };
-    TcpStream::connect_timeout(&to, Duration::from_secs(2)).is_ok()
+    let ms = libc::c_int::try_from(wait.as_millis()).unwrap_or(libc::c_int::MAX);
+    // SAFETY: one valid pollfd for a socket this function borrows for the call.
+    let n = unsafe { libc::poll(&mut fd, 1, ms) };
+    match n {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => Ok(false),
+        _ => Err(()),
+    }
+}
+
+/// Whether a connection waits on `listener`, waiting up to `wait` for one.
+#[cfg(windows)]
+fn ready(listener: &TcpListener, wait: Duration) -> Result<bool, ()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
+    let mut fd = WSAPOLLFD {
+        fd: listener.as_raw_socket() as usize,
+        events: POLLRDNORM,
+        revents: 0,
+    };
+    let ms = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid WSAPOLLFD for a socket this function borrows for the call.
+    let n = unsafe { WSAPoll(&mut fd, 1, ms) };
+    match n {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ => Err(()),
+    }
+}
+
+/// One connection in a port's count; given back when dropped, however its thread ends.
+pub(crate) struct Counted(Arc<AtomicUsize>);
+
+impl Counted {
+    /// A place among `max`, or `None` when all are taken.
+    pub(crate) fn take(active: &Arc<AtomicUsize>, max: usize) -> Option<Counted> {
+        // (a compare-and-swap loop: `fetch_update` is deprecated in newer Rust and its new
+        // name, `try_update`, is missing from older Rust)
+        let mut n = active.load(Ordering::SeqCst);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match active.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(Counted(active.clone())),
+                Err(now) => n = now,
+            }
+        }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
@@ -354,6 +438,16 @@ fn forward_head(head: &Head, secret: &str, who: Option<&Identity>) -> Vec<u8> {
     }
     out.push_str("Connection: close\r\n\r\n");
     out.into_bytes()
+}
+
+/// A program on a protocol 2 app's loopback port that couldn't prove it holds the app's
+/// secret (Revision 5 A).
+pub(crate) fn unverified(title: &str) -> Refusal {
+    Refusal::new(
+        502,
+        "app_unverified",
+        format!("A program that is not {title} answered on its port."),
+    )
 }
 
 /// One phone connection: the TLS handshake, one request, its answer.
@@ -485,7 +579,7 @@ fn serve(
                     Err(r) => refuse(hub, &mut tls, &head, &r),
                 }
             }
-            ("POST", "/hub/pair") => pair(hub, &mut tls, &head, rest, visitor, app),
+            ("POST", "/hub/pair") => pair(hub, &mut tls, &head, rest, visitor, arrived, app),
             // The person removes the app from this phone: its own device is revoked.
             ("POST", "/hub/unpair") => {
                 let done = head
@@ -540,6 +634,7 @@ fn pair(
     head: &Head,
     mut body: Vec<u8>,
     ip: IpAddr,
+    arrived: Arrived,
     app: &str,
 ) -> std::io::Result<()> {
     let len = match head.content_length() {
@@ -568,7 +663,7 @@ fn pair(
         }
     }
     body.truncate(len);
-    match hub.pair(app, &body, ip) {
+    match hub.pair(app, &body, ip, arrived) {
         Ok(v) => finish(hub, tls, &head.method, head.path(), &Answer::ok(v)),
         Err(r) => refuse(hub, tls, head, &r),
     }
@@ -626,11 +721,28 @@ fn forward(
     backend.set_write_timeout(Some(hub.idle))?;
     let _ = backend.set_nodelay(true);
     let failed = || Refusal::new(502, "app_failed", "This app didn't answer properly.");
+    // Protocol 2 (Revision 5 A): the backend proves it holds the secret before it gets
+    // anything from the phone; protocol 1 gets the secret itself.
+    let auth = if info.protocol >= 2 {
+        match proof::hello(&mut backend, &secret) {
+            Ok(a) => zeroize::Zeroizing::new(a),
+            Err(proof::Hello::Stopped) => return refuse(hub, tls, head, &stopped()),
+            Err(proof::Hello::Unverified) => {
+                hub.log(&format!(
+                    "app {app}: a program that is not {} answered on its port",
+                    info.title
+                ));
+                return refuse(hub, tls, head, &unverified(&info.title));
+            }
+        }
+    } else {
+        secret
+    };
 
     // the request: the head, then exactly the body it announced
     let mut chunk = vec![0u8; 64 * 1024];
     let sent = (|| -> std::io::Result<()> {
-        backend.write_all(&forward_head(head, &secret, who))?;
+        backend.write_all(&forward_head(head, &auth, who))?;
         let first = rest.get(..rest.len().min(len as usize)).unwrap_or(&[]);
         backend.write_all(first)?;
         let mut left = len - first.len() as u64;
@@ -697,6 +809,42 @@ mod tests {
 
     fn head(text: &str) -> Head {
         Head::parse(text.as_bytes()).unwrap()
+    }
+
+    /// Revision 5 H (review finding 1): a stopped accept loop ends and gives its port back
+    /// without any connection to it, as when its address has gone.
+    #[test]
+    fn a_stopped_loop_ends_without_a_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let t = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let stopped = || stop.load(Ordering::SeqCst);
+                while next_connection(&listener, &stopped).is_some() {}
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::SeqCst);
+        let began = Instant::now();
+        t.join().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(1));
+        TcpListener::bind(addr).expect("the port is free again");
+    }
+
+    #[test]
+    fn a_count_is_given_back_however_its_thread_ends() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let a = Counted::take(&active, 2).unwrap();
+        let _b = Counted::take(&active, 2).unwrap();
+        assert!(Counted::take(&active, 2).is_none());
+        let t = std::thread::spawn(move || {
+            let _a = a;
+            panic!("a thread that panics");
+        });
+        assert!(t.join().is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 1);
     }
 
     #[test]

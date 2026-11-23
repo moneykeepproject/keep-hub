@@ -54,6 +54,44 @@ pub fn account() -> String {
     format!("NT SERVICE\\{SERVICE_NAME}")
 }
 
+/// Windows: what `keep-hub install-service` runs (elevated) on the data folder before
+/// `setup` writes anything in it (Revision 5 H): owned by the administrators, with only
+/// SYSTEM and the administrators in it. The service's own account doesn't exist yet: it is
+/// let in by [`windows_install`], after the service is made.
+pub fn windows_lock(data: &Path) -> Vec<Step> {
+    let data_s = data.display().to_string();
+    vec![
+        vec![
+            "icacls.exe".into(),
+            data_s.clone(),
+            "/setowner".into(),
+            ADMINISTRATORS.into(),
+            "/T".into(),
+            "/C".into(),
+            "/L".into(),
+        ],
+        vec![
+            "icacls.exe".into(),
+            data_s.clone(),
+            "/reset".into(),
+            "/T".into(),
+            "/C".into(),
+            "/L".into(),
+        ],
+        vec![
+            "icacls.exe".into(),
+            data_s,
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            format!("{SYSTEM}:(OI)(CI)F"),
+            "/grant:r".into(),
+            format!("{ADMINISTRATORS}:(OI)(CI)F"),
+            "/C".into(),
+            "/L".into(),
+        ],
+    ]
+}
+
 /// Windows: what `keep-hub install-service` runs (elevated) after `setup`, in order.
 pub fn windows_install(exe: &Path, data: &Path) -> Vec<Step> {
     let exe = exe.display().to_string();
@@ -78,6 +116,9 @@ pub fn windows_install(exe: &Path, data: &Path) -> Vec<Step> {
             DISPLAY_NAME.into(),
         ],
         step(&["sc.exe", "description", SERVICE_NAME, DESCRIPTION]),
+        // restarted 30 seconds after a crash, the last action for every one after (Revision
+        // 5 H); `failureflag 1` makes a start that fails (reported stopped with an error)
+        // count as a failure too, so it isn't left stopped until the next boot
         step(&[
             "sc.exe",
             "failure",
@@ -85,8 +126,9 @@ pub fn windows_install(exe: &Path, data: &Path) -> Vec<Step> {
             "reset=",
             "86400",
             "actions=",
-            "restart/5000/restart/5000/restart/60000",
+            "restart/30000/restart/30000/restart/30000",
         ]),
+        step(&["sc.exe", "failureflag", SERVICE_NAME, "1"]),
         // the folder: owned by Administrators; every permission anyone put on anything in it
         // removed (`/reset`: only what the folder passes down remains), then the folder itself
         // passes down only SYSTEM and administrators full, the service modify. `/L` works on
@@ -638,6 +680,8 @@ mod tests {
             "StateDirectory=keep-hub",
             "StateDirectoryMode=0750",
             "Restart=on-failure",
+            // only admin.token is the group's (Revision 5 H)
+            "UMask=0077",
             "AmbientCapabilities=CAP_NET_ADMIN",
             "CapabilityBoundingSet=CAP_NET_ADMIN",
             "NoNewPrivileges=yes",
@@ -821,6 +865,20 @@ mod tests {
             .iter()
             .any(|s| s.contains("ProgramData") || s.contains("rmdir")));
         assert!(windows_uninstall().iter().all(may_fail));
+        // a failed start is restarted as a crash is (Revision 5 H)
+        assert!(flat.iter().any(|s| s == "sc.exe failureflag KeepHub 1"));
+        assert!(flat
+            .iter()
+            .any(|s| s.contains("actions= restart/30000/restart/30000/restart/30000")));
+        assert!(pos("failureflag") < pos("sc.exe start"));
+        // before setup writes anything: the folder locked to SYSTEM and the administrators
+        let lock: Vec<String> = windows_lock(&data).iter().map(|s| s.join(" ")).collect();
+        assert_eq!(lock.len(), 3);
+        assert!(lock[0].contains("/setowner *S-1-5-32-544"));
+        assert!(lock[2].contains("/inheritance:r"));
+        assert!(lock
+            .iter()
+            .all(|s| !s.contains("545") && !s.contains("NT SERVICE") && s.contains("/L")));
     }
 
     #[cfg(unix)]

@@ -34,7 +34,7 @@ pub(crate) mod household;
 pub use household::reset_administrator;
 
 /// The hub protocols this hub accepts from an app. A newer hub keeps every older number.
-pub const PROTOCOLS: &[u32] = &[1];
+pub const PROTOCOLS: &[u32] = &[1, 2];
 /// The hub's version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -209,18 +209,16 @@ pub(crate) struct Listener {
 }
 
 impl Listener {
-    /// Stop accepting and wait for the port to close (and its loopback twin).
+    /// Stop accepting and wait for the port to close (and its loopback twin). The accept loop
+    /// polls its stop flag, so this needs no connection to the port: it works when the
+    /// address has already gone (Revision 5 H).
     fn close(mut self) {
         if let Some(t) = self.also.take() {
             t.close();
         }
         self.stop.store(true, Ordering::SeqCst);
-        // Wait for the loop only when it was woken: otherwise it ends by itself with the
-        // next connection, and the hub mustn't hang on it.
-        if relay::wake(self.addr) {
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
         }
     }
 }
@@ -228,8 +226,10 @@ impl Listener {
 pub(crate) struct State {
     pub(crate) registry: Registry,
     codes: HashMap<String, Pairing>,
-    /// Wrong pairing tries in the last [`FAILURE_WINDOW_MS`], with the address they came from.
-    failures: VecDeque<(i64, IpAddr)>,
+    /// Wrong pairing tries in the last [`FAILURE_WINDOW_MS`], with the visitor they came from
+    /// and the listener they arrived on: through the tunnel and on the home address they
+    /// are counted apart (Revision 5 F).
+    failures: VecDeque<(i64, IpAddr, Arrived)>,
     /// The secret shared with each app, for `Keep-Hub-Auth`.
     secrets: HashMap<String, Zeroizing<String>>,
     listeners: HashMap<String, Listener>,
@@ -247,6 +247,8 @@ pub(crate) struct Hub {
     state: Mutex<State>,
     /// One registration or removal of an app at a time.
     changing_apps: Mutex<()>,
+    /// Ports that should be open and aren't, with the reason last logged.
+    closed: Mutex<HashMap<String, String>>,
     pub(crate) data: PathBuf,
     pub(crate) cfg: HubConfig,
     pub(crate) keys: KeyStore,
@@ -481,32 +483,49 @@ impl Hub {
             .name()
             .filter(|n| self.resolver.trusted_name(Some(n)))
             .map(|n| format!("https://{n}:{}/#{key}={code}", app.public_port));
+        // The certificate page is plain HTTP on the Wi-Fi: an app that pairs with the code
+        // alone, whose code is the whole credential, gets no code in its address (Revision
+        // 5 G). The person types the code shown on the computer into the app.
+        let certificate_page = if key == "pair" && app.pairs_by_code_alone() {
+            format!("http://{ip}:{}/?app={}", self.helper_port(), app.id)
+        } else {
+            format!(
+                "http://{ip}:{}/?app={}&{key}={code}",
+                self.helper_port(),
+                app.id
+            )
+        };
         json!({
             "url": by_name.clone().unwrap_or_else(|| by_address.clone()),
             "url_by_name": by_name,
             "url_by_address": by_address,
-            "certificate_page": format!(
-                "http://{ip}:{}/?app={}&{key}={code}",
-                self.helper_port(),
-                app.id
-            ),
+            "certificate_page": certificate_page,
         })
     }
 
     // ----- pairing --------------------------------------------------------------------------------
 
-    /// Drop old failures; refuse when this address, or everyone together, has failed too
-    /// often in the last ten minutes.
-    fn throttle(st: &mut State, now: i64, ip: IpAddr) -> Result<(), Refusal> {
+    /// Drop old failures; refuse when this visitor, or everyone together on the same
+    /// listener (the home address, or the tunnel's loopback listener), has failed too often
+    /// in the last ten minutes. People on the internet can't pause pairing at home, nor the
+    /// reverse (Revision 5 F).
+    fn throttle(st: &mut State, now: i64, ip: IpAddr, arrived: Arrived) -> Result<(), Refusal> {
         while st
             .failures
             .front()
-            .is_some_and(|(t, _)| now - *t > FAILURE_WINDOW_MS)
+            .is_some_and(|(t, _, _)| now - *t > FAILURE_WINDOW_MS)
         {
             st.failures.pop_front();
         }
-        let mine = st.failures.iter().filter(|(_, a)| *a == ip).count();
-        if mine >= MAX_FAILURES || st.failures.len() >= MAX_FAILURES_ALL {
+        let here = st.failures.iter().filter(|(_, _, a)| *a == arrived);
+        let (mut mine, mut all) = (0, 0);
+        for (_, a, _) in here {
+            all += 1;
+            if *a == ip {
+                mine += 1;
+            }
+        }
+        if mine >= MAX_FAILURES || all >= MAX_FAILURES_ALL {
             return Err(Refusal::new(
                 429,
                 "pairing_paused",
@@ -518,11 +537,17 @@ impl Hub {
 
     /// `/hub/pair` on `app`'s port: a household member's code, PIN and device name, or a
     /// guest's invite and name. Answers with the new device's token.
-    pub(crate) fn pair(&self, app: &str, body: &[u8], ip: IpAddr) -> Result<Value, Refusal> {
+    pub(crate) fn pair(
+        &self,
+        app: &str,
+        body: &[u8],
+        ip: IpAddr,
+        arrived: Arrived,
+    ) -> Result<Value, Refusal> {
         let p: PairRequest = serde_json::from_slice(body)
             .map_err(|_| Refusal::new(400, "bad_request", "The request isn't valid."))?;
         if let Some(invite) = &p.invite {
-            return self.pair_guest(app, invite, p.name.as_deref().unwrap_or(""), ip);
+            return self.pair_guest(app, invite, p.name.as_deref().unwrap_or(""), ip, arrived);
         }
         let device_name = clean_name(p.device.as_deref().unwrap_or(""), "this phone")?;
         let code = normalise_code(p.code.as_deref().unwrap_or(""));
@@ -531,7 +556,7 @@ impl Hub {
         // body is then ignored and never checked.
         let pin_hash = {
             let mut st = self.lock();
-            Self::throttle(&mut st, now, ip)?;
+            Self::throttle(&mut st, now, ip, arrived)?;
             let by_code = st
                 .registry
                 .app(app)
@@ -551,7 +576,7 @@ impl Hub {
                 .get(&code)
                 .is_some_and(|c| c.expires > now && c.app == app);
             if !valid {
-                st.failures.push_back((now, ip));
+                st.failures.push_back((now, ip, arrived));
                 return Err(wrong());
             }
             pin_hash
@@ -562,7 +587,7 @@ impl Hub {
             .is_none_or(|h| pin::verify(p.pin.as_deref().unwrap_or("").trim(), h));
         let mut st = self.lock();
         if !pin_ok {
-            st.failures.push_back((now, ip));
+            st.failures.push_back((now, ip, arrived));
             let burn = match st.codes.get_mut(&code) {
                 Some(c) => {
                     c.tries += 1;
@@ -608,12 +633,13 @@ impl Hub {
         invite: &str,
         name: &str,
         ip: IpAddr,
+        arrived: Arrived,
     ) -> Result<Value, Refusal> {
         let name = clean_name(name, "yourself")?;
         let code = normalise_code(invite);
         let now = self.now();
         let mut st = self.lock();
-        Self::throttle(&mut st, now, ip)?;
+        Self::throttle(&mut st, now, ip, arrived)?;
         let found = st.registry.invite_by_code(&code).map_err(Refusal::inner)?;
         let accepts = st
             .registry
@@ -621,7 +647,7 @@ impl Hub {
             .map_err(Refusal::inner)?
             .is_some_and(|a| a.guests);
         let Some(invite) = found.filter(|i| accepts && i.app == app && i.expires > now) else {
-            st.failures.push_back((now, ip));
+            st.failures.push_back((now, ip, arrived));
             return Err(wrong());
         };
         let token = Zeroizing::new(util::hex(&util::random::<32>().map_err(Refusal::inner)?));
@@ -932,10 +958,21 @@ impl Hub {
             }
             apps.into_iter().find(|a| a.id == r.id)
         };
-        // A new app, or a change of how its phones pair, needs what a first registration
-        // needs (Revision 2 A); an update that keeps its pairing needs the token alone.
+        // A new app, or a change of its ports, `money`, `guests` or how its phones pair, or
+        // a lower protocol, needs what a first registration needs (Revision 2 A, Revision 5
+        // C): every user of the computer can read the admin token, and the token alone
+        // mustn't point an app's phones somewhere else. An update that changes nothing but
+        // the title, the version and a higher protocol needs the token alone.
         let first_time = existing.as_ref().is_none_or(|a| a.pairing != pairing);
-        if first_time && !administrator {
+        let needs_administrator = first_time
+            || existing.as_ref().is_some_and(|a| {
+                a.public_port != r.public_port
+                    || a.loopback_port != r.loopback_port
+                    || a.money != r.money
+                    || a.guests != r.guests
+                    || r.protocol < a.protocol
+            });
+        if needs_administrator && !administrator {
             return Err(household::administrator_needed());
         }
         // An app that pairs with the PIN needs a household that has one (Revision 2 B).
@@ -1297,20 +1334,77 @@ impl Hub {
             }
             match self.open_port(&a.id, a.public_port) {
                 Ok(l) => {
+                    self.closed_once(&a.id, None);
                     if let Some(old) = self.lock().listeners.insert(a.id.clone(), l) {
                         old.close();
                     }
                 }
-                Err(e) => self.log(&e),
+                Err(e) => self.closed_once(&a.id, Some(e)),
             }
         }
         match self.open_page() {
             Ok(l) => {
+                self.closed_once("", None);
                 if let Some(old) = self.lock().page.replace(l) {
                     old.close();
                 }
             }
-            Err(e) => self.log(&e),
+            Err(e) => self.closed_once("", Some(e)),
+        }
+    }
+
+    /// At a look that finds the home address unchanged: open any app port or the
+    /// certificate page that should be open and isn't, as after a port another program held
+    /// was freed (Revision 5 H). A port that still can't be opened is logged once, until it
+    /// opens or fails differently.
+    fn reopen_missing(self: &Arc<Self>) {
+        if self.address().is_none() {
+            return;
+        }
+        let _one = self.changing_apps.lock().unwrap_or_else(|p| p.into_inner());
+        let apps = self.lock().registry.apps().unwrap_or_default();
+        for a in &apps {
+            let missing = {
+                let st = self.lock();
+                st.secrets.contains_key(&a.id) && !st.listeners.contains_key(&a.id)
+            };
+            if !missing {
+                continue;
+            }
+            match self.open_port(&a.id, a.public_port) {
+                Ok(l) => {
+                    self.lock().listeners.insert(a.id.clone(), l);
+                    self.closed_once(&a.id, None);
+                    self.log(&format!("port {} open again", a.public_port));
+                }
+                Err(e) => self.closed_once(&a.id, Some(e)),
+            }
+        }
+        if self.lock().page.is_none() {
+            match self.open_page() {
+                Ok(l) => {
+                    self.lock().page = Some(l);
+                    self.closed_once("", None);
+                    self.log("the certificate page is open again");
+                }
+                Err(e) => self.closed_once("", Some(e)),
+            }
+        }
+    }
+
+    /// Log why `what` (an app, or "" for the certificate page) is closed, once per reason.
+    fn closed_once(&self, what: &str, why: Option<String>) {
+        let mut seen = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        match why {
+            None => {
+                seen.remove(what);
+            }
+            Some(e) => {
+                if seen.get(what) != Some(&e) {
+                    self.log(&e);
+                    seen.insert(what.to_string(), e);
+                }
+            }
         }
     }
 
@@ -1341,8 +1435,9 @@ impl Hub {
         machine::choose(&cfg.address.adapter, None, || self.machine.addresses())
     }
 
-    /// Follow a change of the home address: a new authority for phones that connect by
-    /// address (the spec: they install it again), every port and the page on the new
+    /// Follow a change of the home address: for phones that connect by address, the
+    /// address's own authority when the hub used it before, a new one otherwise (they
+    /// install it again: Revision 5 D), every port and the page on the new
     /// address, the address in `hub.json`, and the name service told (through the names
     /// engine). Phones that use the name are unaffected.
     pub(crate) fn move_to(self: &Arc<Self>, new: Option<Ipv4Addr>) {
@@ -1353,6 +1448,14 @@ impl Hub {
         }
         match new {
             Some(ip) => {
+                // an address used before gets its own authority back (Revision 5 D)
+                match ca::switch_authority(&self.data, &self.keys, ip) {
+                    Ok(true) => self.log(
+                        "address changed: back on an address used before, with its certificate",
+                    ),
+                    Ok(false) => {}
+                    Err(e) => self.log(&e),
+                }
                 match ca::ensure(
                     &self.data,
                     &self.keys,
@@ -1385,6 +1488,28 @@ impl Hub {
         self.names.set_address(new);
     }
 
+    /// The home address to use now: the computer's ([`Hub::find_address`]), unless that is
+    /// a new address on a network Windows calls Public, when the last home address is kept,
+    /// nothing is sent to the name service, and check 3 says why (Revision 5 D).
+    fn home_address_now(&self, full: bool) -> Option<Ipv4Addr> {
+        let found = self.find_address(full);
+        match found {
+            Some(ip) if Some(ip) != self.address() && on_public_network(&*self.machine, ip) => {
+                self.closed_once(":public", Some(public_words(ip)));
+                self.address()
+            }
+            _ => {
+                self.closed_once(":public", None);
+                found
+            }
+        }
+    }
+
+    /// The address the computer is on now, Public network or not (for check 3).
+    pub(crate) fn computers_address(&self) -> Option<Ipv4Addr> {
+        self.find_address(true)
+    }
+
     /// Choose the adapter whose address to publish (`automatic`, or an adapter's name), and
     /// look again at once.
     pub(crate) fn choose_adapter(self: &Arc<Self>, adapter: &str) -> Result<(), String> {
@@ -1393,10 +1518,25 @@ impl Hub {
             return Err("Give an adapter's name, or \"automatic\".".into());
         }
         HubConfig::update(&self.data, |c| c.address.adapter = a.to_string())?;
-        let found = self.find_address(true);
+        let found = self.home_address_now(true);
         self.move_to(found);
         Ok(())
     }
+}
+
+/// Whether `ip` is on a network Windows calls Public: not a home address there, even when it
+/// is a private address (Revision 5 D). Linux and a Mac have no network type: every private
+/// address counts.
+fn on_public_network(machine: &dyn Machine, ip: Ipv4Addr) -> bool {
+    machine.os() == machine::Os::Windows
+        && machine
+            .addresses()
+            .iter()
+            .any(|a| a.address == ip.to_string() && a.profile.eq_ignore_ascii_case("public"))
+}
+
+fn public_words(ip: Ipv4Addr) -> String {
+    format!("{ip} is on a network Windows calls Public: the hub keeps its last home address")
 }
 
 /// A running hub.
@@ -1483,21 +1623,33 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         .unwrap_or_else(|| Arc::new(machine::System));
 
     // the home address now, and the authority for it
-    let home = if cfg.address.automatic() {
+    let found = if cfg.address.automatic() {
         machine.default_address()
     } else {
         machine::choose(&cfg.address.adapter, None, || machine.addresses())
     };
+    // on a network Windows calls Public the last home address is kept (Revision 5 D)
+    let home = match found {
+        Some(ip) if Some(ip) != cfg.address.current && on_public_network(&*machine, ip) => {
+            (opts.log)(&public_words(ip));
+            cfg.address.current
+        }
+        _ => found,
+    };
     let made_for: Option<Ipv4Addr> = ca::read_info(&opts.data).and_then(|i| i.address.parse().ok());
     let material = match (home, made_for) {
-        // moved while the hub was stopped: a new authority for the new address
-        (Some(ip), Some(was)) if ip != was => ca::ensure(
-            &opts.data,
-            &opts.keys,
-            &ca::Target { ip },
-            &ca::computer_name(),
-            now / 1000,
-        )?,
+        // moved while the hub was stopped: the address's own authority when it was used
+        // before, a new one otherwise (Revision 5 D)
+        (Some(ip), Some(was)) if ip != was => {
+            ca::switch_authority(&opts.data, &opts.keys, ip)?;
+            ca::ensure(
+                &opts.data,
+                &opts.keys,
+                &ca::Target { ip },
+                &ca::computer_name(),
+                now / 1000,
+            )?
+        }
         (_, Some(was)) => {
             ca::ensure_existing(&opts.data, &opts.keys, &ca::Target { ip: was }, now / 1000)?
         }
@@ -1587,6 +1739,7 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
             sign_ins: HashMap::new(),
         }),
         changing_apps: Mutex::new(()),
+        closed: Mutex::new(HashMap::new()),
         data: opts.data.clone(),
         helper_port: std::sync::atomic::AtomicU16::new(cfg.ports.helper),
         cfg,
@@ -1686,9 +1839,11 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
                 if full {
                     last_full = hub.now();
                 }
-                let found = hub.find_address(full);
+                let found = hub.home_address_now(full);
                 if found != hub.address() {
                     hub.move_to(found);
+                } else {
+                    hub.reopen_missing();
                 }
             }
         })?);

@@ -1011,6 +1011,28 @@ impl Fixture {
         self.phone(app, method, path, &all, Some(&bytes))
     }
 
+    /// As [`Fixture::phone_json`], on the app port's listener for a tunnel's connector
+    /// (`tunnel_listen`), as a request through the tunnel arrives.
+    pub fn tunnel_json(
+        &self,
+        app: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Reply {
+        let addr = SocketAddr::from((self.tunnel_listen, self.port(app).port()));
+        let bytes = serde_json::to_vec(body).unwrap();
+        let mut all = headers.to_vec();
+        all.push(("Content-Type", "application/json"));
+        let req = request(method, path, &addr.to_string(), &all, Some(&bytes));
+        // (the hub's own certificate is for its home address)
+        let home = self.hub().address().expect("a home address").to_string();
+        https_named(addr, &[self.hub().ca_der()], &home, &req)
+            .expect("an answer from the hub")
+            .0
+    }
+
     /// A request with a device token.
     pub fn api(&self, app: &str, token: &str, method: &str, path: &str) -> Reply {
         let auth = format!("Bearer {token}");

@@ -14,12 +14,17 @@ repository = "https://github.com/moneykeepproject/keep-hub"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# HMAC for protocol 2's proofs (Revision 5 A), and the challenges' random bytes. The hub and
+# the family's apps already use it.
+ring = "0.17"
 zeroize = "1"
 
 # DPAPI, to seal the shared secret before it is written (seal.rs), and a file's owner
 # (owner.rs), as the hub and ShareKeep.
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography"] }
+# Who listens on the admin address (listener.rs, Revision 5 B): the listening sockets'
+# processes, the KeepHub service's process, and a process's user.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Services", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

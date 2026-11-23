@@ -13,10 +13,11 @@ Group=keep-hub
 ExecStart=/usr/bin/keep-hub service-run --data /var/lib/keep-hub
 Restart=on-failure
 RestartSec=30
-# /var/lib/keep-hub, owned by keep-hub; its group may enter, for admin.token (0640)
+# /var/lib/keep-hub, owned by keep-hub; its group may enter, for admin.token (0640) only:
+# everything else the service writes is its own (UMask 0077, Revision 5 H)
 StateDirectory=keep-hub
 StateDirectoryMode=0750
-UMask=0027
+UMask=0077
 # Reading the firewall's rules for Find the problem (check 4), and nothing more
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

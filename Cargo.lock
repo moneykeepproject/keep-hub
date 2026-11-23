@@ -411,6 +411,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "keep-hub-app",
+ "libc",
  "rcgen",
  "ring",
  "rusqlite",
@@ -432,6 +433,7 @@ dependencies = [
 name = "keep-hub-app"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde",
  "serde_json",
  "sha2",

@@ -4,8 +4,10 @@
 //!
 //! - **Passwords** are kept only as an Argon2id record (the PIN's form, [`crate::pin`]).
 //! - **Sessions** live in the hub's memory only: 32 random bytes, of which the hub keeps the
-//!   SHA-256. A session lasts `admin.session_minutes` from its last use, and ends when the
-//!   hub restarts, when its member is removed or made a standard member, or on sign-out.
+//!   SHA-256. A session lasts `admin.session_minutes` from its last use and at most
+//!   `admin.session_max_hours` from sign-in, and ends when the hub restarts, when its member
+//!   is removed or made a standard member, when their password is set or reset (also by
+//!   `keep-hub reset-administrator` with the hub running: Revision 5 E), or on sign-out.
 //! - **Wrong passwords** are counted per administrator: five in 10 minutes pause that
 //!   administrator's sign-in for 10 minutes. Others can still sign in.
 //! - **An open household** (Revision 2 B) is one where the computer's sign-in is enough:
@@ -37,6 +39,12 @@ const MAX_PASSWORD: usize = 256;
 pub(crate) struct Session {
     member: u32,
     last_used: i64,
+    /// When the administrator signed in: a session ends `admin.session_max_hours` after,
+    /// however much it is used (Revision 5 E).
+    signed_in: i64,
+    /// The member's epoch at sign-in: `keep-hub reset-administrator` raises it, which ends
+    /// the session at its next use.
+    epoch: i64,
 }
 
 /// One administrator's wrong passwords, and when a pause ends.
@@ -44,6 +52,8 @@ pub(crate) struct Session {
 pub(crate) struct SignIn {
     wrong: VecDeque<i64>,
     paused_until: i64,
+    /// The member's epoch these counts are for: a reset from the command line clears them.
+    epoch: i64,
 }
 
 fn session_key(token: &str) -> [u8; 32] {
@@ -367,11 +377,14 @@ impl Hub {
 
     fn new_session(st: &mut State, member: u32, now: i64) -> Result<Zeroizing<String>, Refusal> {
         let token = Zeroizing::new(util::hex(&util::random::<32>().map_err(Refusal::inner)?));
+        let epoch = st.registry.epoch(member).map_err(Refusal::inner)?;
         st.sessions.insert(
             session_key(&token),
             Session {
                 member,
                 last_used: now,
+                signed_in: now,
+                epoch,
             },
         );
         Ok(token)
@@ -379,6 +392,10 @@ impl Hub {
 
     fn session_ms(&self) -> i64 {
         i64::from(self.cfg.admin.session_minutes.max(1)) * 60_000
+    }
+
+    fn session_max_ms(&self) -> i64 {
+        i64::from(self.cfg.admin.session_max_hours.max(1)) * 3_600_000
     }
 
     /// Sign an administrator in with their name and password: a session.
@@ -411,7 +428,15 @@ impl Hub {
                 }
                 return Err(wrong());
             };
+            // a reset from the command line since these counts began clears them
+            let epoch = st.registry.epoch(member.id).map_err(Refusal::inner)?;
             let s = st.sign_ins.entry(member.id).or_default();
+            if s.epoch != epoch {
+                *s = SignIn {
+                    epoch,
+                    ..SignIn::default()
+                };
+            }
             if s.paused_until > now {
                 return Err(paused());
             }
@@ -465,13 +490,19 @@ impl Hub {
             return Err(administrator_needed());
         };
         let now = self.now();
-        let life = self.session_ms();
+        let (life, longest) = (self.session_ms(), self.session_max_ms());
         let key = session_key(session);
         let mut st = self.lock();
-        st.sessions.retain(|_, s| now - s.last_used < life);
-        let Some(id) = st.sessions.get(&key).map(|s| s.member) else {
+        st.sessions
+            .retain(|_, s| now - s.last_used < life && now - s.signed_in < longest);
+        let Some((id, epoch)) = st.sessions.get(&key).map(|s| (s.member, s.epoch)) else {
             return Err(administrator_needed());
         };
+        // `keep-hub reset-administrator` since sign-in ends the session (Revision 5 E)
+        if st.registry.epoch(id).map_err(Refusal::inner)? != epoch {
+            Self::end_sessions(&mut st, id, None);
+            return Err(administrator_needed());
+        }
         let member = st.registry.member(id).map_err(Refusal::inner)?;
         let Some(member) = member.filter(Member::is_administrator) else {
             st.sessions.remove(&key);
@@ -686,6 +717,8 @@ pub fn reset_administrator(
         return Err(format!("There is no administrator named {}.", name.trim()));
     };
     let record = pin::hash(password)?;
-    registry.set_password(m.id, Some(&record))?;
+    // (with the epoch raised: every session of theirs ends, in a running hub too, and their
+    // sign-in pause is cleared: Revision 5 E)
+    registry.reset_password(m.id, &record)?;
     Ok(m.id)
 }

@@ -75,6 +75,31 @@ pub const MIGRATIONS: &[&str] = &[
     // 2 → 3 (stage 9, Revision 2 A): how an app's phones pair. Apps registered before
     // pair with a code and the household PIN, as they always did.
     "ALTER TABLE apps ADD COLUMN pairing TEXT NOT NULL DEFAULT 'code_and_pin';",
+    // 3 → 4 (stage 11, Revision 5 E and H): a member id is never used twice, so `members`
+    // is made again with AUTOINCREMENT, its counter starting above every id a member or a
+    // device has ever had; and each member has an `epoch`, raised when their sessions must
+    // end from outside the running hub (`keep-hub reset-administrator`).
+    "CREATE TABLE members_4 (
+         id          INTEGER PRIMARY KEY AUTOINCREMENT,
+         name        TEXT NOT NULL,
+         guest_app   TEXT,
+         guest_scope TEXT,
+         created     INTEGER NOT NULL,
+         class       TEXT NOT NULL DEFAULT 'standard',
+         password    TEXT,
+         epoch       INTEGER NOT NULL DEFAULT 0
+     );
+     INSERT INTO members_4 (id, name, guest_app, guest_scope, created, class, password)
+         SELECT id, name, guest_app, guest_scope, created, class, password FROM members;
+     DROP TABLE members;
+     ALTER TABLE members_4 RENAME TO members;
+     DELETE FROM sqlite_sequence WHERE name IN ('members', 'members_4');
+     INSERT INTO sqlite_sequence (name, seq)
+         SELECT 'members', COALESCE(MAX(id), 0) FROM (
+             SELECT id FROM members
+             UNION ALL SELECT member FROM devices
+             UNION ALL SELECT member FROM grants
+         );",
 ];
 
 /// A member's class (the spec, "Administrators and standard members").
@@ -469,6 +494,32 @@ impl Registry {
             .conn
             .execute(
                 "UPDATE members SET password = ?2 WHERE id = ?1 AND class = 'administrator'",
+                rusqlite::params![id, record],
+            )
+            .map_err(sql)?;
+        Ok(n > 0)
+    }
+
+    /// A member's epoch: raised when their sessions end from outside the running hub.
+    /// 0 for a member there is no row for.
+    pub fn epoch(&self, id: u32) -> StoreResult<i64> {
+        self.conn
+            .query_row("SELECT epoch FROM members WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(sql)
+            .map(|e| e.unwrap_or(0))
+    }
+
+    /// Set an administrator's password record and raise their epoch, in one write: every
+    /// session they have ends, in a running hub too (Revision 5 E).
+    pub fn reset_password(&self, id: u32, record: &str) -> StoreResult<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE members SET password = ?2, epoch = epoch + 1
+                 WHERE id = ?1 AND class = 'administrator'",
                 rusqlite::params![id, record],
             )
             .map_err(sql)?;
@@ -934,6 +985,62 @@ mod tests {
         assert!(!a.pairs_by_code_alone());
         assert_eq!(Registry::read_apps(dir.path()).unwrap(), before);
         assert_eq!(r.get(HOUSEHOLD_KEY).unwrap(), None, "a secured household");
+    }
+
+    /// Acceptance test 74: a member id is never used twice, guests included.
+    #[test]
+    fn at74_a_removed_members_id_is_never_given_again() {
+        let mut r = Registry::in_memory().unwrap();
+        let admin = r.add_member_as("Admin", ADMINISTRATOR, 1).unwrap();
+        let sam = r.add_member("Sam", 1).unwrap();
+        r.add_device("tok", sam, "trips", "phone", 1).unwrap();
+        assert!(r.remove_member(sam, 2).unwrap());
+        let ana = r.add_member("Ana", 3).unwrap();
+        assert!(ana > sam, "{ana} after {sam}");
+        assert_ne!(ana, admin);
+        // Sam's revoked phone doesn't list under Ana
+        assert!(r.devices().unwrap().iter().all(|d| d.member != ana));
+        r.add_invite("INVITE01", "trips", "t", 3, 99).unwrap();
+        let invite = r.invite_by_code("INVITE01").unwrap().unwrap();
+        let (kim, _) = r.pair_guest(&invite, "Kim", "tok2", 3).unwrap().unwrap();
+        r.remove_member(kim, 4).unwrap();
+        assert!(r.add_member("Lee", 5).unwrap() > kim);
+    }
+
+    /// A registry from before Revision 5 (migrations 1 to 3) whose newest member was
+    /// removed, leaving a revoked phone: the next member gets a new id, not the removed one.
+    #[test]
+    fn a_registry_from_before_revision_5_never_gives_a_removed_id_again() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut r = Registry::open_with(dir.path(), &MIGRATIONS[..3]).unwrap();
+            let a = r.add_member_as("Admin", ADMINISTRATOR, 1).unwrap();
+            r.set_password(a, Some("record")).unwrap();
+            let sam = r.add_member("Sam", 1).unwrap();
+            r.add_device("tok", sam, "trips", "phone", 1).unwrap();
+            r.remove_member(sam, 2).unwrap();
+        }
+        let r = Registry::open(dir.path()).unwrap();
+        let m = r.members().unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m[0].password_set && m[0].is_administrator());
+        assert_eq!(r.epoch(m[0].id).unwrap(), 0);
+        assert_eq!(r.add_member("Ana", 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_reset_password_raises_the_epoch() {
+        let r = Registry::in_memory().unwrap();
+        let a = r.add_member_as("Admin", ADMINISTRATOR, 1).unwrap();
+        let s = r.add_member("Sam", 1).unwrap();
+        assert_eq!(r.epoch(a).unwrap(), 0);
+        assert!(r.reset_password(a, "new").unwrap());
+        assert_eq!(r.epoch(a).unwrap(), 1);
+        assert!(
+            !r.reset_password(s, "new").unwrap(),
+            "only an administrator"
+        );
+        assert_eq!(r.password_of(a).unwrap().as_deref(), Some("new"));
     }
 
     /// Acceptance test 21.

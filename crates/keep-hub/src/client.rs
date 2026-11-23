@@ -147,6 +147,19 @@ impl HttpsClient {
     }
 }
 
+/// The first of `addrs` that answers, tried in order (Revision 5 H: a name whose first
+/// address is IPv6 still works where IPv6 doesn't).
+fn connect_any(addrs: &[std::net::SocketAddr]) -> Result<TcpStream, String> {
+    let mut last = "no address".to_string();
+    for a in addrs {
+        match TcpStream::connect_timeout(a, TIMEOUT) {
+            Ok(t) => return Ok(t),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(last)
+}
+
 impl Http for HttpsClient {
     fn send(
         &self,
@@ -157,16 +170,15 @@ impl Http for HttpsClient {
     ) -> Result<Response, String> {
         let u = Url::parse(url)?;
         let where_ = format!("{}:{}", u.host, u.port);
-        let addr = where_
+        let addrs: Vec<std::net::SocketAddr> = where_
             .to_socket_addrs()
             .map_err(|e| format!("{} can't be found: {e}", u.host))?
-            .next()
-            .ok_or_else(|| format!("{} can't be found", u.host))?;
+            .collect();
         let name = ServerName::try_from(u.host.clone()).map_err(|e| e.to_string())?;
         let mut conn =
             rustls::ClientConnection::new(self.config.clone(), name).map_err(|e| e.to_string())?;
-        let mut tcp = TcpStream::connect_timeout(&addr, TIMEOUT)
-            .map_err(|e| format!("{} can't be reached: {e}", u.host))?;
+        let mut tcp =
+            connect_any(&addrs).map_err(|e| format!("{} can't be reached: {e}", u.host))?;
         tcp.set_read_timeout(Some(TIMEOUT))
             .map_err(|e| e.to_string())?;
         tcp.set_write_timeout(Some(TIMEOUT))
@@ -305,6 +317,22 @@ mod tests {
             None
         );
         assert_eq!(parse_response(b"not http"), None);
+    }
+
+    /// Revision 5 H: every address a name resolves to is tried, in order.
+    #[test]
+    fn each_address_is_tried_in_order() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = l.local_addr().unwrap();
+        // a port nothing listens on, first
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let t = connect_any(&[dead, good]).unwrap();
+        assert_eq!(t.peer_addr().unwrap(), good);
+        assert!(connect_any(&[dead]).is_err());
+        assert!(connect_any(&[]).is_err());
     }
 
     #[test]

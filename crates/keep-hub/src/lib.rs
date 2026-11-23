@@ -42,6 +42,7 @@ pub mod page;
 pub mod pin;
 pub mod probe;
 pub mod problems;
+pub mod proof;
 pub mod registry;
 pub mod relay;
 pub mod seal;

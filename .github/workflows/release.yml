@@ -12,7 +12,41 @@ permissions:
   contents: read
 
 jobs:
+  # Nothing is built unless the tag is the version the program reports and the tests pass
+  # on Windows and Linux (Revision 5 H).
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the program's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          reported="$(cargo run -q --locked -p keep-hub -- version)"
+          echo "tag $TAG, program $reported"
+          test "$TAG" = "v$reported"
+
+  tests:
+    needs: version
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust (stable, with rustfmt and clippy)
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
   windows:
+    needs: tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +68,7 @@ jobs:
             dist/keep-hub-*-windows-x64-setup.exe.sha256
 
   linux:
+    needs: tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +86,7 @@ jobs:
             dist/keep-hub_*.deb.sha256
 
   mac:
+    needs: tests
     runs-on: [self-hosted, macOS]
     steps:
       - uses: actions/checkout@v4

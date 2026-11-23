@@ -26,7 +26,7 @@ use tiny_http::{Header, Request, Response};
 use crate::ca::{self, Info};
 use crate::hub::Hub;
 use crate::probe::Arrived;
-use crate::relay::Slot;
+use crate::relay::{self, Slot};
 use crate::util as store;
 
 pub const CA_CRT_PATH: &str = "/keep-hub-ca.crt";
@@ -218,6 +218,9 @@ pub struct AppLink {
     pub id: String,
     pub title: String,
     pub port: u16,
+    /// Its phones pair with the code alone (Revision 2 A): the code is the whole credential,
+    /// so it never goes into this plain-HTTP page's links (Revision 5 G).
+    pub by_code: bool,
 }
 
 /// Where the page was opened from: a pairing code (or guest invite) for one app.
@@ -226,8 +229,9 @@ pub struct Join {
     pub app: AppLink,
     /// `pair` or `invite`.
     pub key: &'static str,
-    /// Shown as `ABCD-EFGH`.
-    pub code: String,
+    /// Shown as `ABCD-EFGH`. `None` for an app that pairs with the code alone: the person
+    /// types the code shown on the computer into the app instead (Revision 5 G).
+    pub code: Option<String>,
 }
 
 /// A pairing code or invite from the page's address, if it is one (8 letters and digits,
@@ -249,16 +253,24 @@ pub fn page(info: &Info, device: Device, apps: &[AppLink], join: Option<&Join>) 
         )
     };
     let step2 = join
-        .map(|j| {
-            format!(
+        .map(|j| match &j.code {
+            Some(code) => format!(
                 r#"<div class="card"><h2>Step 2: join</h2>
 <p>After the certificate is installed, open {title}:</p>
 {link}
 <p class="muted">The code is <b>{code}</b>. It works once.</p></div>"#,
                 title = xml(&j.app.title),
-                link = open(&j.app, &format!("#{}={}", j.key, xml(&j.code))),
-                code = xml(&j.code),
-            )
+                link = open(&j.app, &format!("#{}={}", j.key, xml(code))),
+                code = xml(code),
+            ),
+            None => format!(
+                r#"<div class="card"><h2>Step 2: join</h2>
+<p>After the certificate is installed, open {title}:</p>
+{link}
+<p class="muted">Then type the code shown on the hub computer into {title}. It works once.</p></div>"#,
+                title = xml(&j.app.title),
+                link = open(&j.app, ""),
+            ),
         })
         .unwrap_or_default();
     let mut sections = [
@@ -359,6 +371,7 @@ pub(crate) fn handle(hub: &Arc<Hub>, req: Request) {
         .unwrap_or_default()
         .into_iter()
         .map(|a| AppLink {
+            by_code: a.pairs_by_code_alone(),
             id: a.id,
             title: a.title,
             port: a.public_port,
@@ -366,13 +379,22 @@ pub(crate) fn handle(hub: &Arc<Hub>, req: Request) {
         .collect();
     let join = query(&url, "app").and_then(|id| {
         let app = apps.iter().find(|a| a.id == id)?.clone();
+        // an app that pairs with the code alone: `pair=` is ignored, and its link opens the
+        // app without a code (Revision 5 G)
+        if app.by_code && query(&url, "invite").is_none() {
+            return Some(Join {
+                app,
+                key: "pair",
+                code: None,
+            });
+        }
         let (key, raw) = query(&url, "pair")
             .map(|c| ("pair", c))
             .or_else(|| query(&url, "invite").map(|c| ("invite", c)))?;
         Some(Join {
             app,
             key,
-            code: code_param(raw)?,
+            code: Some(code_param(raw)?),
         })
     });
     let get = req.method() == &tiny_http::Method::Get || req.method() == &tiny_http::Method::Head;
@@ -430,8 +452,8 @@ pub(crate) fn handle(hub: &Arc<Hub>, req: Request) {
 
 /// The page's front on the home network: at most [`MAX_HELPER`] connections,
 /// [`crate::relay::MAX_PER_ADDRESS`] from one address, each closed after [`HELPER_IDLE`] without traffic,
-/// passed to the page's own server on `backend`. Waits in `accept`; closing wakes it
-/// ([`crate::relay::wake`]).
+/// passed to the page's own server on `backend`. Polls for connections, so closing needs no
+/// connection to the port ([`crate::relay::next_connection`]).
 ///
 /// The front reads each request line first. A probe (`GET /_probe/<nonce>`, Revision 4 A) is
 /// answered here, where the visitor's address is known, and goes no further; anything else
@@ -445,39 +467,23 @@ pub(crate) fn front(
     let stopping = hub.stopping.clone();
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(std::collections::HashMap::<IpAddr, usize>::new()));
-    if listener.set_nonblocking(false).is_err() {
-        return;
-    }
-    loop {
-        let accepted = listener.accept();
-        if stop.load(Ordering::SeqCst) || stopping.load(Ordering::SeqCst) {
-            return;
-        }
-        match accepted {
-            Ok((tcp, peer)) => {
-                if active.load(Ordering::SeqCst) >= MAX_HELPER {
-                    drop(tcp);
-                    continue;
-                }
-                let Some(slot) = Slot::take(&per, peer.ip()) else {
-                    drop(tcp);
-                    continue;
-                };
-                active.fetch_add(1, Ordering::SeqCst);
-                let (act, hub) = (active.clone(), hub.clone());
-                let spawned = std::thread::Builder::new()
-                    .name("hub-page-front".into())
-                    .spawn(move || {
-                        let _slot = slot;
-                        let _ = visit(tcp, peer, &hub, backend);
-                        act.fetch_sub(1, Ordering::SeqCst);
-                    });
-                if spawned.is_err() {
-                    active.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
+    let stopped = || stop.load(Ordering::SeqCst) || stopping.load(Ordering::SeqCst);
+    while let Some((tcp, peer)) = relay::next_connection(&listener, &stopped) {
+        let Some(counted) = relay::Counted::take(&active, MAX_HELPER) else {
+            drop(tcp);
+            continue;
+        };
+        let Some(slot) = Slot::take(&per, peer.ip()) else {
+            drop(tcp);
+            continue;
+        };
+        let hub = hub.clone();
+        let _ = std::thread::Builder::new()
+            .name("hub-page-front".into())
+            .spawn(move || {
+                let (_counted, _slot) = (counted, slot);
+                let _ = visit(tcp, peer, &hub, backend);
+            });
     }
 }
 
@@ -602,6 +608,7 @@ mod tests {
             id: "vacapick".into(),
             title: "VacaPick".into(),
             port: 16443,
+            by_code: false,
         }];
         let p = page(&info(), Device::Android, &apps, None);
         assert!(p.contains("AAAA BBBB CCCC DDDD EEEE FFFF 0000 1111"));
@@ -613,12 +620,25 @@ mod tests {
         let join = Join {
             app: apps[0].clone(),
             key: "pair",
-            code: "ABCD-EFGH".into(),
+            code: Some("ABCD-EFGH".into()),
         };
         let p = page(&info(), Device::Android, &apps, Some(&join));
         assert!(
             p.contains(r#"href="https://192.168.1.20:16443/#pair=ABCD-EFGH">Open VacaPick</a>"#)
         );
+        // a code-alone app: the link opens it without a code (Revision 5 G)
+        let join = Join {
+            app: AppLink {
+                by_code: true,
+                ..apps[0].clone()
+            },
+            key: "pair",
+            code: None,
+        };
+        let p = page(&info(), Device::Android, &apps, Some(&join));
+        assert!(p.contains("Step 2"));
+        assert!(!p.contains("#pair="));
+        assert!(p.contains("type the code shown on the hub computer"));
     }
 
     #[test]

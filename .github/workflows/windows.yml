@@ -1,5 +1,5 @@
 # The Windows setup run for real: scripts/ci/windows-install.ps1, its scenarios in order on
-# one runner (acceptance tests 24, 25 and 26). The script is a CI script: PowerShell runs
+# one runner (acceptance tests 24, 25 and 26), and acceptance test 79 on the installed hub. The script is a CI script: PowerShell runs
 # here, never in Keep Hub or its setup.
 name: Windows setup
 
@@ -41,6 +41,9 @@ jobs:
       - name: Install with no app registered
         shell: powershell
         run: .\scripts\ci\windows-install.ps1 -Scenario install
+      # acceptance test 79: a start that fails (16081 held) is started again by itself
+      - name: A failed start is started again
+        run: cargo test -p keep-hub --test service at79 -- --ignored --nocapture
       - name: Update
         shell: powershell
         run: .\scripts\ci\windows-install.ps1 -Scenario upgrade

@@ -843,7 +843,7 @@ fn registering_refuses_a_taken_port_and_an_unknown_protocol_with_plain_messages(
     assert!(r.json()["message"].as_str().unwrap().contains("Test alpha"));
     // a protocol the hub doesn't know
     let mut reg = Fixture::registration(&beta, free_port(), false, false);
-    reg["protocol"] = json!(2);
+    reg["protocol"] = json!(3);
     let r = f.admin("POST", "/admin/v1/apps", Some(reg));
     assert_eq!((r.status, r.error().as_str()), (409, "unknown_protocol"));
     // ids, and the hub's own ports
@@ -864,7 +864,7 @@ fn registering_refuses_a_taken_port_and_an_unknown_protocol_with_plain_messages(
     // the port opened at once, on registering
     assert_eq!(f.phone("alpha", "GET", "/hub/check", &[], None).status, 200);
     let status = f.admin_ok("GET", "/admin/v1/status", None);
-    assert_eq!(status["protocols"], json!([1]));
+    assert_eq!(status["protocols"], json!([1, 2]));
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["apps"][0]["state"], "running");
 }
