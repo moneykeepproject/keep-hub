@@ -5,8 +5,10 @@
 //! cargo xtask workflows   only release.yml may name the project's own Mac (self-hosted)
 //! cargo xtask guards      no panics in shipped code; sources keep LF line endings
 //! cargo xtask installer   the Windows setup (installer.rs)
+//! cargo xtask deb         the Linux package (deb.rs)
 //! ```
 
+mod deb;
 mod installer;
 mod licences;
 
@@ -21,12 +23,16 @@ fn main() -> ExitCode {
         "ci" => ci(&root),
         "workflows" => report(check_workflows(&root)),
         "guards" => report(check_guards(&root)),
+        "deb" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            deb::deb(&root, &rest)
+        }
         "installer" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             installer::installer(&root, &rest)
         }
         _ => {
-            eprintln!("usage: cargo xtask <ci|workflows|guards|installer>");
+            eprintln!("usage: cargo xtask <ci|workflows|guards|installer|deb>");
             return ExitCode::from(2);
         }
     };
@@ -223,6 +229,16 @@ fn check_guards(root: &Path) -> Vec<String> {
             "rs", "toml", "lock", "md", "yml", "yaml", "json", "sh", "command", "ps1", "nsi",
             "plist", "py", "html", "js", "wat",
         ],
+    )
+    .into_iter()
+    // the Linux package's files: shell scripts without an extension, the unit, sysusers
+    .chain(
+        fs::read_dir(root.join("installer").join("linux"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file()),
     ) {
         match fs::read(&path) {
             Ok(bytes) if bytes.contains(&b'\r') => {

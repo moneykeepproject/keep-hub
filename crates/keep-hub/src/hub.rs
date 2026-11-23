@@ -25,6 +25,7 @@ use zeroize::Zeroizing;
 use crate::config::HubConfig;
 use crate::keys::KeyStore;
 use crate::machine::{self, Machine};
+use crate::probe::{self, Arrived, Probes};
 use crate::registry::{App, Device, Member, Registry, CODE, CODE_AND_PIN, PIN_KEY};
 use crate::util::{self, StoreResult};
 use crate::{admin, ca, names, page, pin, relay};
@@ -78,6 +79,10 @@ pub struct HubOptions {
     pub machine: Option<Arc<dyn Machine>>,
     /// How often the hub looks at the default route for a new address.
     pub address_poll: Duration,
+    /// Where each app port also listens for a tunnel's connector (Revision 4 A):
+    /// 127.0.0.1. Only there is Cloudflare's connecting-address header believed. When the
+    /// home address is this address (the tests' hubs), its one listener is this one.
+    pub tunnel_listen: Ipv4Addr,
 }
 
 /// How often the hub looks for a new address (owner decision 2026-11-18: a cheap look at
@@ -99,6 +104,7 @@ impl HubOptions {
             outside: None,
             machine: None,
             address_poll: ADDRESS_POLL,
+            tunnel_listen: Ipv4Addr::LOCALHOST,
         }
     }
 }
@@ -198,11 +204,16 @@ pub(crate) struct Listener {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     pub(crate) addr: SocketAddr,
+    /// The same app port on the tunnel's loopback address, when it is open there too.
+    also: Option<Box<Listener>>,
 }
 
 impl Listener {
-    /// Stop accepting and wait for the port to close.
+    /// Stop accepting and wait for the port to close (and its loopback twin).
     fn close(mut self) {
+        if let Some(t) = self.also.take() {
+            t.close();
+        }
         self.stop.store(true, Ordering::SeqCst);
         // Wait for the loop only when it was woken: otherwise it ends by itself with the
         // next connection, and the hub mustn't hang on it.
@@ -258,6 +269,12 @@ pub(crate) struct Hub {
     pub(crate) gate: Arc<relay::Gate>,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) names: Arc<names::Names>,
+    /// The probe's nonces and limits (Revision 4 A).
+    probes: Mutex<Probes>,
+    /// Where app ports listen for a tunnel's connector ([`HubOptions::tunnel_listen`]).
+    tunnel_listen: Ipv4Addr,
+    /// `tunnel.hostname` as it now stands (Revision 4 B).
+    tunnel_hostname: Mutex<String>,
 }
 
 fn normalise_code(code: &str) -> String {
@@ -772,6 +789,30 @@ impl Hub {
         let ip = self
             .address()
             .ok_or("This computer isn't on a home network, so no port is opened.")?;
+        let arrived = if ip == self.tunnel_listen {
+            Arrived::Loopback
+        } else {
+            Arrived::Home
+        };
+        let mut home = self.listen_app(app, ip, port, arrived)?;
+        if arrived == Arrived::Home {
+            // the tunnel's connector reaches the same port on loopback; a failure there
+            // leaves the home network working
+            match self.listen_app(app, self.tunnel_listen, port, Arrived::Loopback) {
+                Ok(l) => home.also = Some(Box::new(l)),
+                Err(e) => self.log(&format!("{e} (for a tunnel's connector)")),
+            }
+        }
+        Ok(home)
+    }
+
+    fn listen_app(
+        self: &Arc<Self>,
+        app: &str,
+        ip: Ipv4Addr,
+        port: u16,
+        arrived: Arrived,
+    ) -> StoreResult<Listener> {
         let listener = TcpListener::bind((ip, port)).map_err(|e| {
             format!("Port {port} can't be opened on {ip}: {e}. Is another program using it?")
         })?;
@@ -780,13 +821,14 @@ impl Hub {
         let thread = {
             let (hub, app, stop) = (self.clone(), app.to_string(), stop.clone());
             spawn(&format!("hub-{app}"), move || {
-                relay::accept_loop(listener, hub, app, stop)
+                relay::accept_loop(listener, hub, app, stop, arrived)
             })?
         };
         Ok(Listener {
             stop,
             thread: Some(thread),
             addr,
+            also: None,
         })
     }
 
@@ -1028,8 +1070,169 @@ impl Hub {
             "code_page": names["code_page"],
             "code_needed": names["code_needed"],
             "household": if self.is_open()? { "open" } else { "secured" },
+            "tunnel": { "hostname": self.tunnel_hostname() },
+            "keys": crate::seal::protection(),
             "apps": apps,
         }))
+    }
+}
+
+// ----- the probe and the tunnel (Revision 4) ----------------------------------------------------
+
+impl Hub {
+    /// A probe request on one of the hub's ports: its status (204, 404 or 429).
+    pub(crate) fn probe_request(
+        &self,
+        nonce: &str,
+        peer: IpAddr,
+        arrived: Arrived,
+        cloudflare: bool,
+    ) -> u16 {
+        let source = probe::source(peer, arrived, cloudflare, self.address());
+        let outcome = self
+            .probes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .request(nonce, peer, source, self.now());
+        if outcome == (probe::Outcome::Unknown { log: true }) {
+            self.log(&format!(
+                "probe: {} unknown probe nonces in the last hour",
+                probe::UNKNOWN_LOGGED_AT
+            ));
+        }
+        outcome.status()
+    }
+
+    /// The registered app whose port a tunnel uses: the first one registered.
+    pub(crate) fn first_app(&self) -> Result<Option<App>, Refusal> {
+        let apps = self.lock().registry.apps().map_err(Refusal::inner)?;
+        Ok(apps
+            .into_iter()
+            .min_by_key(|a| (a.registered, a.public_port)))
+    }
+
+    /// `POST /admin/v1/probe`: a fresh nonce, the address a phone should open, its life.
+    pub(crate) fn issue_probe(&self) -> Result<Value, Refusal> {
+        let nonce = util::hex(&util::random::<16>().map_err(Refusal::inner)?);
+        let minutes = HubConfig::load(&self.data)
+            .map(|c| c.probe.minutes)
+            .unwrap_or(crate::config::PROBE_MINUTES)
+            .max(1);
+        let path = format!("{}{nonce}", probe::PREFIX);
+        // by name on the first app port when names are on; otherwise the address on the
+        // certificate page's port
+        let by_name = match (self.names.serving(), self.first_app()?) {
+            (Some(c), Some(a)) => Some(format!("https://{}:{}{path}", c.name, a.public_port)),
+            _ => None,
+        };
+        let url = by_name.or_else(|| {
+            self.address()
+                .map(|ip| format!("http://{ip}:{}{path}", self.helper_port()))
+        });
+        let expires = self.probes.lock().unwrap_or_else(|p| p.into_inner()).issue(
+            nonce.clone(),
+            self.now(),
+            minutes,
+        );
+        Ok(json!({
+            "nonce": nonce,
+            "url": url,
+            "expires": expires,
+            "minutes": minutes,
+        }))
+    }
+
+    /// `GET /admin/v1/probe/<nonce>`: whether the hub saw it, when and how.
+    pub(crate) fn probe_seen(&self, nonce: &str) -> Result<Value, Refusal> {
+        let found = self
+            .probes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .lookup(nonce, self.now());
+        match found {
+            None => Err(Refusal::new(
+                404,
+                "no_such_probe",
+                "The hub didn't issue that probe, or its life is over.",
+            )),
+            Some(None) => Ok(json!({ "seen": false })),
+            Some(Some(s)) => Ok(json!({ "seen": true, "when": s.when, "source": s.source })),
+        }
+    }
+
+    /// `tunnel.hostname` (empty: none).
+    pub(crate) fn tunnel_hostname(&self) -> Option<String> {
+        let h = self
+            .tunnel_hostname
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        (!h.is_empty()).then_some(h)
+    }
+
+    /// Set or clear (`""`) `tunnel.hostname`. A name the rules refuse leaves the old one.
+    pub(crate) fn set_tunnel_hostname(&self, name: &str) -> Result<Option<String>, Refusal> {
+        let name = crate::config::check_hostname(name)
+            .map_err(|m| Refusal::new(400, "bad_hostname", m))?;
+        let mut cfg = HubConfig::load(&self.data).map_err(Refusal::inner)?;
+        cfg.tunnel.hostname = name.clone();
+        cfg.save(&self.data).map_err(Refusal::inner)?;
+        *self
+            .tunnel_hostname
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = name;
+        Ok(self.tunnel_hostname())
+    }
+
+    /// `PUT /admin/v1/tunnel/moneykeep-name` (Path B of `cloudflare-tunnel.md`): ask the
+    /// name service for a tunnel to the first app's port, set the hostname to the away name
+    /// it answers, and give back the tunnel token. The hub keeps no copy of the token and
+    /// logs nothing of it.
+    pub(crate) fn make_moneykeep_tunnel(&self) -> Result<Value, Refusal> {
+        self.moneykeep_tunnel_routes()?;
+        let Some(app) = self.first_app()? else {
+            return Err(Refusal::new(
+                409,
+                "no_apps",
+                "No app is registered yet, so there is no port for the tunnel. Turn on phones in an app first.",
+            ));
+        };
+        let made = self
+            .names
+            .make_tunnel(app.public_port)
+            .map_err(|m| Refusal::new(502, "name_service_refused", m))?;
+        let hostname = self.set_tunnel_hostname(&made.hostname)?;
+        self.log("tunnel: the name service made the tunnel (away name set)");
+        Ok(json!({
+            "hostname": hostname,
+            "port": app.public_port,
+            "token": made.token.as_str(),
+        }))
+    }
+
+    /// `DELETE /admin/v1/tunnel/moneykeep-name`: the name service deletes the tunnel, and the
+    /// hostname is cleared.
+    pub(crate) fn remove_moneykeep_tunnel(&self) -> Result<Value, Refusal> {
+        self.moneykeep_tunnel_routes()?;
+        self.names
+            .remove_tunnel()
+            .map_err(|m| Refusal::new(502, "name_service_refused", m))?;
+        self.set_tunnel_hostname("")?;
+        self.log("tunnel: the name service removed the tunnel");
+        Ok(json!({ "hostname": null }))
+    }
+
+    /// The MoneyKeep-name routes exist only with names on and an address set.
+    fn moneykeep_tunnel_routes(&self) -> Result<(), Refusal> {
+        if self.names.address_set() {
+            Ok(())
+        } else {
+            Err(Refusal::new(
+                404,
+                "not_found",
+                "There is nothing at that address: a tunnel for the MoneyKeep name needs hub names on and the hub's address set.",
+            ))
+        }
     }
 }
 
@@ -1049,16 +1252,16 @@ impl Hub {
         self.helper_port.store(addr.port(), Ordering::SeqCst);
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (backend, stop, stopping) =
-                (self.page_backend, stop.clone(), self.stopping.clone());
+            let (hub, backend, stop) = (self.clone(), self.page_backend, stop.clone());
             spawn("hub-page-front", move || {
-                page::front(listener, backend, stop, stopping)
+                page::front(listener, hub, backend, stop)
             })?
         };
         Ok(Listener {
             stop,
             thread: Some(thread),
             addr,
+            also: None,
         })
     }
 
@@ -1295,6 +1498,11 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         c.address.current = home;
         c.save(&opts.data)?;
     }
+    // (a hostname edited by hand that the rules refuse isn't shown)
+    let tunnel_hostname = crate::config::check_hostname(&cfg.tunnel.hostname).unwrap_or_else(|e| {
+        (opts.log)(&format!("tunnel.hostname: {e}"));
+        String::new()
+    });
     let resolver = Arc::new(ca::Resolver::new(&material)?);
     let tls = ca::server_config(resolver.clone())?;
     let registry = Registry::open(&opts.data)?;
@@ -1381,6 +1589,9 @@ pub fn start(opts: HubOptions) -> StoreResult<Running> {
         gate: relay::Gate::new(),
         stopping: Arc::new(AtomicBool::new(false)),
         names,
+        probes: Mutex::new(Probes::default()),
+        tunnel_listen: opts.tunnel_listen,
+        tunnel_hostname: Mutex::new(tunnel_hostname),
     });
 
     if home.is_some() {

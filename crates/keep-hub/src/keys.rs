@@ -3,8 +3,9 @@
 //!
 //! Kept in the hub's data folder, one file per key. On Windows each file is sealed by DPAPI
 //! for this computer ([`crate::seal`], machine scope), and the hub's installer lets only the
-//! hub's service account and administrators into the folder; elsewhere the files are readable
-//! only by their owner (root, for the macOS daemon). A key is never sent to a device, put in
+//! hub's service account and administrators into the folder. On Linux they are sealed with the
+//! systemd credential's master key when the service has it ([`crate::seal::set_master`]).
+//! Otherwise the files are readable only by their owner. A key is never sent to a device, put in
 //! `hub.json` or written to a log. A plain key file from before sealing is sealed the first
 //! time it's read. Tests keep keys in memory.
 
@@ -61,7 +62,7 @@ impl KeyStore {
                 Ok(b) => {
                     let (key, sealed) = seal::unseal(&b, Scope::Machine)
                         .map_err(|e| format!("the key {name} can't be opened: {e}"))?;
-                    if !sealed && seal::SEALS {
+                    if !sealed && seal::seals() {
                         // written before sealing: seal it now (best effort)
                         let _ = self.set(name, &key);
                     }

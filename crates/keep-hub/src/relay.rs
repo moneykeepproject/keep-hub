@@ -38,6 +38,7 @@ use serde_json::json;
 
 use crate::http::{self, Answer, Head, LengthError};
 use crate::hub::{Hub, Identity, Refusal, PROTOCOLS, VERSION};
+use crate::probe::{self, Arrived};
 use crate::util;
 
 /// Phones connected at once to one app port (each connection has a thread).
@@ -165,6 +166,7 @@ pub(crate) fn accept_loop(
     hub: Arc<Hub>,
     app: String,
     stop: Arc<AtomicBool>,
+    arrived: Arrived,
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
@@ -192,7 +194,7 @@ pub(crate) fn accept_loop(
                     .name("hub-tls".into())
                     .spawn(move || {
                         let _slot = slot;
-                        let _ = serve(tcp, peer, &hub, &app);
+                        let _ = serve(tcp, peer, &hub, &app, arrived);
                         act.fetch_sub(1, Ordering::SeqCst);
                     });
                 if spawned.is_err() {
@@ -346,7 +348,13 @@ fn forward_head(head: &Head, secret: &str, who: Option<&Identity>) -> Vec<u8> {
 }
 
 /// One phone connection: the TLS handshake, one request, its answer.
-fn serve(tcp: TcpStream, peer: SocketAddr, hub: &Arc<Hub>, app: &str) -> std::io::Result<()> {
+fn serve(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    hub: &Arc<Hub>,
+    app: &str,
+    arrived: Arrived,
+) -> std::io::Result<()> {
     tcp.set_nonblocking(false)?;
     tcp.set_write_timeout(Some(hub.idle))?;
     let _ = tcp.set_nodelay(true);
@@ -389,11 +397,33 @@ fn serve(tcp: TcpStream, peer: SocketAddr, hub: &Arc<Hub>, app: &str) -> std::io
     let path = head.path().to_string();
     let method = head.method.as_str();
 
+    // the probe (Revision 4 A): answered here, never forwarded. Nothing but the request
+    // line is read, except on the tunnel's loopback listener, where only whether
+    // Cloudflare's header is present counts.
+    if let Some(nonce) = probe::nonce_of(&head.target) {
+        let status = if method == "GET" {
+            let cloudflare =
+                arrived == Arrived::Loopback && head.header(probe::CLOUDFLARE_HEADER).is_some();
+            hub.probe_request(nonce, peer.ip(), arrived, cloudflare)
+        } else {
+            404
+        };
+        hub.log_request(method, "/_probe/-", status);
+        tls.write_all(&http::empty_answer(status, by_name(hub, &tls)))?;
+        return close(&mut tls);
+    }
+
     // who answers
     if path == "/hub" || path.starts_with("/hub/") {
         return match (method, path.as_str()) {
             ("GET" | "HEAD", "/hub/check") => {
-                let a = Answer::ok(json!({ "hub": "keep-hub", "ok": true }));
+                // (Revision 4: the probe path and the tunnel's hostname, for an app to show)
+                let a = Answer::ok(json!({
+                    "hub": "keep-hub",
+                    "ok": true,
+                    "probe": format!("{}<nonce>", probe::PREFIX),
+                    "tunnel_hostname": hub.tunnel_hostname(),
+                }));
                 finish(hub, &mut tls, method, &path, &a)
             }
             ("GET", "/hub/whoami") => {

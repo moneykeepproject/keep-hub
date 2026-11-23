@@ -45,15 +45,15 @@ The hub holds no app's books and no app's rules.
 | Path | What |
 |---|---|
 | `docs/specs/keep-hub.md` | What the hub must do |
-| `docs/implementation/stage-1.md` … `stage-7.md` | What each stage built, the choices it made, and what it left for later stages |
+| `docs/implementation/stage-1.md` … `stage-10.md` | What each stage built, the choices it made, and what it left for later stages |
 | `AGENTS.md` | Rules for every contributor. Read it first |
 | `crates/keep-hub` | The hub: library and the `keep-hub` program |
 | `crates/keep-hub-app` | The small library each app copies: find the hub, register, check `Keep-Hub-Auth` on the app's backend, and the Phones screen's requests. See `docs/implementation/stage-6.md` |
-| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, `library.rs`: stage 6, `service.rs` and `browser.rs`: stage 7, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
-| `installer/windows`, `installer/macos` | The Windows setup (NSIS) and the Mac disk image's scripts |
+| `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, `library.rs`: stage 6, `service.rs` and `browser.rs`: stage 7, `administrators.rs`: stage 8, `revisions.rs`: stage 9, `tunnel.rs` and `linux.rs`: stage 10, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
+| `installer/windows`, `installer/macos`, `installer/linux` | The Windows setup (NSIS), the Mac disk image's scripts, and the Linux package's systemd unit, sysusers file and maintainer scripts |
 | `scripts/ci/windows-install.ps1` | The Windows setup run for real: install, update, an older version refused, remove with apps registered, install again |
 | `.github/workflows` | CI on Linux, Windows and macOS; the Windows setup's run; the draft release |
-| `xtask` | `cargo xtask ci`, the repository rules and `cargo xtask installer` |
+| `xtask` | `cargo xtask ci`, the repository rules, `cargo xtask installer` and `cargo xtask deb` |
 
 Crates are added as the build stages in `AGENTS.md` are reached.
 
@@ -73,6 +73,7 @@ MIT OR Apache-2.0, at your option, as the other MoneyKeep Apps.
 ```sh
 cargo xtask installer        # Windows, with NSIS 3: dist/keep-hub-<version>-windows-x64-setup.exe
 installer/macos/make-dmg.sh <version> target/release   # on a Mac, after cargo build --release -p keep-hub
+cargo xtask deb              # Linux, with dpkg-deb: dist/keep-hub_<version>_<arch>.deb
 ```
 
 Users never build anything: keep-launcher installs the hub from its releases.

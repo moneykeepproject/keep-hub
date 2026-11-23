@@ -706,6 +706,9 @@ pub struct Fixture {
     pub address_poll: Duration,
     /// How long a backend may take to start its answer.
     pub first_byte: Duration,
+    /// Where app ports listen for a tunnel's connector (the home address, 127.0.0.1, unless
+    /// a test moves it).
+    pub tunnel_listen: Ipv4Addr,
     /// The test administrator's session, once the hub is set up.
     session: Mutex<Option<String>>,
     hub: Option<Running>,
@@ -772,6 +775,7 @@ impl Fixture {
             machine: Arc::new(machine::FakeMachine::at(Ipv4Addr::LOCALHOST)),
             address_poll: Duration::from_millis(100),
             first_byte: keep_hub::relay::FIRST_BYTE,
+            tunnel_listen: Ipv4Addr::LOCALHOST,
             session: Mutex::new(None),
             hub: None,
         };
@@ -802,6 +806,7 @@ impl Fixture {
             machine: Some(self.machine.clone()),
             address_poll: self.address_poll,
             first_byte: self.first_byte,
+            tunnel_listen: self.tunnel_listen,
         })
         .unwrap();
         self.hub = Some(hub);

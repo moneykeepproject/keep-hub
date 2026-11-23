@@ -714,3 +714,55 @@ fn the_code_page_through_the_library() {
         Some("https://example.org/codes")
     );
 }
+
+// ----- stage 10: Revision 4 through the library ---------------------------------------------------
+
+/// What ServicesKeep calls: a probe and whether it was seen, the tunnel hostname, and Fix.
+#[test]
+fn the_probe_the_tunnel_hostname_and_fix_through_the_library() {
+    let f = hub_on_known_port();
+    let hub = client(&f);
+    let p = hub.probe().unwrap();
+    assert_eq!(p.minutes, 10);
+    assert!(!hub.probe_seen(&p.nonce).unwrap().seen);
+    let r = support::http(
+        f.hub().helper().unwrap(),
+        "GET",
+        &format!("/_probe/{}", p.nonce),
+        &[],
+        None,
+    );
+    assert_eq!(r.status, 204);
+    let s = hub.probe_seen(&p.nonce).unwrap();
+    assert!(s.seen);
+    assert_eq!(s.source.as_deref(), Some("this_computer"));
+    assert_eq!(
+        hub.probe_seen("0123456789abcdef0123").unwrap_err().code,
+        "no_such_probe"
+    );
+
+    assert_eq!(
+        hub.set_tunnel_hostname("hub.example.org")
+            .unwrap()
+            .as_deref(),
+        Some("hub.example.org")
+    );
+    let st = hub.status().unwrap();
+    assert_eq!(
+        st.tunnel.and_then(|t| t.hostname).as_deref(),
+        Some("hub.example.org")
+    );
+    assert_eq!(
+        hub.set_tunnel_hostname("bad name").unwrap_err().code,
+        "bad_hostname"
+    );
+    hub.clear_tunnel_hostname().unwrap();
+    assert_eq!(hub.status().unwrap().tunnel.unwrap().hostname, None);
+
+    *f.machine.firewall.lock().unwrap() = Some(keep_hub::machine::FirewallScan::default());
+    let c = hub.fix(4).unwrap();
+    assert_eq!((c.number, c.status.as_str()), (4, "ok"));
+    assert_eq!(hub.fix(9).unwrap_err().code, "no_fix");
+    // names off: no tunnel from the name service
+    assert_eq!(hub.make_moneykeep_tunnel().unwrap_err().code, "not_found");
+}

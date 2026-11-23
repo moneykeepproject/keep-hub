@@ -1,0 +1,13 @@
+#!/bin/sh
+# keep-hub postrm: purge deletes the data folder and the sealing key, as Debian's rules
+# say. It asks nothing: ServicesKeep or keep-launcher asks before removing the hub.
+set -e
+case "$1" in
+    purge)
+        rm -rf /var/lib/keep-hub
+        rm -f /etc/credstore.encrypted/keep-hub-master
+        rm -rf /etc/systemd/system/keep-hub.service.d
+        systemctl daemon-reload || true
+        ;;
+esac
+exit 0

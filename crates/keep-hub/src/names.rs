@@ -527,6 +527,47 @@ impl Names {
         self.load().name
     }
 
+    /// Whether names are on and the name service has taken this hub's address: the tunnel
+    /// routes of Revision 4 B exist only then.
+    pub fn address_set(&self) -> bool {
+        let settings = self.live().settings.clone();
+        let saved = self.load();
+        settings.enabled
+            && self.registration(&saved, &settings).is_some()
+            && saved.address_sent.is_some()
+    }
+
+    /// The hub's id and token at the name service in use.
+    fn credentials(&self) -> Result<(String, Zeroizing<String>, String), String> {
+        let settings = self.live().settings.clone();
+        let saved = self.load();
+        let (id, _) = self
+            .registration(&saved, &settings)
+            .ok_or("The hub isn't registered with the name service.")?;
+        let token = self
+            .keys
+            .get(TOKEN_KEY)?
+            .ok_or("The name service's token is missing: turn names off, then on with a new registration code.")?;
+        let token = Zeroizing::new(String::from_utf8_lossy(&token).into_owned());
+        Ok((id, token, settings.service))
+    }
+
+    /// Make tunnel at the name service (revision 1) for `port`. Its refusal in its own words.
+    pub fn make_tunnel(&self, port: u16) -> Result<crate::nameservice::Tunnel, String> {
+        let (id, token, service) = self.credentials()?;
+        NameService::new(self.outside.http.as_ref(), &service)
+            .make_tunnel(&id, &token, port)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Remove tunnel at the name service (revision 1).
+    pub fn remove_tunnel(&self) -> Result<(), String> {
+        let (id, token, service) = self.credentials()?;
+        NameService::new(self.outside.http.as_ref(), &service)
+            .remove_tunnel(&id, &token)
+            .map_err(|e| e.to_string())
+    }
+
     /// The outside world the engine uses (for Find the problem).
     pub fn outside(&self) -> &Outside {
         &self.outside

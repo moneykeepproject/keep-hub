@@ -1,0 +1,2 @@
+# Keep Hub's own system user and group (systemd-sysusers). Revision 4 D.
+u keep-hub - "Keep Hub" /var/lib/keep-hub /usr/sbin/nologin

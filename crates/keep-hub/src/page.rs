@@ -13,6 +13,7 @@
 //!
 //! No scripts; nothing secret. Anything else redirects to `/`.
 
+use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,7 @@ use tiny_http::{Header, Request, Response};
 
 use crate::ca::{self, Info};
 use crate::hub::Hub;
+use crate::probe::Arrived;
 use crate::relay::Slot;
 use crate::util as store;
 
@@ -430,12 +432,17 @@ pub(crate) fn handle(hub: &Arc<Hub>, req: Request) {
 /// [`crate::relay::MAX_PER_ADDRESS`] from one address, each closed after [`HELPER_IDLE`] without traffic,
 /// passed to the page's own server on `backend`. Waits in `accept`; closing wakes it
 /// ([`crate::relay::wake`]).
+///
+/// The front reads each request line first. A probe (`GET /_probe/<nonce>`, Revision 4 A) is
+/// answered here, where the visitor's address is known, and goes no further; anything else
+/// is passed on with the line it read.
 pub(crate) fn front(
     listener: TcpListener,
+    hub: Arc<Hub>,
     backend: SocketAddr,
     stop: Arc<AtomicBool>,
-    stopping: Arc<AtomicBool>,
 ) {
+    let stopping = hub.stopping.clone();
     let active = Arc::new(AtomicUsize::new(0));
     let per = Arc::new(Mutex::new(std::collections::HashMap::<IpAddr, usize>::new()));
     if listener.set_nonblocking(false).is_err() {
@@ -457,12 +464,12 @@ pub(crate) fn front(
                     continue;
                 };
                 active.fetch_add(1, Ordering::SeqCst);
-                let act = active.clone();
+                let (act, hub) = (active.clone(), hub.clone());
                 let spawned = std::thread::Builder::new()
                     .name("hub-page-front".into())
                     .spawn(move || {
                         let _slot = slot;
-                        let _ = pipe(tcp, backend);
+                        let _ = visit(tcp, peer, &hub, backend);
                         act.fetch_sub(1, Ordering::SeqCst);
                     });
                 if spawned.is_err() {
@@ -474,13 +481,62 @@ pub(crate) fn front(
     }
 }
 
-/// Bytes both ways between a visitor and the page's server, until either side closes or
-/// nothing moves for [`HELPER_IDLE`].
-fn pipe(outer: TcpStream, backend: SocketAddr) -> std::io::Result<()> {
+/// The longest request line the front reads before deciding (a probe's is far shorter).
+const MAX_LINE: usize = 8 * 1024;
+
+/// One visitor: its request line, then a probe's answer or the page's server.
+fn visit(
+    mut outer: TcpStream,
+    peer: SocketAddr,
+    hub: &Arc<Hub>,
+    backend: SocketAddr,
+) -> std::io::Result<()> {
     outer.set_nonblocking(false)?;
     outer.set_read_timeout(Some(HELPER_IDLE))?;
     outer.set_write_timeout(Some(HELPER_IDLE))?;
-    let inner = TcpStream::connect_timeout(&backend, Duration::from_secs(5))?;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\n") && line.len() < MAX_LINE {
+        match outer.read(&mut byte)? {
+            0 => break,
+            _ => line.push(byte[0]),
+        }
+    }
+    let text = String::from_utf8_lossy(&line);
+    let mut parts = text.trim_end().split(' ');
+    let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    if let Some(nonce) = crate::probe::nonce_of(target) {
+        let status = if method == "GET" {
+            hub.probe_request(nonce, peer.ip(), Arrived::Home, false)
+        } else {
+            404
+        };
+        outer.write_all(&crate::http::empty_answer(status, false))?;
+        hub.log_request(method, "/_probe/-", status);
+        // The rest of the request is read and dropped, unlooked at, before closing: closing
+        // with unread bytes makes Windows reset the connection, and the visitor would lose
+        // the answer.
+        let _ = outer.shutdown(Shutdown::Write);
+        let _ = outer.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut sink = [0u8; 1024];
+        let mut left = MAX_LINE * 2;
+        while left > 0 {
+            match outer.read(&mut sink) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+        let _ = outer.shutdown(Shutdown::Both);
+        return Ok(());
+    }
+    pipe(outer, backend, &line)
+}
+
+/// Bytes both ways between a visitor and the page's server (after `first`, what the front
+/// already read), until either side closes or nothing moves for [`HELPER_IDLE`].
+fn pipe(outer: TcpStream, backend: SocketAddr, first: &[u8]) -> std::io::Result<()> {
+    let mut inner = TcpStream::connect_timeout(&backend, Duration::from_secs(5))?;
+    inner.write_all(first)?;
     inner.set_read_timeout(Some(HELPER_IDLE))?;
     inner.set_write_timeout(Some(HELPER_IDLE))?;
     let (mut from_in, mut to_out) = (inner.try_clone()?, outer.try_clone()?);

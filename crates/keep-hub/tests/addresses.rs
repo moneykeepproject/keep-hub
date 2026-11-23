@@ -89,8 +89,11 @@ fn at15_a_new_address_reaches_the_name_service_keeps_the_name_certificate_and_ma
     assert!(app.seen().iter().any(|s| s.target == "/api/hello"));
     // the certificate page is on the new address and shows the new fingerprint
     assert_eq!(f.hub().helper().unwrap().ip(), MOVED);
-    // the old address answers no more
-    assert!(std::net::TcpStream::connect(("127.0.0.1", f.port("vacapick").port())).is_err());
+    // 127.0.0.1 was the home address here, and is also where a tunnel's connector reaches
+    // the hub (Revision 4 A): the port there is now that listener alone, and the home port
+    // is on the new address only
+    assert!(std::net::TcpStream::connect(("127.0.0.1", f.port("vacapick").port())).is_ok());
+    assert_eq!(f.port("vacapick").ip(), MOVED);
     assert!(f.log_lines().iter().any(|l| l.contains("address changed")));
 }
 

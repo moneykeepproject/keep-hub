@@ -47,6 +47,14 @@
 //! A  PUT    /admin/v1/address        {adapter}     which adapter's address to use ("automatic")
 //!    POST   /admin/v1/problems                     Find the problem: run the checks
 //!    GET    /admin/v1/problems                     the last results
+//! A  POST   /admin/v1/problems/fix   {check}       Fix (check 4 only): check 4's new result
+//! A  POST   /admin/v1/probe                        a probe nonce and the address to open
+//!    GET    /admin/v1/probe/<nonce>                whether the hub saw it, when and how
+//! A  PUT    /admin/v1/tunnel         {hostname}    the tunnel's public hostname
+//! A  DELETE /admin/v1/tunnel                       clear it
+//! A  PUT    /admin/v1/tunnel/moneykeep-name        a tunnel from the name service: its token,
+//!                                                  once (only with names on and an address set)
+//! A  DELETE /admin/v1/tunnel/moneykeep-name        the name service deletes it
 //! ```
 
 use std::io::Read;
@@ -83,9 +91,12 @@ fn send(hub: &Hub, req: Request, status: u16, body: &Value) {
     }
     let _ = req.respond(resp);
     // A pairing code in a path is a secret: the log names the kind of address only.
-    let shown = match path.strip_prefix("/admin/v1/pairing-codes/") {
-        Some(_) => "/admin/v1/pairing-codes/-",
-        None => path.as_str(),
+    let shown = if path.starts_with("/admin/v1/pairing-codes/") {
+        "/admin/v1/pairing-codes/-"
+    } else if path.starts_with("/admin/v1/probe/") {
+        "/admin/v1/probe/-"
+    } else {
+        path.as_str()
     };
     hub.log_request(&method, shown, status);
 }
@@ -190,6 +201,16 @@ struct InviteRequest {
 struct NamesOnRequest {
     #[serde(default)]
     registration_code: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FixRequest {
+    check: u8,
+}
+
+#[derive(Deserialize)]
+struct HostnameRequest {
+    hostname: String,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +473,33 @@ fn call(hub: &Arc<Hub>, req: &mut Request, method: &str, parts: &[&str]) -> Resu
             let results = crate::problems::run(hub);
             hub.lock().problems = Some(results.clone());
             Ok(results)
+        }
+        ("POST", ["problems", "fix"]) => {
+            need()?;
+            let b: FixRequest = read_json(req)?;
+            crate::problems::fix(hub, b.check)
+        }
+        ("POST", ["probe"]) => {
+            need()?;
+            hub.issue_probe()
+        }
+        ("GET", ["probe", nonce]) => hub.probe_seen(nonce),
+        ("PUT", ["tunnel"]) => {
+            need()?;
+            let b: HostnameRequest = read_json(req)?;
+            Ok(json!({ "hostname": hub.set_tunnel_hostname(&b.hostname)? }))
+        }
+        ("DELETE", ["tunnel"]) => {
+            need()?;
+            Ok(json!({ "hostname": hub.set_tunnel_hostname("")? }))
+        }
+        ("PUT", ["tunnel", "moneykeep-name"]) => {
+            need()?;
+            hub.make_moneykeep_tunnel()
+        }
+        ("DELETE", ["tunnel", "moneykeep-name"]) => {
+            need()?;
+            hub.remove_moneykeep_tunnel()
         }
         ("GET", ["problems"]) => Ok(hub
             .lock()

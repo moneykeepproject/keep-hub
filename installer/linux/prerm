@@ -1,0 +1,13 @@
+#!/bin/sh
+# keep-hub prerm: the service stops (and, on remove, is no longer started at boot).
+# /var/lib/keep-hub is kept: a reinstall has the same name and pairings.
+set -e
+case "$1" in
+    remove)
+        /usr/bin/keep-hub remove-service || true
+        ;;
+    upgrade|deconfigure|failed-upgrade)
+        systemctl stop keep-hub.service || true
+        ;;
+esac
+exit 0

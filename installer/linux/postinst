@@ -1,0 +1,10 @@
+#!/bin/sh
+# keep-hub postinst: the service's user, the sealing key, the certificate page's port in
+# the firewall, and the service started (keep-hub install-service does each step).
+set -e
+case "$1" in
+    configure)
+        /usr/bin/keep-hub install-service
+        ;;
+esac
+exit 0

@@ -86,6 +86,10 @@ pub struct FirewallScan {
     pub named: Vec<FoundRule>,
     #[serde(default)]
     pub program_rules: Vec<FoundRule>,
+    /// On Linux: the firewall that is on and the ports it lets in (the Windows parts are
+    /// then empty).
+    #[serde(default)]
+    pub linux: Option<crate::linuxfw::LinuxFirewall>,
 }
 
 /// The state of the hub's rule.
@@ -156,6 +160,11 @@ pub struct FirewallRule {
     pub profiles: Vec<String>,
     /// The program the rule is limited to (the installed hub).
     pub program: String,
+    /// The ports to let in: every registered app port and the certificate page's. A
+    /// Windows rule names the program and covers any port; a firewall that can't name a
+    /// program needs the ports.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 impl FirewallRule {
@@ -164,6 +173,7 @@ impl FirewallRule {
             name: FIREWALL_RULE.into(),
             profiles: vec!["Private".into(), "Domain".into()],
             program: program.display().to_string(),
+            ports: Vec::new(),
         }
     }
 
@@ -255,6 +265,7 @@ pub fn parse_firewall_scan(json: &str) -> Result<FirewallScan, String> {
                 .map(serde_json::Value::take)
                 .unwrap_or_default(),
         ),
+        linux: None,
     })
 }
 
@@ -374,7 +385,33 @@ pub fn choose(
 }
 
 /// What the hub asks of this computer.
+/// The kind of system the hub runs on (some checks differ).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Os {
+    Windows,
+    Mac,
+    Linux,
+}
+
+impl Os {
+    /// The system this program was built for.
+    pub fn current() -> Os {
+        if cfg!(windows) {
+            Os::Windows
+        } else if cfg!(target_os = "macos") {
+            Os::Mac
+        } else {
+            Os::Linux
+        }
+    }
+}
+
 pub trait Machine: Send + Sync {
+    /// The kind of system (the real one by default; a fake says which it plays).
+    fn os(&self) -> Os {
+        Os::current()
+    }
     /// [`default_route_address`] (cheap: checked every 15 seconds).
     fn default_address(&self) -> Option<Ipv4Addr>;
     /// This computer's home addresses with their adapters (and, on Windows, profiles).
@@ -479,6 +516,12 @@ impl Machine for System {
     }
 
     fn firewall_scan(&self) -> Result<Option<FirewallScan>, String> {
+        if cfg!(target_os = "linux") {
+            return Ok(Some(FirewallScan {
+                linux: Some(crate::linuxfw::system()?),
+                ..FirewallScan::default()
+            }));
+        }
         if !cfg!(windows) {
             return Ok(None);
         }
@@ -497,6 +540,16 @@ impl Machine for System {
 /// prompt): put the hub's rule back for `program`, and remove Windows' Block rules for it.
 /// What was done, in words.
 pub fn fix_firewall(machine: &dyn Machine, program: &Path) -> Result<Vec<String>, String> {
+    fix_firewall_for(machine, program, &[])
+}
+
+/// [`fix_firewall`] with the ports the rule must let in (the hub's own Fix, which knows
+/// them: `POST /admin/v1/problems/fix`).
+pub fn fix_firewall_for(
+    machine: &dyn Machine,
+    program: &Path,
+    ports: &[u16],
+) -> Result<Vec<String>, String> {
     let check = firewall_check(machine.firewall_scan()?);
     if !check.managed {
         return Ok(vec![
@@ -508,7 +561,8 @@ pub fn fix_firewall(machine: &dyn Machine, program: &Path) -> Result<Vec<String>
             "The firewall rule \"{FIREWALL_RULE}\" is in place."
         )]);
     }
-    let rule = FirewallRule::for_program(program);
+    let mut rule = FirewallRule::for_program(program);
+    rule.ports = ports.to_vec();
     let ids: Vec<String> = check.block_rules.iter().map(|r| r.id.clone()).collect();
     machine.fix_firewall(&rule, &ids)?;
     let mut done = vec![format!(
@@ -547,6 +601,7 @@ mod tests {
         let c = firewall_check(Some(FirewallScan {
             named: vec![rule(FIREWALL_RULE, false, "Allow", "")],
             program_rules: vec![],
+            linux: None,
         }));
         assert_eq!(c.rule, RuleState::Disabled);
         let c = firewall_check(Some(FirewallScan {
@@ -566,6 +621,7 @@ mod tests {
                 ),
                 rule("other", true, "Block", r"C:\x\other.exe"),
             ],
+            linux: None,
         }));
         assert_eq!(c.rule, RuleState::Ok);
         assert_eq!(c.block_rules.len(), 1, "only Block rules naming the hub");
@@ -689,6 +745,7 @@ mod tests {
             scan: std::sync::Mutex::new(FirewallScan {
                 named: vec![],
                 program_rules: vec![rule("keep-hub", true, "Block", r"C:\x\keep-hub.exe")],
+                linux: None,
             }),
             fixed: std::sync::Mutex::new(Vec::new()),
         };
@@ -702,6 +759,7 @@ mod tests {
         *f.scan.lock().unwrap() = FirewallScan {
             named: vec![rule(FIREWALL_RULE, true, "Allow", "")],
             program_rules: vec![],
+            linux: None,
         };
         fix_firewall(&f, exe).unwrap();
         assert_eq!(f.fixed.lock().unwrap().len(), 1);

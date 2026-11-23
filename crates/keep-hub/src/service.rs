@@ -193,7 +193,13 @@ pub fn may_fail(s: &Step) -> bool {
     let a: Vec<&str> = s.iter().map(String::as_str).collect();
     matches!(
         a.as_slice(),
-        ["sc.exe", "stop", ..] | ["sc.exe", "delete", ..] | ["netsh.exe", _, _, "delete", ..]
+        ["sc.exe", "stop", ..]
+            | ["sc.exe", "delete", ..]
+            | ["netsh.exe", _, _, "delete", ..]
+            | ["systemctl", "disable", ..]
+            | ["ufw", ..]
+            | ["firewall-cmd", ..]
+            | ["usermod", ..]
     )
 }
 
@@ -367,6 +373,203 @@ pub fn macos_plist_path() -> String {
     format!("/Library/LaunchDaemons/{LAUNCHD_LABEL}.plist")
 }
 
+// ----- Linux (Revision 4 D) ---------------------------------------------------------------------
+
+/// The Linux data folder (`StateDirectory=keep-hub`).
+pub const LINUX_DATA: &str = "/var/lib/keep-hub";
+/// The service's system user and group (`systemd-sysusers`).
+pub const LINUX_USER: &str = "keep-hub";
+/// The systemd unit.
+pub const LINUX_UNIT: &str = "keep-hub.service";
+/// Where the package puts the unit and the sysusers file.
+pub const LINUX_UNIT_FILE: &str = "/usr/lib/systemd/system/keep-hub.service";
+pub const LINUX_SYSUSERS_FILE: &str = "/usr/lib/sysusers.d/keep-hub.conf";
+/// The sealing key's systemd credential: its name and its sealed file.
+pub const CREDENTIAL_NAME: &str = "keep-hub-master";
+pub const CREDENTIAL_FILE: &str = "/etc/credstore.encrypted/keep-hub-master";
+/// The drop-in that gives the service the credential (written only when it was made).
+pub const SEALING_DROPIN: &str = "/etc/systemd/system/keep-hub.service.d/10-sealing.conf";
+
+/// The unit, the sysusers file and the package's scripts, as shipped
+/// (`installer/linux/`; `cargo xtask deb` puts them in the `.deb`).
+pub const LINUX_UNIT_TEXT: &str = include_str!("../../../installer/linux/keep-hub.service");
+pub const LINUX_SYSUSERS_TEXT: &str = include_str!("../../../installer/linux/keep-hub.sysusers");
+
+/// The drop-in's text.
+pub fn sealing_dropin() -> String {
+    format!(
+        "# Written by keep-hub install-service: the master key that seals keys/ (Revision 4 D).\n[Service]\nLoadCredentialEncrypted={CREDENTIAL_NAME}:{CREDENTIAL_FILE}\n"
+    )
+}
+
+/// A firewall on at install time (as root, which may ask ufw itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallFirewall {
+    Ufw,
+    Firewalld,
+    /// None, or one the package doesn't change (plain nftables: a rule added now would be
+    /// gone after a reboot).
+    Other,
+}
+
+/// What `keep-hub install-service` runs on Linux (as root, from the package's `postinst`),
+/// in order, after it made the sealing key ([`make_credential`]):
+/// the user, the installing person added to the group (they read `admin.token` after
+/// signing in again), the certificate page's port in the firewall that is on, and the
+/// service enabled and (re)started. App ports are ServicesKeep's to open (owner decision
+/// 2026-11-22).
+pub fn linux_install(person: Option<&str>, firewall: InstallFirewall, helper: u16) -> Vec<Step> {
+    let mut steps = vec![step(&["systemd-sysusers", LINUX_SYSUSERS_FILE])];
+    if let Some(p) = person {
+        steps.push(step(&["usermod", "--append", "--groups", LINUX_USER, p]));
+    }
+    let port = format!("{helper}/tcp");
+    match firewall {
+        InstallFirewall::Ufw => {
+            steps.push(step(&["ufw", "allow", &port, "comment", "Keep Hub"]));
+        }
+        InstallFirewall::Firewalld => {
+            let add = format!("--add-port={port}");
+            steps.push(step(&["firewall-cmd", "--permanent", &add]));
+            steps.push(step(&["firewall-cmd", "--reload"]));
+        }
+        InstallFirewall::Other => {}
+    }
+    steps.push(step(&["systemctl", "daemon-reload"]));
+    steps.push(step(&["systemctl", "enable", LINUX_UNIT]));
+    steps.push(step(&["systemctl", "restart", LINUX_UNIT]));
+    steps
+}
+
+/// `keep-hub remove-service` on Linux (the package's `prerm`): the service stops and is no
+/// longer started at boot. The data folder and the sealing key stay.
+pub fn linux_uninstall() -> Vec<Step> {
+    vec![step(&["systemctl", "disable", "--now", LINUX_UNIT])]
+}
+
+/// The person who installed the package (`sudo`, or a graphical installer through
+/// `pkexec`), never root.
+pub fn installing_person(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let ok = |n: &str| {
+        !n.is_empty()
+            && n != "root"
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    if let Some(u) = var("SUDO_USER").filter(|u| ok(u)) {
+        return Some(u);
+    }
+    let uid = var("PKEXEC_UID").filter(|u| u != "0" && u.bytes().all(|b| b.is_ascii_digit()))?;
+    let out = std::process::Command::new("id")
+        .args(["-nu", &uid])
+        .output()
+        .ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    ok(&name).then_some(name)
+}
+
+/// Whether this program runs as root (Linux).
+#[cfg(unix)]
+pub fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0)
+}
+
+/// Seal a new random master key as the systemd credential, unless there is one (its keys
+/// would not open with another). `Ok(false)`: `systemd-creds` isn't there or can't seal,
+/// so keys stay protected by file permissions only.
+pub fn make_credential(echo: &dyn Fn(&str)) -> Result<bool, String> {
+    use std::io::Write;
+    if Path::new(CREDENTIAL_FILE).exists() {
+        return Ok(true);
+    }
+    if let Some(parent) = Path::new(CREDENTIAL_FILE).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut child) = std::process::Command::new("systemd-creds")
+        .args([
+            "encrypt",
+            &format!("--name={CREDENTIAL_NAME}"),
+            "--with-key=auto",
+            "-",
+            CREDENTIAL_FILE,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        echo("systemd-creds isn't on this system: keys are protected by file permissions only.");
+        return Ok(false);
+    };
+    let key = zeroize::Zeroizing::new(crate::util::random::<32>()?);
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(key.as_slice())
+            .map_err(|e| format!("systemd-creds couldn't be given the key: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("systemd-creds failed: {e}"))?;
+    if !out.status.success() {
+        echo(&format!(
+            "systemd-creds couldn't seal the key ({}): keys are protected by file permissions only.",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(CREDENTIAL_FILE, std::fs::Permissions::from_mode(0o600));
+    }
+    echo("The key that seals Keep Hub's keys is sealed by systemd for this computer.");
+    Ok(true)
+}
+
+/// The firewall on now, asked as root.
+pub fn install_firewall() -> InstallFirewall {
+    let ufw = std::process::Command::new("ufw")
+        .arg("status")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("Status: active"));
+    if ufw {
+        return InstallFirewall::Ufw;
+    }
+    let firewalld = std::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", "firewalld"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if firewalld {
+        InstallFirewall::Firewalld
+    } else {
+        InstallFirewall::Other
+    }
+}
+
+/// The master key systemd gave the service (`$CREDENTIALS_DIRECTORY/keep-hub-master`).
+pub fn credential(dir: Option<std::ffi::OsString>) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    let path = PathBuf::from(dir?).join(CREDENTIAL_NAME);
+    std::fs::read(path).ok().map(zeroize::Zeroizing::new)
+}
+
+/// `admin.token` readable by the `keep-hub` group (owner decision 2026-11-22: the
+/// installing person is added to it), and the folder by the group too, to reach it.
+#[cfg(unix)]
+pub fn share_admin_token(data: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let set = |p: &Path, mode: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            format!(
+                "{} can't be shared with the keep-hub group: {e}",
+                p.display()
+            )
+        })
+    };
+    set(data, 0o750)?;
+    set(&data.join(crate::hub::ADMIN_TOKEN_FILE), 0o640)
+}
+
 /// Run the steps in order; a step that may fail is reported but doesn't stop the rest.
 pub fn run_steps(steps: &[Step], echo: &dyn Fn(&str)) -> Result<(), String> {
     for s in steps {
@@ -420,6 +623,148 @@ pub fn file_log(path: PathBuf) -> crate::hub::Log {
 
 #[cfg(test)]
 mod tests {
+    /// Revision 4 D: the unit runs as keep-hub with its state folder and one capability.
+    #[test]
+    fn the_linux_unit_runs_as_its_own_user_with_one_capability() {
+        let unit = LINUX_UNIT_TEXT;
+        let lines: Vec<&str> = unit
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
+        for want in [
+            "User=keep-hub",
+            "Group=keep-hub",
+            "StateDirectory=keep-hub",
+            "StateDirectoryMode=0750",
+            "Restart=on-failure",
+            "AmbientCapabilities=CAP_NET_ADMIN",
+            "CapabilityBoundingSet=CAP_NET_ADMIN",
+            "NoNewPrivileges=yes",
+            "WantedBy=multi-user.target",
+            "ExecStart=/usr/bin/keep-hub service-run --data /var/lib/keep-hub",
+        ] {
+            assert!(lines.contains(&want), "{want}");
+        }
+        // nothing else is granted, and it is never root
+        let granted: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.starts_with("AmbientCapabilities=") || l.starts_with("User="))
+            .collect();
+        assert_eq!(granted.len(), 2);
+        assert!(!lines
+            .iter()
+            .any(|l| *l == "User=root" || l.starts_with("DynamicUser=")));
+        assert!(LINUX_SYSUSERS_TEXT
+            .lines()
+            .any(|l| l.starts_with("u keep-hub - \"Keep Hub\" /var/lib/keep-hub")));
+        assert!(sealing_dropin().contains(
+            "LoadCredentialEncrypted=keep-hub-master:/etc/credstore.encrypted/keep-hub-master"
+        ));
+    }
+
+    /// `systemd-analyze verify` reads the unit as systemd will (where it is installed).
+    #[test]
+    fn systemd_accepts_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let unit = dir.path().join(LINUX_UNIT);
+        // (pointing ExecStart at a program that exists, for the check)
+        let text = LINUX_UNIT_TEXT.replace("/usr/bin/keep-hub", "/bin/true");
+        std::fs::write(&unit, text).unwrap();
+        let Ok(out) = std::process::Command::new("systemd-analyze")
+            .args(["verify", "--man=no"])
+            .arg(&unit)
+            .output()
+        else {
+            return; // not on this system
+        };
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !err.contains("Unknown key")
+                && !err.contains("Invalid")
+                && !err.contains("Failed to parse"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_linux_install_opens_the_certificate_page_only_and_starts_the_service() {
+        let ufw = linux_install(Some("jerry"), InstallFirewall::Ufw, 16080);
+        let flat: Vec<String> = ufw.iter().map(|s| s.join(" ")).collect();
+        assert_eq!(
+            flat,
+            [
+                "systemd-sysusers /usr/lib/sysusers.d/keep-hub.conf",
+                "usermod --append --groups keep-hub jerry",
+                "ufw allow 16080/tcp comment Keep Hub",
+                "systemctl daemon-reload",
+                "systemctl enable keep-hub.service",
+                "systemctl restart keep-hub.service",
+            ]
+        );
+        // the comment is one argument, as ufw needs it
+        assert!(ufw[2].contains(&"Keep Hub".to_string()));
+        let fwd: Vec<String> = linux_install(None, InstallFirewall::Firewalld, 16080)
+            .iter()
+            .map(|s| s.join(" "))
+            .collect();
+        assert!(fwd.contains(&"firewall-cmd --permanent --add-port=16080/tcp".to_string()));
+        assert!(!fwd.iter().any(|s| s.starts_with("usermod")));
+        let other = linux_install(None, InstallFirewall::Other, 16080);
+        assert!(!other
+            .iter()
+            .any(|s| s[0] == "ufw" || s[0] == "firewall-cmd"));
+        // a firewall step that fails doesn't stop the install; starting the service does
+        assert!(may_fail(&ufw[2]));
+        assert!(!may_fail(&ufw[5]));
+        assert_eq!(
+            linux_uninstall()[0].join(" "),
+            "systemctl disable --now keep-hub.service"
+        );
+    }
+
+    #[test]
+    fn the_installing_person_is_never_root() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            installing_person(env(&[("SUDO_USER", "jerry")])).as_deref(),
+            Some("jerry")
+        );
+        assert_eq!(installing_person(env(&[("SUDO_USER", "root")])), None);
+        assert_eq!(installing_person(env(&[("SUDO_USER", "a;rm -rf /")])), None);
+        assert_eq!(installing_person(env(&[("PKEXEC_UID", "0")])), None);
+        assert_eq!(installing_person(env(&[])), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_admin_token_is_shared_with_the_group_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(crate::hub::ADMIN_TOKEN_FILE), "t").unwrap();
+        share_admin_token(dir.path()).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.path().join(crate::hub::ADMIN_TOKEN_FILE)), 0o640);
+        assert_eq!(mode(dir.path()), 0o750);
+    }
+
+    #[test]
+    fn the_credential_systemd_gives_is_read_from_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(credential(Some(dir.path().as_os_str().to_owned())).is_none());
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), [9u8; 32]).unwrap();
+        let k = credential(Some(dir.path().as_os_str().to_owned())).unwrap();
+        assert_eq!(k.len(), 32);
+        assert!(credential(None).is_none());
+    }
+
     use super::*;
 
     #[test]

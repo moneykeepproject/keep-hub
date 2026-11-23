@@ -44,6 +44,66 @@ pub struct HubConfig {
     pub cert: CertSettings,
     #[serde(default)]
     pub admin: AdminSettings,
+    #[serde(default)]
+    pub tunnel: TunnelSettings,
+    #[serde(default)]
+    pub probe: ProbeSettings,
+}
+
+/// The `tunnel.*` settings (Revision 4 B).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TunnelSettings {
+    /// The public hostname ServicesKeep set up (empty: none). Shown to apps and phones,
+    /// nothing more.
+    pub hostname: String,
+}
+
+/// Life of a probe nonce in minutes (`probe.minutes`).
+pub const PROBE_MINUTES: u32 = 10;
+
+/// The `probe.*` settings (Revision 4 A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProbeSettings {
+    pub minutes: u32,
+}
+
+impl Default for ProbeSettings {
+    fn default() -> Self {
+        ProbeSettings {
+            minutes: PROBE_MINUTES,
+        }
+    }
+}
+
+/// The longest `tunnel.hostname`, in characters.
+pub const HOSTNAME_MAX: usize = 253;
+
+/// `tunnel.hostname` as it is kept: empty, or a host name of at most 253 characters whose
+/// labels are letters, digits and hyphens (each 1 to 63 characters, not starting or ending
+/// with a hyphen), in lower case. The reason when not.
+pub fn check_hostname(name: &str) -> Result<String, String> {
+    let n = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if n.is_empty() {
+        return Ok(n);
+    }
+    let why = format!(
+        "A tunnel hostname is at most {HOSTNAME_MAX} characters, in labels of letters, digits and hyphens separated by dots (such as hub.example.org)."
+    );
+    if n.len() > HOSTNAME_MAX {
+        return Err(why);
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    if !n.split('.').all(label_ok) {
+        return Err(why);
+    }
+    Ok(n)
 }
 
 /// How long an administrator's session lasts after its last use (stage 8).
@@ -270,6 +330,8 @@ impl HubConfig {
             names: NamesSettings::default(),
             cert: CertSettings::default(),
             admin: AdminSettings::default(),
+            tunnel: TunnelSettings::default(),
+            probe: ProbeSettings::default(),
         }
     }
 
@@ -341,6 +403,37 @@ mod tests {
         );
         s.code_page = "https://example.org/codes".into();
         assert_eq!(s.code_page(), "https://example.org/codes");
+    }
+
+    /// Revision 4 B: the tunnel hostname's rules.
+    #[test]
+    fn a_tunnel_hostname_is_labels_of_letters_digits_and_hyphens() {
+        assert_eq!(check_hostname("").unwrap(), "");
+        assert_eq!(
+            check_hostname(" Hub.Example.org. ").unwrap(),
+            "hub.example.org"
+        );
+        assert_eq!(
+            check_hostname("k7m2p9xw4t01.away.getmoneykeep.org").unwrap(),
+            "k7m2p9xw4t01.away.getmoneykeep.org"
+        );
+        let label = "a".repeat(63);
+        let long = [label.as_str(); 4].join(".");
+        assert_eq!(long.len(), 255);
+        let fits = &long[..253];
+        assert!(check_hostname(fits).is_ok());
+        for bad in [
+            long.as_str(),
+            &"a".repeat(300),
+            "hub example.org",
+            "hub_1.example.org",
+            "-hub.example.org",
+            "hub..example.org",
+            "https://hub.example.org",
+            &format!("{}a.example.org", label),
+        ] {
+            assert!(check_hostname(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

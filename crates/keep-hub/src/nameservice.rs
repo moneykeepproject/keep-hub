@@ -3,6 +3,8 @@
 
 use serde_json::json;
 
+use zeroize::Zeroizing;
+
 use crate::client::{Http, Response};
 
 /// The production name service (`names.service`).
@@ -40,6 +42,21 @@ pub struct Registered {
     pub token: String,
 }
 
+/// What Make tunnel gives: the away name, and the tunnel token for the connector.
+pub struct Tunnel {
+    pub hostname: String,
+    /// Passed on once, in the admin answer; never kept, never logged.
+    pub token: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for Tunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tunnel")
+            .field("hostname", &self.hostname)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct NameService<'a> {
     http: &'a dyn Http,
     base: String,
@@ -60,6 +77,17 @@ impl<'a> NameService<'a> {
         token: Option<&str>,
         body: Option<serde_json::Value>,
         ok: u16,
+    ) -> Result<Response, ServiceError> {
+        self.call_any(method, path, token, body, &[ok])
+    }
+
+    fn call_any(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<serde_json::Value>,
+        ok: &[u16],
     ) -> Result<Response, ServiceError> {
         let auth = token.map(|t| format!("Bearer {t}"));
         let mut headers: Vec<(&str, &str)> = Vec::new();
@@ -84,7 +112,7 @@ impl<'a> NameService<'a> {
                 message: e,
                 retry_after: None,
             })?;
-        if r.status == ok {
+        if ok.contains(&r.status) {
             return Ok(r);
         }
         let v = r.json().unwrap_or(serde_json::Value::Null);
@@ -139,6 +167,43 @@ impl<'a> NameService<'a> {
             Some(token),
             Some(json!({ "value": value })),
             200,
+        )
+        .map(|_| ())
+    }
+
+    /// Make tunnel (revision 1): the tunnel to `port`, its away name, and the tunnel token
+    /// (never kept by the hub). Answers `201` the first time and `200` after.
+    pub fn make_tunnel(&self, id: &str, token: &str, port: u16) -> Result<Tunnel, ServiceError> {
+        let r = self.call_any(
+            "POST",
+            &format!("/hubs/{id}/tunnel"),
+            Some(token),
+            Some(json!({ "port": port })),
+            &[200, 201],
+        )?;
+        let v = r.json().unwrap_or(serde_json::Value::Null);
+        match (v["hostname"].as_str(), v["token"].as_str()) {
+            (Some(h), Some(t)) if !t.is_empty() => Ok(Tunnel {
+                hostname: h.to_string(),
+                token: Zeroizing::new(t.to_string()),
+            }),
+            _ => Err(ServiceError {
+                status: r.status,
+                code: "unreadable".into(),
+                message: "the answer can't be read".into(),
+                retry_after: None,
+            }),
+        }
+    }
+
+    /// Remove tunnel (revision 1): `204`, also when it is already gone.
+    pub fn remove_tunnel(&self, id: &str, token: &str) -> Result<(), ServiceError> {
+        self.call(
+            "DELETE",
+            &format!("/hubs/{id}/tunnel"),
+            Some(token),
+            None,
+            204,
         )
         .map(|_| ())
     }

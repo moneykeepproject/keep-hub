@@ -159,6 +159,10 @@ fn network_private(hub: &Arc<Hub>) -> Vec<Check> {
     let Some(ip) = hub.address() else {
         return Vec::new();
     };
+    // (Revision 4 D: Linux has no network type to set)
+    if hub.machine.os() == machine::Os::Linux {
+        return vec![ok(3, "network_private", "Not needed on this system.")];
+    }
     let here = hub
         .machine
         .addresses()
@@ -175,6 +179,55 @@ fn network_private(hub: &Arc<Hub>) -> Vec<Check> {
     }]
 }
 
+/// The ports phones need: every registered app's and the certificate page's.
+pub(crate) fn needed_ports(hub: &Arc<Hub>) -> Vec<u16> {
+    let mut ports: Vec<u16> = hub
+        .lock()
+        .registry
+        .apps()
+        .unwrap_or_default()
+        .iter()
+        .map(|a| a.public_port)
+        .collect();
+    ports.push(hub.helper_port());
+    ports
+}
+
+/// Check 4 on Linux (Revision 4 D): an allow rule for every port in the firewall that is on.
+/// The hub can't change ufw or firewalld, so the action is ServicesKeep's Fix.
+fn linux_firewall(hub: &Arc<Hub>, fw: &crate::linuxfw::LinuxFirewall) -> Vec<Check> {
+    let Some(active) = fw.active else {
+        return vec![ok(4, "firewall", "No firewall is on.")];
+    };
+    let closed = fw.closed(&needed_ports(hub));
+    if closed.is_empty() {
+        return vec![ok(
+            4,
+            "firewall",
+            format!(
+                "The firewall ({}) lets phones reach the hub.",
+                active.name()
+            ),
+        )];
+    }
+    let list: Vec<String> = closed.iter().map(u16::to_string).collect();
+    vec![failed(
+        4,
+        "firewall_ports_closed",
+        format!(
+            "Phones can't reach this computer: the firewall ({}) doesn't let in port {}. Fix it in ServicesKeep.",
+            active.name(),
+            list.join(", ")
+        ),
+        Some(json!({
+            "kind": "serviceskeep",
+            "label": "Fix in ServicesKeep",
+            "ports": closed,
+            "firewall": active.name(),
+        })),
+    )]
+}
+
 fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
     let scan = match hub.machine.firewall_scan() {
         Ok(s) => s,
@@ -187,6 +240,9 @@ fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
             )]
         }
     };
+    if let Some(fw) = scan.as_ref().and_then(|s| s.linux.as_ref()) {
+        return linux_firewall(hub, fw);
+    }
     let check = machine::firewall_check(scan);
     if check.ok() {
         let words = if check.managed {
@@ -199,11 +255,16 @@ fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "keep-hub".into());
+    // (Revision 4 C: the same Fix as an admin request, so a program needn't know where the
+    // hub's program is; the command stays for the apps that run it today)
     let fix = json!({
         "kind": "fix",
         "label": "Fix",
         "command": [exe, "fix-firewall"],
         "permission": "Windows will ask for permission, because the firewall is set for all users.",
+        "method": "POST",
+        "path": "/admin/v1/problems/fix",
+        "body": { "check": 4 },
     });
     let (code, words) = if !check.block_rules.is_empty() {
         (
@@ -222,6 +283,65 @@ fn firewall(hub: &Arc<Hub>) -> Vec<Check> {
         )
     };
     vec![failed(4, code, words, Some(fix))]
+}
+
+/// Each check's one action, in words (for a Fix asked of a check that has none).
+fn action_words(number: u8) -> Option<&'static str> {
+    Some(match number {
+        1 => "Start it",
+        2 => "Open network settings",
+        3 => "Open the Windows setting",
+        4 => "Fix",
+        5 => "Try again",
+        6 => "Update the name",
+        7 => "Use the other way to connect",
+        8 => "Renew now",
+        9 => "Start that app",
+        10 => "None: go to the phone questions",
+        _ => return None,
+    })
+}
+
+/// `POST /admin/v1/problems/fix {check}` (Revision 4 C): Fix for check 4, done by the
+/// service itself, answering check 4's new result. Any other check has no Fix.
+pub(crate) fn fix(hub: &Arc<Hub>, check: u8) -> Result<Value, crate::hub::Refusal> {
+    use crate::hub::Refusal;
+    let Some(action) = action_words(check) else {
+        return Err(Refusal::new(
+            400,
+            "bad_request",
+            "There is no check with that number: the checks are 1 to 10.",
+        ));
+    };
+    if check != 4 {
+        return Err(Refusal::new(
+            400,
+            "no_fix",
+            format!("Only check 4 (the firewall) has a Fix. Check {check}'s action is: {action}."),
+        ));
+    }
+    if hub.machine.os() == machine::Os::Linux {
+        // (owner decision 2026-11-22: the service has no right to change ufw or firewalld;
+        // the package opens the ports at install, and ServicesKeep fixes them later)
+        return Err(Refusal::new(
+            409,
+            "fix_in_serviceskeep",
+            "On Linux, Keep Hub can't change the firewall itself. Run Fix from ServicesKeep.",
+        ));
+    }
+    let exe = std::env::current_exe()
+        .map_err(|e| Refusal::inner(format!("the hub program's path can't be found: {e}")))?;
+    let ports = needed_ports(hub);
+    let done = machine::fix_firewall_for(&*hub.machine, &exe, &ports).map_err(|e| {
+        Refusal::new(
+            500,
+            "fix_failed",
+            format!("The firewall couldn't be fixed: {e}"),
+        )
+    })?;
+    hub.log("firewall: Fix asked of the hub");
+    let result = firewall(hub);
+    Ok(json!({ "check": result.first(), "done": done }))
 }
 
 /// Checks 5 to 8 apply only with names on.

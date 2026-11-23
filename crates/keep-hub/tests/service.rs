@@ -59,32 +59,44 @@ fn the_uninstaller_learns_which_apps_still_use_the_hub_while_it_runs() {
 }
 
 #[test]
-fn install_service_never_takes_a_folder_and_runs_only_from_program_files_on_windows() {
+fn install_service_never_takes_a_folder_and_runs_only_where_it_installs_a_service() {
     let out = hub()
         .args(["install-service", "--data", "/tmp/elsewhere"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(15), "--data is refused");
-    if !cfg!(windows) {
-        let out = hub().arg("install-service").output().unwrap();
-        assert_eq!(out.status.code(), Some(15), "Windows only");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("setup"));
-    } else {
+    let out = hub().arg("install-service").output().unwrap();
+    if cfg!(windows) {
         // the test program isn't in Program Files
-        let out = hub().arg("install-service").output().unwrap();
         assert_eq!(out.status.code(), Some(10));
+    } else if cfg!(target_os = "linux") {
+        // (Revision 4 D) as root from the .deb only: a test is either not root, or root
+        // without the package's unit, and never installs anything
+        assert_ne!(out.status.code(), Some(0));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("root") || err.contains(".deb"), "{err}");
+    } else {
+        assert_eq!(out.status.code(), Some(15), "not on a Mac");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("setup"));
     }
 }
 
 #[test]
-fn service_run_is_for_windows_and_run_is_for_everything_else() {
+fn service_run_is_for_the_service_manager_and_run_is_for_everything_else() {
     if cfg!(windows) {
         return; // started outside the service manager it says so: windows-install.ps1
     }
+    // on Linux only systemd runs it (Revision 4 D); on a Mac never
+    let dir = tempfile::tempdir().unwrap();
     let out = hub()
-        .args(["service-run", "--data", "/tmp/x"])
+        .args(["service-run", "--data", dir.path().to_str().unwrap()])
+        .env_remove("INVOCATION_ID")
         .output()
         .unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("use `run`"));
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "nothing set up"
+    );
 }

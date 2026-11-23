@@ -51,7 +51,8 @@ pub mod seal;
 pub use auth::{listen, Caller, Header, HubAuth, Refused};
 pub use client::{
     default_data_folder, find, AppState, Device, Found, Grant, HubApp, HubClient, HubError,
-    HubStatus, Invite, Member, Pairing, ProblemCheck, Problems, SignedIn, ADMINISTRATOR, STANDARD,
+    HubStatus, Invite, Member, MoneyKeepTunnel, Pairing, Probe, ProbeSeen, ProblemCheck, Problems,
+    SignedIn, TunnelStatus, ADMINISTRATOR, STANDARD,
 };
 pub use offer::{
     make_this_the_hub, offer, start_command, Launcher, Next, Offer, DOWNLOAD_PAGE, LAUNCHER_ENTRY,

@@ -635,7 +635,11 @@ fn the_hubs_https_client_reads_answers_and_refuses_a_server_it_doesnt_trust() {
         )
         .unwrap();
     assert_eq!(r.status, 200);
-    assert_eq!(r.json().unwrap(), json!({ "hub": "keep-hub", "ok": true }));
+    // (Revision 4 adds the probe path and the tunnel's hostname)
+    assert_eq!(
+        r.json().unwrap(),
+        json!({ "hub": "keep-hub", "ok": true, "probe": "/_probe/<nonce>", "tunnel_hostname": null })
+    );
     // a POST with a body and a refusal
     let r = client
         .send(

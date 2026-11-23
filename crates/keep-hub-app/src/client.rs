@@ -25,7 +25,9 @@ const MAX_ANSWER: u64 = 4 * 1024 * 1024;
 
 /// The hub's data folder: `%ProgramData%\Keep Hub` on Windows (the spec), and on a Mac
 /// `~/Library/Application Support/Keep Hub`, where the hub's disk image puts it (the hub runs
-/// as the person who installed it, as ShareKeep's). Elsewhere none: the app passes its own.
+/// as the person who installed it, as ShareKeep's), and on Linux `/var/lib/keep-hub`, the
+/// systemd service's folder (Revision 4 D; its `admin.token` is readable by the `keep-hub`
+/// group). Elsewhere none: the app passes its own.
 pub fn default_data_folder() -> Option<PathBuf> {
     if cfg!(windows) {
         let base = std::env::var_os("ProgramData")
@@ -39,6 +41,8 @@ pub fn default_data_folder() -> Option<PathBuf> {
                 .join("Application Support")
                 .join("Keep Hub")
         })
+    } else if cfg!(target_os = "linux") {
+        Some(PathBuf::from("/var/lib/keep-hub"))
     } else {
         None
     }
@@ -210,7 +214,57 @@ pub struct HubStatus {
     /// older hub, whose households are all secured).
     #[serde(default)]
     pub household: Option<String>,
+    /// The tunnel's public hostname, when one is set (Revision 4 B; `None` also from an
+    /// older hub).
+    #[serde(default)]
+    pub tunnel: Option<TunnelStatus>,
     pub apps: Vec<AppState>,
+}
+
+/// The tunnel part of the status (Revision 4 B).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelStatus {
+    /// Away from home, phones open `https://<hostname>`.
+    pub hostname: Option<String>,
+}
+
+/// A probe nonce (Revision 4 A): open `url`, then ask [`HubClient::probe_seen`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Probe {
+    pub nonce: String,
+    /// The address a phone should open (`None` with no home address).
+    pub url: Option<String>,
+    /// When it is forgotten (milliseconds since 1970).
+    pub expires: i64,
+    pub minutes: u32,
+}
+
+/// Whether the hub saw a probe, when, and how: `home`, `tunnel`, `this_computer` or
+/// `outside`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProbeSeen {
+    pub seen: bool,
+    #[serde(default)]
+    pub when: Option<i64>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// A tunnel from the name service (Revision 4 B, Path B). The token is for the connector
+/// only: hand it on and drop it. It is never in `Debug`.
+pub struct MoneyKeepTunnel {
+    pub hostname: String,
+    pub port: u16,
+    pub token: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for MoneyKeepTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MoneyKeepTunnel")
+            .field("hostname", &self.hostname)
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
 }
 
 impl HubStatus {
@@ -709,6 +763,61 @@ impl HubClient {
         self.call("PUT", "names/code-page", Some(&body))
     }
 
+    // ----- Revision 4: the probe, the tunnel, Fix -----
+
+    /// A probe nonce and the address a phone should open (an administrator's request).
+    pub fn probe(&self) -> Result<Probe, HubError> {
+        parse(self.call("POST", "probe", None)?)
+    }
+
+    /// Whether the hub saw the probe `nonce` (`no_such_probe` once its life is over).
+    pub fn probe_seen(&self, nonce: &str) -> Result<ProbeSeen, HubError> {
+        parse(self.call("GET", &format!("probe/{}", part(nonce)), None)?)
+    }
+
+    /// Set the tunnel's public hostname (`tunnel.hostname`), shown to apps and phones.
+    pub fn set_tunnel_hostname(&self, hostname: &str) -> Result<Option<String>, HubError> {
+        let body = json!({ "hostname": hostname });
+        field(self.call("PUT", "tunnel", Some(&body))?, "hostname")
+    }
+
+    /// Clear the tunnel's hostname.
+    pub fn clear_tunnel_hostname(&self) -> Result<(), HubError> {
+        self.call("DELETE", "tunnel", None).map(drop)
+    }
+
+    /// Ask the name service, through the hub, for a tunnel to the first app's port. The
+    /// hub sets the hostname to the away name; the token is for the connector only.
+    pub fn make_moneykeep_tunnel(&self) -> Result<MoneyKeepTunnel, HubError> {
+        let mut v = self.call("PUT", "tunnel/moneykeep-name", None)?;
+        let token = v
+            .get_mut("token")
+            .and_then(|t| t.as_str().map(|t| Zeroizing::new(t.to_string())))
+            .ok_or_else(|| unreadable(&"no token"))?;
+        if let Some(o) = v.as_object_mut() {
+            o.remove("token");
+        }
+        Ok(MoneyKeepTunnel {
+            hostname: v["hostname"].as_str().unwrap_or("").to_string(),
+            port: v["port"]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .unwrap_or(0),
+            token,
+        })
+    }
+
+    /// The name service deletes the tunnel, and the hub clears the hostname.
+    pub fn remove_moneykeep_tunnel(&self) -> Result<(), HubError> {
+        self.call("DELETE", "tunnel/moneykeep-name", None).map(drop)
+    }
+
+    /// Fix a check (only check 4, the firewall, has one): the check's new result.
+    pub fn fix(&self, check: u8) -> Result<ProblemCheck, HubError> {
+        let body = json!({ "check": check });
+        field(self.call("POST", "problems/fix", Some(&body))?, "check")
+    }
+
     /// Turn names off (the name and certificate are kept).
     pub fn names_off(&self) -> Result<Value, HubError> {
         self.call("POST", "names/off", None)
@@ -900,9 +1009,16 @@ mod tests {
     #[test]
     fn the_spec_puts_the_data_folder_in_programdata_on_windows() {
         let found = default_data_folder();
-        assert_eq!(found.is_some(), cfg!(windows) || cfg!(target_os = "macos"));
+        assert_eq!(
+            found.is_some(),
+            cfg!(windows) || cfg!(target_os = "macos") || cfg!(target_os = "linux")
+        );
         if let Some(p) = found {
-            assert!(p.ends_with("Keep Hub"));
+            assert!(
+                p.ends_with("Keep Hub") || p.ends_with("keep-hub"),
+                "{}",
+                p.display()
+            );
         }
     }
 }

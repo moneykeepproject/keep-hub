@@ -94,6 +94,13 @@ pub fn start_command() -> Option<Vec<String>> {
             "kickstart".into(),
             "system/org.moneykeep.keep-hub".into(),
         ])
+    } else if cfg!(target_os = "linux") {
+        // (run through pkexec or sudo: starting a system service is for administrators)
+        Some(vec![
+            "systemctl".into(),
+            "start".into(),
+            "keep-hub.service".into(),
+        ])
     } else {
         None
     }
@@ -159,7 +166,10 @@ mod tests {
     #[test]
     fn starting_names_the_hubs_service() {
         let found = start_command();
-        assert_eq!(found.is_some(), cfg!(windows) || cfg!(target_os = "macos"));
+        assert_eq!(
+            found.is_some(),
+            cfg!(windows) || cfg!(target_os = "macos") || cfg!(target_os = "linux")
+        );
         if let Some(c) = found {
             assert!(c
                 .iter()

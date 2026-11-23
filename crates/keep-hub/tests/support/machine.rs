@@ -4,7 +4,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
-use keep_hub::machine::{FirewallRule, FirewallScan, FoundRule, LocalAddress, Machine};
+use keep_hub::machine::{FirewallRule, FirewallScan, FoundRule, LocalAddress, Machine, Os};
 
 pub struct FakeMachine {
     /// What the default route would use (`None`: not on a home network).
@@ -16,6 +16,8 @@ pub struct FakeMachine {
     pub firewall_error: Mutex<Option<String>>,
     /// Every Fix: the rule and the Block rules removed.
     pub fixes: Mutex<Vec<(FirewallRule, Vec<String>)>>,
+    /// The system it plays (Windows unless a test says otherwise).
+    pub os: Mutex<Os>,
 }
 
 impl FakeMachine {
@@ -31,6 +33,7 @@ impl FakeMachine {
             firewall: Mutex::new(None),
             firewall_error: Mutex::new(None),
             fixes: Mutex::new(Vec::new()),
+            os: Mutex::new(Os::Windows),
         }
     }
 
@@ -54,6 +57,7 @@ impl FakeMachine {
         *self.firewall.lock().unwrap() = Some(FirewallScan {
             named: vec![rule("Keep Hub", "Allow", "")],
             program_rules: vec![],
+            linux: None,
         });
     }
 }
@@ -70,6 +74,10 @@ pub fn rule(name: &str, action: &str, program: &str) -> FoundRule {
 }
 
 impl Machine for FakeMachine {
+    fn os(&self) -> Os {
+        *self.os.lock().unwrap()
+    }
+
     fn default_address(&self) -> Option<Ipv4Addr> {
         *self.default.lock().unwrap()
     }

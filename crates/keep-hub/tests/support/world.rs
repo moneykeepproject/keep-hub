@@ -86,6 +86,12 @@ pub struct NameServiceState {
     pub registrations: u32,
     /// Every request: "METHOD path".
     pub calls: Vec<String>,
+    /// Tunnels (revision 1): hub id → (port asked for, tunnel token).
+    pub tunnels: HashMap<String, (u16, String)>,
+    /// The bodies of Make tunnel requests.
+    pub tunnel_requests: Vec<Value>,
+    /// Refuse Make tunnel with this code.
+    pub refuse_tunnel: Option<String>,
 }
 
 struct Order {
@@ -293,6 +299,36 @@ impl World {
                 let record = format!("_acme-challenge.{name}");
                 ns.txt.insert(record.clone(), v);
                 json_answer(200, json!({ "record": record }))
+            }
+            ("POST", "tunnel") => {
+                ns.tunnel_requests.push(body.clone());
+                if let Some(code) = ns.refuse_tunnel.clone() {
+                    return err(409, &code);
+                }
+                let Some(port) = body["port"].as_u64().filter(|p| (1024..=65535).contains(p))
+                else {
+                    return err(400, "bad_request");
+                };
+                let first = !ns.tunnels.contains_key(id);
+                let token = ns
+                    .tunnels
+                    .get(id)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_else(|| format!("eyJ{}", b64(&rand_bytes())));
+                ns.tunnels
+                    .insert(id.to_string(), (port as u16, token.clone()));
+                json_answer(
+                    if first { 201 } else { 200 },
+                    json!({
+                        "hostname": format!("{id}.away.getmoneykeep.org"),
+                        "tunnel_id": "c1744f8b-0000-4000-8000-000000000001",
+                        "token": token,
+                    }),
+                )
+            }
+            ("DELETE", "tunnel") => {
+                ns.tunnels.remove(id);
+                answer(204, &[], Vec::new())
             }
             ("DELETE", "proof") => {
                 ns.txt.remove(&format!("_acme-challenge.{name}"));

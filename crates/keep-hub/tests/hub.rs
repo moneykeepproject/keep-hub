@@ -266,7 +266,11 @@ fn only_what_the_hub_checked_reaches_a_backend() {
     // the hub's own addresses
     let r = f.phone("alpha", "GET", "/hub/check", &[], None);
     assert_eq!(r.status, 200);
-    assert_eq!(r.json(), json!({ "hub": "keep-hub", "ok": true }));
+    // (Revision 4 adds the probe path and the tunnel's hostname)
+    assert_eq!(
+        r.json(),
+        json!({ "hub": "keep-hub", "ok": true, "probe": "/_probe/<nonce>", "tunnel_hostname": null })
+    );
     assert_eq!(
         f.phone("alpha", "GET", "/hub/nothing", &[], None).status,
         404

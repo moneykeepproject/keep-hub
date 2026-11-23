@@ -9,10 +9,14 @@
 //! keep-hub fix-firewall                         put the firewall rule back (administrator)
 //! keep-hub install-service                      Windows, elevated: the setup's one step
 //!                                               (the folder is always %ProgramData%\Keep Hub;
-//!                                               exit codes in keep_hub::service::Exit)
+//!                                               exit codes in keep_hub::service::Exit).
+//!                                               Linux, as root (the .deb's postinst): the
+//!                                               user, the sealing key, the service
 //! keep-hub remove-service                       Windows, elevated: the service and the
-//!                                               firewall rule go; the data folder stays
-//! keep-hub service-run      --data <folder>     the Windows service itself
+//!                                               firewall rule go; the data folder stays.
+//!                                               Linux, as root: the service is disabled
+//! keep-hub service-run      --data <folder>     the Windows service itself; on Linux what
+//!                                               keep-hub.service runs (setup the first time)
 //! keep-hub reset-administrator --name <name> [--data <folder>]
 //!                                               a new password for a named administrator,
 //!                                               read from the standard input (one line);
@@ -54,6 +58,7 @@ fn reset_administrator(args: &[String]) -> Result<(), String> {
     let data = match arg(args, "--data") {
         Some(d) => PathBuf::from(d),
         None if cfg!(windows) => service::windows_data().ok_or("%ProgramData% isn't set")?,
+        None if cfg!(target_os = "linux") => PathBuf::from(service::LINUX_DATA),
         None => return Err("--data <folder> is needed".into()),
     };
     if !data.join(keep_hub::registry::REGISTRY_FILE).exists() {
@@ -95,6 +100,16 @@ fn run() -> Result<(), String> {
                 println!("{line}");
             }
             return Ok(());
+        }
+        "install-service" if cfg!(target_os = "linux") => {
+            let exit = match linux_install_service(&args) {
+                Ok(()) => Exit::Done,
+                Err((exit, e)) => {
+                    eprintln!("{e}");
+                    exit
+                }
+            };
+            std::process::exit(i32::from(exit.code()));
         }
         "install-service" => {
             let exit = install_service(&args);
@@ -240,6 +255,8 @@ fn install_service(args: &[String]) -> Exit {
 fn remove_service() -> Result<(), String> {
     if cfg!(windows) {
         service::run_steps(&service::windows_uninstall(), &echo)
+    } else if cfg!(target_os = "linux") {
+        service::run_steps(&service::linux_uninstall(), &echo)
     } else if cfg!(target_os = "macos") {
         Err(MAC_INSTALL.into())
     } else {
@@ -329,9 +346,117 @@ fn service_run(data: PathBuf) -> Result<(), String> {
     winsvc::run(data)
 }
 
-#[cfg(not(windows))]
+/// `install-service` on Linux (Revision 4 D), as root from the package's `postinst`: the
+/// sealing key, the user and group, the installing person in the group, the certificate
+/// page's port in the firewall, and the service enabled and started. The data folder is the
+/// service's own (`StateDirectory`): the service sets itself up at its first start.
+/// The exit codes are Windows' ([`Exit`]), so keep-launcher reads both alike.
+#[cfg(unix)]
+fn linux_install_service(args: &[String]) -> Result<(), (Exit, String)> {
+    let failed = |e: String| (Exit::SetupFailed, e);
+    if arg(args, "--data").is_some() {
+        return Err((
+            Exit::BadArguments,
+            format!(
+                "install-service takes no --data: the folder is always {}.",
+                service::LINUX_DATA
+            ),
+        ));
+    }
+    if !service::is_root() {
+        return Err((
+            Exit::BadArguments,
+            "install-service must run as root (the package's installer runs it).".into(),
+        ));
+    }
+    for f in [service::LINUX_UNIT_FILE, service::LINUX_SYSUSERS_FILE] {
+        if !Path::new(f).is_file() {
+            return Err(failed(format!(
+                "{f} is missing: install Keep Hub from its .deb package."
+            )));
+        }
+    }
+    if service::make_credential(&echo).map_err(failed)? {
+        let dropin = Path::new(service::SEALING_DROPIN);
+        if let Some(dir) = dropin.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| failed(format!("{} can't be made: {e}", dir.display())))?;
+        }
+        std::fs::write(dropin, service::sealing_dropin())
+            .map_err(|e| failed(format!("{} can't be written: {e}", dropin.display())))?;
+    }
+    let person = service::installing_person(|k| std::env::var(k).ok());
+    let helper = HubConfig::load(Path::new(service::LINUX_DATA))
+        .map(|c| c.ports.helper)
+        .unwrap_or(keep_hub::config::HELPER_PORT);
+    service::run_steps(
+        &service::linux_install(person.as_deref(), service::install_firewall(), helper),
+        &echo,
+    )
+    .map_err(|e| (Exit::ServiceDidntStart, e))?;
+    if let Some(p) = person {
+        echo(&format!(
+            "{p} can use Keep Hub from the apps after signing in to this computer again."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn linux_install_service(_args: &[String]) -> Result<(), (Exit, String)> {
+    Err((
+        Exit::BadArguments,
+        "install-service for Linux runs on Linux only.".into(),
+    ))
+}
+
+/// `service-run` on Linux: what keep-hub.service runs, as the keep-hub user. The master key
+/// from systemd (when it gave one) seals the keys; the first start sets the hub up; the
+/// admin token is shared with the keep-hub group.
+#[cfg(unix)]
+fn service_run(data: PathBuf) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("service-run is for Windows and Linux; on a Mac use `run`.".into());
+    }
+    // (systemd gives every service an invocation id: by hand, this would set a hub up)
+    if std::env::var_os("INVOCATION_ID").is_none() {
+        return Err(
+            "service-run is what keep-hub.service runs; to run the hub by hand, use `run`.".into(),
+        );
+    }
+    let log = service::file_log(data.join(service::LOG_FILE));
+    if let Some(key) = service::credential(std::env::var_os("CREDENTIALS_DIRECTORY")) {
+        keep_hub::seal::set_master(&key)?;
+    }
+    let words = keep_hub::seal::protection()["words"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    log(&words);
+    if !data.join(keep_hub::config::CONFIG_FILE).exists() {
+        match setup(&data, None) {
+            Ok(info) => log(&format!("set up for {}", info.address)),
+            Err((_, e)) => {
+                // (systemd starts it again in 30 seconds: a home network may come)
+                log(&format!("couldn't set up: {e}"));
+                return Err(e);
+            }
+        }
+    }
+    if let Err(e) = service::share_admin_token(&data) {
+        log(&e);
+    }
+    let mut opts = HubOptions::new(data);
+    opts.log = log.clone();
+    let running = keep_hub::start(opts).inspect_err(|e| log(&format!("couldn't start: {e}")))?;
+    log(&format!("started: this computer http://{}", running.admin));
+    running.wait();
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
 fn service_run(_data: PathBuf) -> Result<(), String> {
-    Err("service-run is for Windows; elsewhere use `run`.".into())
+    Err("service-run is for Windows and Linux; elsewhere use `run`.".into())
 }
 
 fn main() -> ExitCode {

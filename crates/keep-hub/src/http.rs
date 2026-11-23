@@ -161,10 +161,29 @@ impl Answer {
     }
 }
 
+/// An answer with no body (the probe's): a 204 carries no `Content-Length` (RFC 9110
+/// section 8.6), any other status `Content-Length: 0`.
+pub fn empty_answer(status: u16, hsts: bool) -> Vec<u8> {
+    let length = if status == 204 {
+        ""
+    } else {
+        "Content-Length: 0\r\n"
+    };
+    format!(
+        "HTTP/1.1 {status} {}\r\n{length}Cache-Control: no-store\r\n{}Connection: close\r\n\r\n",
+        reason(status),
+        added(hsts)
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect::<String>()
+    )
+    .into_bytes()
+}
+
 /// The words after a status code (RFC 9110 section 15).
 pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

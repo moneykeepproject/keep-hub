@@ -1,0 +1,31 @@
+# Keep Hub: the phone access service of the Keep apps (systemd system service).
+# Revision 4 D of docs/specs/keep-hub.md. Installed by the keep-hub .deb.
+[Unit]
+Description=Keep Hub (phone access for the Keep apps)
+Documentation=https://github.com/moneykeepproject/keep-hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=keep-hub
+Group=keep-hub
+ExecStart=/usr/bin/keep-hub service-run --data /var/lib/keep-hub
+Restart=on-failure
+RestartSec=30
+# /var/lib/keep-hub, owned by keep-hub; its group may enter, for admin.token (0640)
+StateDirectory=keep-hub
+StateDirectoryMode=0750
+UMask=0027
+# Reading the firewall's rules for Find the problem (check 4), and nothing more
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The master key that seals keys/ comes from the drop-in keep-hub install-service writes
+# (10-sealing.conf: LoadCredentialEncrypted=keep-hub-master:...), when systemd-creds works.
+
+[Install]
+WantedBy=multi-user.target

@@ -28,10 +28,20 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Write a file only its owner can read (on Unix; on Windows the hub's data folder's
 /// permissions apply, set by the hub's installer). Written through a temporary file.
+///
+/// Each write has its own temporary file, so two threads writing the same file at once
+/// (the names engine and an admin request, say) can't take each other's: the later rename
+/// wins, and neither fails.
 pub fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = std::path::PathBuf::from(tmp);
     let result = (|| -> std::io::Result<()> {
         let mut o = std::fs::OpenOptions::new();
@@ -116,5 +126,27 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    /// Many threads writing one file at once: none fails, no temporary file is left.
+    #[test]
+    fn writes_of_one_file_at_once_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.json");
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        write_private(&p, format!("{i}").as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1);
     }
 }

@@ -19,5 +19,7 @@
 *.html   text eol=lf
 *.js     text eol=lf
 *.wat    text eol=lf
+# the Linux package: shell scripts with no extension, the systemd unit, sysusers
+installer/linux/** text eol=lf
 NOTICE   text eol=lf
 LICENSE-* text eol=lf
