@@ -300,6 +300,10 @@ mod tests {
             cloudflare_down: false,
         }));
         assert!(l.home("localhost").unwrap().contains(&Ipv4Addr::LOCALHOST));
-        assert!(l.home("no-such-name.invalid").unwrap().is_empty());
+        // A name no one has is an answer, not an error. What the answer holds depends on the
+        // computer: some routers and virtual machines' networks answer every name (or the
+        // computer's search domain is added on), so the test can't expect it to be empty. The
+        // hub only ever looks for its own address in what comes back.
+        assert!(l.home("no-such-name.invalid").is_ok());
     }
 }
