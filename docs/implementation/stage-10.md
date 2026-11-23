@@ -519,3 +519,27 @@ Apache-2.0, Windows only) for COM, and `GetAdaptersAddresses` for the adapters. 
 
 `cargo xtask ci` on Linux passed: 251 tests, with 5 ignored. That is three script tests
 fewer and one new.
+
+## The first runs on GitHub
+
+The first push ran the workflows on GitHub's machines for the first time; four things failed,
+none of them in the hub itself:
+
+- **CI, Windows.** Two library tests expected the test's temporary folder to be refused as
+  "not the hub's folder". GitHub's runner runs elevated, so the administrators own the folders
+  it makes, and the owner check rightly believes them. The tests now ask the owner check who
+  owns the folder (`believed` in `tests/library.rs`) and expect the refusal only where the
+  folder is the person's own, as on a developer's computer.
+- **CI, macOS.** Two address tests move the computer to 127.0.0.2, which a Mac doesn't have
+  on its loopback unless it's added. They run on Windows and Linux, as the two tunnel tests
+  that need 127.0.0.2 already did. The third test now moves back to 127.0.0.1, so it runs on
+  a Mac too. `cargo xtask ci` runs the tests with `--no-fail-fast`, so a run shows every
+  failing test binary, not just the first. This was the first time the code was built and
+  tested on a Mac, so the next run may still find more.
+- **Windows setup, "Two apps register".** The script's `Note` wrote with `Write-Output`, so
+  a note inside `Get-Session` became part of the session it returned, and the hub refused that
+  session. `Note` writes with `Write-Host` now.
+- **Linux package, test 62.** The step found the test binary under `target/debug/deps/`, but
+  newer cargo keeps test binaries under `target/debug/build/`, so nothing was found and the step
+  stopped before the test ran. It now reads the path from cargo's JSON output. Test 62 itself
+  hasn't run yet.

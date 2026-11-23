@@ -78,7 +78,7 @@ fn ci(root: &Path) -> Result<(), String> {
             "-D",
             "warnings",
         ],
-        &["test", "--workspace", "--locked"],
+        &["test", "--workspace", "--locked", "--no-fail-fast"],
     ];
     for args in steps {
         println!("== cargo {}", args.join(" "));

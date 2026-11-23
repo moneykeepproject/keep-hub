@@ -163,18 +163,21 @@ impl App {
 // ----- finding the hub ----------------------------------------------------------------------------
 
 /// On Windows an app believes a hub's folder only when the administrators, SYSTEM or a
-/// service own it (stage 7): a test's temporary folder is the person's own, so it is refused
-/// as a folder someone else could have planted. This shows that refusal and gives the client
-/// the rest of the test goes on with. Elsewhere the folder is believed and `found` is the
-/// answer itself.
-fn on_windows_refused_as_planted(data: &Path) {
-    if cfg!(windows) {
-        match find(data) {
-            Found::NoAccess(e) => assert_eq!(e.code, "not_the_hubs_folder", "{e}"),
-            other => panic!("a folder the person owns must be refused on Windows: {other:?}"),
-        }
-        assert!(matches!(offer(data), Offer::CantUse(e) if e.code == "not_the_hubs_folder"));
+/// service own it (stage 7). A test's temporary folder belongs to whoever runs the test: on a
+/// person's computer it is theirs, so it is refused as a folder someone else could have
+/// planted; when the tests run elevated (GitHub's Windows runner) the administrators own it,
+/// so it is believed. This shows the refusal where there is one and answers whether the
+/// folder is believed. Elsewhere it always is.
+fn believed(data: &Path) -> bool {
+    if keep_hub::owner::protected(data).is_ok() {
+        return true;
     }
+    match find(data) {
+        Found::NoAccess(e) => assert_eq!(e.code, "not_the_hubs_folder", "{e}"),
+        other => panic!("a folder the person owns must be refused on Windows: {other:?}"),
+    }
+    assert!(matches!(offer(data), Offer::CantUse(e) if e.code == "not_the_hubs_folder"));
+    false
 }
 
 #[test]
@@ -183,8 +186,7 @@ fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
     assert!(matches!(find(empty.path()), Found::NotInstalled));
 
     let f = hub_on_known_port();
-    on_windows_refused_as_planted(f.dir.path());
-    if !cfg!(windows) {
+    if believed(f.dir.path()) {
         match find(f.dir.path()) {
             Found::Running(hub, status) => {
                 assert_eq!(hub.addr(), f.hub().admin);
@@ -207,8 +209,7 @@ fn an_app_finds_no_hub_a_stopped_hub_and_a_running_one() {
     }
     drop(f); // the hub stops
     std::thread::sleep(Duration::from_millis(100));
-    on_windows_refused_as_planted(stopped.path());
-    if cfg!(windows) {
+    if !believed(stopped.path()) {
         let hub = HubClient::open(stopped.path()).unwrap();
         assert_eq!(hub.addr(), admin);
         assert_eq!(hub.status().unwrap_err().code, "hub_unreachable");
@@ -286,8 +287,7 @@ fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start()
 
     // a running hub: on with the phone setup
     let f = hub_on_known_port();
-    on_windows_refused_as_planted(f.dir.path());
-    if !cfg!(windows) {
+    if believed(f.dir.path()) {
         assert!(matches!(offer(f.dir.path()), Offer::Ready(_, _)));
     }
 
@@ -304,8 +304,7 @@ fn at23_no_hub_offers_the_launchers_entry_and_a_stopped_hub_is_offered_a_start()
         installed: true,
         opened: std::cell::Cell::new(0),
     };
-    on_windows_refused_as_planted(stopped.path());
-    if !cfg!(windows) {
+    if believed(stopped.path()) {
         match offer(stopped.path()) {
             Offer::StartHub(hub) => {
                 assert_eq!(hub.status().unwrap_err().code, "hub_unreachable")

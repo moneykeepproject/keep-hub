@@ -1,5 +1,6 @@
 target/
 dist/
+ci-failed-*.txt
 
 # A hub's data folder from a local run: the admin token, the registry, certificates.
 hubdata/
@@ -15,3 +16,4 @@ admin.token
 *.pem
 *.key
 *.crt
+

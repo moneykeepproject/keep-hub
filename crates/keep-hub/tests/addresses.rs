@@ -17,6 +17,8 @@ use support::machine::rule;
 use support::world::Home;
 use support::{named_hub, Fixture, TestApp};
 
+/// The address the computer moves to. A Mac has only 127.0.0.1 on its loopback unless more are
+/// added, so the tests that move to it run on Windows and Linux.
 const MOVED: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
 /// Wait (up to 5 s) until `done` is true.
@@ -32,6 +34,7 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 
 // ----- the address --------------------------------------------------------------------------------
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn at15_a_new_address_reaches_the_name_service_keeps_the_name_certificate_and_makes_a_new_authority(
 ) {
@@ -154,7 +157,7 @@ fn a_hub_started_away_from_home_opens_its_ports_when_an_address_comes() {
     // registering works without an address; the port opens when one comes
     let other = TestApp::start("carpick");
     f.register(&other, false, false);
-    f.machine.move_to(Some(MOVED));
+    f.machine.move_to(Some(Ipv4Addr::LOCALHOST));
     wait_for("both ports", || {
         f.hub().app_port("vacapick").is_some() && f.hub().app_port("carpick").is_some()
     });
@@ -164,6 +167,7 @@ fn a_hub_started_away_from_home_opens_its_ports_when_an_address_comes() {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_chosen_adapter_is_used_instead_of_the_default_route() {
     let f = Fixture::new();

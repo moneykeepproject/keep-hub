@@ -54,7 +54,9 @@ $Out = Join-Path $Artifacts $Scenario
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 function Fail([string]$why) { throw "FAILED ($Scenario): $why" }
-function Note([string]$line) { Write-Output $line; Add-Content -Path (Join-Path $Out 'steps.log') -Value $line }
+# (Write-Host, not Write-Output: a note inside a function mustn't become part of what the function
+# returns, as it did in Get-Session, whose session came back with the note in front of it)
+function Note([string]$line) { Write-Host $line; Add-Content -Path (Join-Path $Out 'steps.log') -Value $line }
 
 function Get-Setup([bool]$Older = $false) {
     $all = @(Get-ChildItem -Path (Join-Path $Root 'dist') -Filter 'keep-hub-*-windows-x64-setup.exe')
