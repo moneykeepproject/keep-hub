@@ -52,7 +52,7 @@ The hub holds no app's books and no app's rules.
 | `crates/keep-hub/tests` | The acceptance tests, with small test apps (`hub.rs`: stage 1, `web.rs` and `memory.rs`: stage 2, `names.rs`: stage 3, `fallback.rs`: stage 4, `addresses.rs`: stage 5, `library.rs`: stage 6, `service.rs` and `browser.rs`: stage 7, `administrators.rs`: stage 8, `revisions.rs`: stage 9, `tunnel.rs` and `linux.rs`: stage 10, with a fake name service, ACME server and DNS in `support/world.rs` and a fake computer in `support/machine.rs`) |
 | `installer/windows`, `installer/macos`, `installer/linux` | The Windows setup (NSIS), the Mac disk image's scripts, and the Linux package's systemd unit, sysusers file and maintainer scripts |
 | `scripts/ci/windows-install.ps1` | The Windows setup run for real: install, update, an older version refused, remove with apps registered, install again |
-| `.github/workflows` | `ci.yml`: `cargo xtask ci` on Linux, Windows and macOS; `windows.yml`: the Windows setup run for real; `linux.yml`: the `.deb` installed for real (test 62, with ufw on); `release.yml`: a draft release for a `v*` tag |
+| `.github/workflows` | `ci.yml`: `cargo xtask ci` on Linux and Windows; `windows.yml`: the Windows setup run for real; `linux.yml`: the `.deb` installed for real (test 62, with ufw on), and kept as the run's `keep-hub-deb` download; `release.yml`: a draft release for a `v*` tag |
 | `xtask` | `cargo xtask ci`, the repository rules, `cargo xtask installer` and `cargo xtask deb` |
 
 Crates are added as the build stages in `AGENTS.md` are reached.

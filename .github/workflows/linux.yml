@@ -32,6 +32,15 @@ jobs:
           restore-keys: linux-deb-
       - name: The package
         run: cargo xtask deb
+      # (the .deb to download from the run's page, as keep-hub-deb: a zip with the package and
+      # its .sha256. The same package the steps below install and test.)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keep-hub-deb
+          path: |
+            dist/keep-hub_*.deb
+            dist/keep-hub_*.deb.sha256
+          if-no-files-found: error
       - name: ufw on (incoming refused, outgoing allowed)
         run: sudo ufw --force enable && sudo ufw status verbose
       # (the tests are built as the runner's user and only run as root, so target/ stays
