@@ -38,7 +38,9 @@ jobs:
       # the user's for the steps after)
       - name: Acceptance test 62 (install, the service as keep-hub, dpkg -r keeps the data)
         run: |
-          tests="$(cargo test -p keep-hub --test linux --no-run 2>&1 | sed -n 's/.*(\(target\/debug\/deps\/linux-[0-9a-f]*\)).*/\1/p' | head -n1)"
+          # (the test program's path from cargo itself: newer cargo keeps test programs under
+          # target/debug/build, not target/debug/deps)
+          tests="$(cargo test -p keep-hub --test linux --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and .target.name == "linux" and .executable != null) | .executable' | head -n1)"
           test -x "$tests"
           sudo "$tests" at62 --ignored --nocapture
       - name: The ruleset with Keep Hub's port in ufw

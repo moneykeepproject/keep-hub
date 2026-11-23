@@ -19,6 +19,7 @@ use support::{named_hub, Fixture, TestApp};
 
 /// The address the computer moves to. A Mac has only 127.0.0.1 on its loopback unless more are
 /// added, so the tests that move to it run on Windows and Linux.
+#[cfg(not(target_os = "macos"))]
 const MOVED: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 
 /// Wait (up to 5 s) until `done` is true.

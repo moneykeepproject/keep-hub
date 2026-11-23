@@ -956,9 +956,16 @@ mod tests {
         Ok(())
     }
 
-    /// On Windows a folder the person owns is refused before anything else is read.
+    /// On Windows a folder the person owns is refused before anything else is read. A test's
+    /// temporary folder is the person's own on their computer; when the tests run elevated
+    /// (GitHub's Windows runner) the administrators own it and the real check believes it, so
+    /// the refusal is expected only where the owner check itself refuses (always passes
+    /// elsewhere).
     fn refused_on_windows(dir: &Path) {
-        if cfg!(windows) {
+        let believed = [dir.to_path_buf(), dir.join(TOKEN_FILE)]
+            .iter()
+            .all(|p| crate::owner::protected(p).is_ok());
+        if !believed {
             match find(dir) {
                 Found::NoAccess(e) => assert_eq!(e.code, "not_the_hubs_folder", "{e}"),
                 other => panic!("{other:?}"),

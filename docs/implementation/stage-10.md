@@ -543,3 +543,23 @@ none of them in the hub itself:
   newer cargo keeps test binaries under `target/debug/build/`, so nothing was found and the step
   stopped before the test ran. It now reads the path from cargo's JSON output. Test 62 itself
   hasn't run yet.
+
+## The second runs on GitHub (commit "CI-1")
+
+- **CI, macOS** is no longer run: the owner doesn't need macOS builds. (Its failure was the
+  127.0.0.2 constant, unused on a Mac once its tests were left out; it is now left out with
+  them, so a Mac still builds cleanly if one is ever run.) The macOS job in `release.yml` is
+  unchanged.
+- **CI, Windows.** One more unit test in `keep-hub-app` (`client.rs`,
+  `a_hub_that_doesnt_answer_is_stopped_and_the_port_comes_from_hub_json`) expected the
+  refusal of a person-owned folder, for the same reason as `believed`. Its helper
+  `refused_on_windows` now expects the refusal only where the owner check refuses the folder
+  or the token.
+- **Windows setup, "Two apps register".** `keep-hub reset-administrator` reported a new
+  password, then signing in with it was refused. The Rust test of the same command (test 32)
+  passes; the difference is the pipe: Windows PowerShell puts a byte-order mark in front of
+  what it pipes into a program when its output encoding is UTF-8, so the hub kept a password
+  starting with U+FEFF. The command now drops a leading byte-order mark (no one types one),
+  with a unit test, and the script pipes UTF-8 without one and notes what the command said.
+- **Linux package.** The run still had the old `linux.yml`; the new one (the path from
+  cargo's JSON) was checked here against cargo 1.97. Test 62 hasn't run yet.

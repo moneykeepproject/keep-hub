@@ -38,6 +38,9 @@ param(
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# What this script pipes into keep-hub.exe (the passwords for reset-administrator): UTF-8
+# without the byte-order mark Windows PowerShell would put in front.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Service = 'KeepHub'
@@ -273,8 +276,9 @@ try {
             if (@($apps).Count -ne 2) { Fail "the hub has $(@($apps).Count) apps" }
             # acceptance test 32, on the installed hub while the service runs: an
             # administrator of this computer sets a new password from the command line
-            'ci-reset-password-2' | & $Hub reset-administrator --name $AdminName --data $Data | Out-Null
+            $said = 'ci-reset-password-2' | & $Hub reset-administrator --name $AdminName --data $Data
             if ($LASTEXITCODE -ne 0) { Fail "keep-hub reset-administrator failed" }
+            Note "  reset-administrator: $said"
             $null = Invoke-Admin 'POST' 'session' @{ name = $AdminName; password = 'ci-reset-password-2' }
             $AdminPassword | & $Hub reset-administrator --name $AdminName --data $Data | Out-Null
             if ($LASTEXITCODE -ne 0) { Fail "keep-hub reset-administrator failed the second time" }

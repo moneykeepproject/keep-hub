@@ -51,6 +51,15 @@ fn echo(line: &str) {
 /// remove launchd's file themselves.
 const MAC_INSTALL: &str = "On a Mac, open \"Install Keep Hub\" (or \"Remove Keep Hub\") from the Keep Hub disk image: they register the hub with launchd without running Keep Hub as root.";
 
+/// The password on the line read from the standard input: without the line ending, and without
+/// the byte-order mark Windows PowerShell puts in front of what it pipes to a program when its
+/// output encoding is UTF-8 (no one types U+FEFF, and a password kept with it could never be
+/// typed at sign-in).
+fn typed_password(line: &str) -> &str {
+    line.trim_start_matches('\u{feff}')
+        .trim_end_matches(['\r', '\n'])
+}
+
 /// `reset-administrator`: when no administrator can sign in. The new password comes on the
 /// standard input, so it is never in the command line (which other programs can see).
 fn reset_administrator(args: &[String]) -> Result<(), String> {
@@ -72,8 +81,7 @@ fn reset_administrator(args: &[String]) -> Result<(), String> {
     std::io::stdin()
         .read_line(&mut line)
         .map_err(|e| format!("the password couldn't be read: {e}"))?;
-    let password = line.trim_end_matches(['\r', '\n']);
-    let id = keep_hub::reset_administrator(&data, &name, password)?;
+    let id = keep_hub::reset_administrator(&data, &name, typed_password(&line))?;
     println!("Administrator {name} (member {id}) has a new password. Phones, members and grants are unchanged.");
     Ok(())
 }
@@ -466,5 +474,23 @@ fn main() -> ExitCode {
             eprintln!("keep-hub: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::typed_password;
+
+    #[test]
+    fn a_piped_password_loses_its_line_ending_and_a_byte_order_mark() {
+        assert_eq!(
+            typed_password("ci-reset-password-2\r\n"),
+            "ci-reset-password-2"
+        );
+        assert_eq!(
+            typed_password("\u{feff}ci-reset-password-2\r\n"),
+            "ci-reset-password-2"
+        );
+        assert_eq!(typed_password("pass word \n"), "pass word ");
     }
 }

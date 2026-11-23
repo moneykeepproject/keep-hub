@@ -1,4 +1,4 @@
-# cargo xtask ci on Linux, Windows and macOS: fmt, clippy -D warnings, the tests, and the
+# cargo xtask ci on Linux and Windows (macOS isn't built in CI): fmt, clippy -D warnings, the tests, and the
 # repository rules. Windows is where the hub's Windows-only code is compiled.
 name: CI
 
@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
